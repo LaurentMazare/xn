@@ -70,11 +70,25 @@ pub enum Error {
 
     #[cfg(feature = "cuda")]
     #[error(transparent)]
-    Cublas(#[from] cudarc::cublas::result::CublasError),
+    Cublas(cudarc::cublas::result::CublasError),
 
     #[cfg(feature = "cuda")]
     #[error(transparent)]
     CudaDriver(cudarc::driver::DriverError),
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::driver::DriverError> for Error {
+    fn from(value: cudarc::driver::DriverError) -> Self {
+        Self::CudaDriver(value).bt()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::cublas::result::CublasError> for Error {
+    fn from(value: cudarc::cublas::result::CublasError) -> Self {
+        Self::Cublas(value).bt()
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
