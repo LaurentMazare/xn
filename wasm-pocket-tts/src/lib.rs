@@ -2,7 +2,8 @@ use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 use pocket_tts::flow_lm;
-use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt};
+use pocket_tts::mimi::MimiState;
+use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
 use xn::{CPU, CpuDevice, Tensor};
 
@@ -88,12 +89,24 @@ fn remap_key(name: &str) -> Option<String> {
     Some(name)
 }
 
+struct GenState {
+    tts_state: TTSState<f32, CpuDevice>,
+    mimi_state: MimiState<f32, CpuDevice>,
+    prev_latent: Tensor<f32, CpuDevice>,
+    rng: WasmRng,
+    max_frames: usize,
+    frames_after_eos: usize,
+    eos_countdown: Option<usize>,
+    step: usize,
+}
+
 #[wasm_bindgen]
 pub struct Model {
     inner: TTSModel<f32, CpuDevice>,
     voice_emb: Tensor<f32, CpuDevice>,
     tokenizer: std::sync::Arc<PresetTokenizer>,
     cfg: TTSConfig,
+    gen_state: Option<GenState>,
 }
 
 #[wasm_bindgen]
@@ -141,6 +154,7 @@ impl Model {
             voice_emb,
             tokenizer,
             cfg,
+            gen_state: None,
         })
     }
 
@@ -228,6 +242,105 @@ impl Model {
         let pcm = audio.to_vec().map_err(e)?;
 
         Ok(js_sys::Float32Array::from(pcm.as_slice()))
+    }
+
+    pub fn start_generation(
+        &mut self,
+        token_ids: &[u32],
+        frames_after_eos: usize,
+        temperature: f32,
+    ) -> Result<(), JsError> {
+        let e = |e: xn::Error| JsError::new(&e.to_string());
+
+        self.tokenizer.set_tokens(token_ids.to_vec());
+
+        let num_tokens = token_ids.len();
+        let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
+        let seq_budget = num_tokens + 512 + max_frames;
+
+        let mut tts_state = self.inner.init_flow_lm_state(1, seq_budget).map_err(e)?;
+        let mimi_state = self.inner.init_mimi_state(1, 250).map_err(e)?;
+
+        self.inner
+            .prompt_audio(&mut tts_state, &self.voice_emb)
+            .map_err(e)?;
+        self.inner
+            .prompt_text(&mut tts_state, token_ids)
+            .map_err(e)?;
+
+        let rng = WasmRng::new(temperature);
+
+        let ldim = self.cfg.flow_lm.ldim;
+        let nan_data: Vec<f32> = vec![f32::NAN; ldim];
+        let prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU).map_err(e)?;
+
+        self.gen_state = Some(GenState {
+            tts_state,
+            mimi_state,
+            prev_latent,
+            rng,
+            max_frames,
+            frames_after_eos,
+            eos_countdown: None,
+            step: 0,
+        });
+
+        Ok(())
+    }
+
+    pub fn generation_step(&mut self) -> Result<Option<js_sys::Float32Array>, JsError> {
+        let e = |e: xn::Error| JsError::new(&e.to_string());
+
+        let mut state = match self.gen_state.take() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        if state.step >= state.max_frames {
+            return Ok(None);
+        }
+
+        let (next_latent, is_eos) = self
+            .inner
+            .generate_step(&mut state.tts_state, &state.prev_latent, &mut state.rng)
+            .map_err(e)?;
+
+        let audio_chunk = self
+            .inner
+            .decode_latent(&next_latent, &mut state.mimi_state)
+            .map_err(e)?;
+
+        if is_eos && state.eos_countdown.is_none() {
+            state.eos_countdown = Some(state.frames_after_eos);
+        }
+
+        let done = if let Some(ref mut countdown) = state.eos_countdown {
+            if *countdown == 0 {
+                true
+            } else {
+                *countdown -= 1;
+                false
+            }
+        } else {
+            false
+        };
+
+        state.prev_latent = next_latent;
+        state.step += 1;
+
+        let audio = audio_chunk
+            .narrow(0, ..1)
+            .map_err(e)?
+            .contiguous()
+            .map_err(e)?;
+        let pcm = audio.to_vec().map_err(e)?;
+        let result = js_sys::Float32Array::from(pcm.as_slice());
+
+        if !done {
+            self.gen_state = Some(state);
+        }
+
+        Ok(Some(result))
     }
 
     pub fn sample_rate(&self) -> usize {
