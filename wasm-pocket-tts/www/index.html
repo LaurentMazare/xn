@@ -49,11 +49,12 @@
       <option value="azelma">Azelma</option>
     </select>
   </div>
-  <button id="generate-btn" disabled>Generate</button>
+  <button id="load-btn">Load Weights</button>
+  <button id="generate-btn" style="display:none">Generate</button>
 </div>
 
 <div class="progress-bar" id="progress-bar" style="display:none"><div class="fill" id="progress-fill"></div></div>
-<div id="status">Initializing...</div>
+<div id="status"></div>
 <div id="audio-container"></div>
 
 <script type="module">
@@ -281,52 +282,25 @@ class UnigramTokenizer {
 let model = null;
 let tokenizer = null;
 let cachedVoice = { name: null, data: null };
-
-async function loadTokenizer() {
-  log('Downloading tokenizer...');
-  const data = await fetchWithProgress(TOKENIZER_URL, 'Tokenizer');
-  const pieces = decodeSentencepieceModel(data);
-  tokenizer = new UnigramTokenizer(pieces);
-  log(`Tokenizer loaded (${pieces.length} pieces)`);
-}
-
-async function loadModel() {
-  log('Downloading model weights (this may take a while)...');
-  const modelData = await fetchWithProgress(MODEL_URL, 'Model weights');
-  const voiceName = voiceSelect.value;
-  log(`Downloading voice embedding (${voiceName})...`);
-  const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
-  cachedVoice = { name: voiceName, data: voiceData };
-
-  log('Initializing WASM model...');
-  model = new Model(modelData, voiceData);
-  log('Model ready!');
-}
-
-async function ensureVoice() {
-  const voiceName = voiceSelect.value;
-  if (cachedVoice.name === voiceName) return;
-  log(`Downloading voice embedding (${voiceName})...`);
-  const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
-  cachedVoice = { name: voiceName, data: voiceData };
-  // Need to reload model with new voice
-  log('Reloading model with new voice...');
-  // We'd need the model weights cached too. For simplicity, store them.
-  // This is handled below with cachedModelWeights.
-}
-
 let cachedModelWeights = null;
 
-async function initialize() {
+const loadBtn = document.getElementById('load-btn');
+
+async function loadWeights() {
+  loadBtn.disabled = true;
   try {
     await init();
     log('WASM initialized. Downloading tokenizer and model...');
 
     // Download tokenizer and model in parallel
-    const tokenizerPromise = loadTokenizerData();
-    log('Downloading model weights (this may take a while)...');
-    cachedModelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
+    const tokenizerPromise = (async () => {
+      const data = await fetchWithProgress(TOKENIZER_URL, 'Tokenizer');
+      const pieces = decodeSentencepieceModel(data);
+      tokenizer = new UnigramTokenizer(pieces);
+      log(`Tokenizer loaded (${pieces.length} pieces)`);
+    })();
 
+    cachedModelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
     await tokenizerPromise;
 
     const voiceName = voiceSelect.value;
@@ -337,19 +311,14 @@ async function initialize() {
     log('Initializing model...');
     model = new Model(cachedModelWeights, voiceData);
     log('Ready! Enter text and click Generate.');
-    btn.disabled = false;
-  } catch (e) {
-    log('Error during initialization: ' + e.message);
-    console.error(e);
-  }
-}
 
-async function loadTokenizerData() {
-  log('Downloading tokenizer...');
-  const data = await fetchWithProgress(TOKENIZER_URL, 'Tokenizer');
-  const pieces = decodeSentencepieceModel(data);
-  tokenizer = new UnigramTokenizer(pieces);
-  log(`Tokenizer loaded (${pieces.length} pieces)`);
+    loadBtn.style.display = 'none';
+    btn.style.display = '';
+  } catch (e) {
+    log('Error: ' + e.message);
+    console.error(e);
+    loadBtn.disabled = false;
+  }
 }
 
 async function generate() {
@@ -451,8 +420,8 @@ function encodeWav(samples, sampleRate) {
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
+loadBtn.addEventListener('click', loadWeights);
 btn.addEventListener('click', generate);
-initialize();
 </script>
 </body>
 </html>
