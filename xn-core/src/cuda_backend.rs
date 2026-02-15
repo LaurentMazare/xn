@@ -438,6 +438,9 @@ impl crate::Backend for Device {
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, elem: T, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
         let kname = kernel_name::<T>("fill");
         let func = dst.device.get_func(&kname, PTXModule::Fill)?;
         let cfg = LaunchConfig::for_num_elems(len as u32);
@@ -655,6 +658,9 @@ impl crate::Backend for Device {
         dst_o: usize,
         src_o: usize,
     ) -> Result<()> {
+        if d1 == 0 || d2 == 0 {
+            return Ok(());
+        }
         let kname = kernel_name::<T>("copy2d");
         let func = dst.device.get_func(&kname, PTXModule::Fill)?;
 

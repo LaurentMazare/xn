@@ -22,6 +22,7 @@ tracing-chrome = "0.7"
 [features]
 default = []
 cuda = ["xn/cuda"]
+audio = ["dep:kaudio"]
 
 [[example]]
 name = "pocket_tts"
