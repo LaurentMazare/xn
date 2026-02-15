@@ -9,8 +9,10 @@ categories = ["science"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
+cudarc = { version = "0.19.0", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"], default-features=false, optional = true }
 gemm = "0.19.0"
 half = { version = "2.7.1", features = ["num-traits"] }
+kaudio = { version = "0.2.1", optional = true }
 libc = { version = "0.2", optional = true }
 libm = "0.2"
 memmap2 = "0.9"
@@ -23,13 +25,10 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 yoke = { version = "0.8.1", features = ["derive"] }
 
-cudarc = { version = "0.19.0", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"], default-features=false, optional = true }
-
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hf-hub = "0.4"
-kaudio = "0.2.1"
 paste = "1"
 rand = "0.9.2"
 serde_json = "1"
@@ -42,7 +41,16 @@ bindgen_cuda = { version = "0.1.6", optional = true }
 [features]
 default = []
 accelerate = ["dep:libc"]
+audio = ["dep:kaudio"]
 cuda = ["dep:cudarc", "dep:bindgen_cuda"]
+
+[[example]]
+name = "mimi"
+required-features = ["audio"]
+
+[[example]]
+name = "demucs"
+required-features = ["audio"]
 
 [[example]]
 name = "basic_cuda"

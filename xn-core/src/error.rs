@@ -74,7 +74,7 @@ pub enum Error {
 
     #[cfg(feature = "cuda")]
     #[error(transparent)]
-    CudaDriver(#[from] cudarc::driver::DriverError),
+    CudaDriver(cudarc::driver::DriverError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
