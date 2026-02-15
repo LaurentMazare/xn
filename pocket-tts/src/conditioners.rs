@@ -12,12 +12,10 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
     pub fn load(
         vb: &Path<B>,
         n_bins: usize,
-        tokenizer_path: &str,
+        tokenizer: sentencepiece::SentencePieceProcessor,
         dim: usize,
         output_dim: usize,
     ) -> Result<Self> {
-        let tokenizer = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
-            .map_err(|e| xn::Error::Msg(format!("Failed to load tokenizer: {e}")))?;
         let embed = vb.tensor("embed.weight", (n_bins + 1, dim))?;
         Ok(Self { tokenizer, embed, dim, output_dim })
     }

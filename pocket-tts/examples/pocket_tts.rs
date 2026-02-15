@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use pocket_tts::flow_lm::FlowLMConfig;
-use pocket_tts::mimi::MimiConfig;
 use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt};
 use xn::nn::VB;
 use xn::{Backend, Tensor};
@@ -187,49 +185,10 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let vb = VB::load_with_key_map(&[&model_path], dev.clone(), remap_key)?;
     let root = vb.root();
 
-    let tokenizer_str = tokenizer_path.to_str().context("invalid tokenizer path")?;
+    let tokenizer_path = tokenizer_path.to_str().context("invalid tokenizer path")?;
+    let tokenizer = sentencepiece::SentencePieceProcessor::open(tokenizer_path)?;
 
-    let cfg = TTSConfig {
-        flow_lm: FlowLMConfig {
-            d_model: 1024,
-            num_heads: 16,
-            num_layers: 6,
-            dim_feedforward: 4096,
-            max_period: 10000.0,
-            n_bins: 4000,
-            tokenizer_path: tokenizer_str.to_string(),
-            lut_dim: 1024,
-            flow_dim: 512,
-            flow_depth: 6,
-            ldim: 32,
-        },
-        mimi: MimiConfig {
-            channels: 1,
-            sample_rate: 24000,
-            frame_rate: 12,
-            dimension: 512,
-            quantizer_dimension: 32,
-            quantizer_output_dimension: 512,
-            n_filters: 64,
-            n_residual_layers: 1,
-            ratios: vec![6, 5, 4],
-            kernel_size: 7,
-            last_kernel_size: 3,
-            residual_kernel_size: 3,
-            dilation_base: 2,
-            compress: 2,
-            transformer_d_model: 512,
-            transformer_num_heads: 8,
-            transformer_num_layers: 2,
-            transformer_layer_scale: 0.01,
-            transformer_context: 250,
-            transformer_max_period: 10000.0,
-            transformer_dim_feedforward: 2048,
-        },
-        temp: args.temperature,
-        lsd_decode_steps: 1,
-        eos_threshold: -4.0,
-    };
+    let cfg = TTSConfig::v202601(args.temperature);
 
     let mut rng = match args.rng_values {
         Some(path) => Rng::from_file(&path)?,
@@ -244,7 +203,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         xn::with_f16c()
     );
 
-    let model: TTSModel<f32, Dev> = TTSModel::load(&root, &cfg)?;
+    let model: TTSModel<f32, Dev> = TTSModel::load(&root, tokenizer, &cfg)?;
     tracing::info!("model loaded successfully!");
 
     // Prepare text

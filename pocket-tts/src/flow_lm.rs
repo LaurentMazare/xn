@@ -43,7 +43,6 @@ pub struct FlowLMConfig {
     pub dim_feedforward: usize,
     pub max_period: f32,
     pub n_bins: usize,
-    pub tokenizer_path: String,
     pub lut_dim: usize,
     pub flow_dim: usize,
     pub flow_depth: usize,
@@ -71,11 +70,15 @@ pub struct FlowLMState<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
-    pub fn load(vb: &Path<B>, cfg: &FlowLMConfig) -> Result<Self> {
+    pub fn load(
+        vb: &Path<B>,
+        tokenizer: sentencepiece::SentencePieceProcessor,
+        cfg: &FlowLMConfig,
+    ) -> Result<Self> {
         let conditioner = LUTConditioner::load(
             &vb.pp("conditioner"),
             cfg.n_bins,
-            &cfg.tokenizer_path,
+            tokenizer,
             cfg.lut_dim,
             cfg.d_model,
         )?;

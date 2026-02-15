@@ -11,6 +11,51 @@ pub struct TTSConfig {
     pub eos_threshold: f32,
 }
 
+impl TTSConfig {
+    pub fn v202601(temp: f32) -> Self {
+        Self {
+            flow_lm: FlowLMConfig {
+                d_model: 1024,
+                num_heads: 16,
+                num_layers: 6,
+                dim_feedforward: 4096,
+                max_period: 10000.0,
+                n_bins: 4000,
+                lut_dim: 1024,
+                flow_dim: 512,
+                flow_depth: 6,
+                ldim: 32,
+            },
+            mimi: MimiConfig {
+                channels: 1,
+                sample_rate: 24000,
+                frame_rate: 12,
+                dimension: 512,
+                quantizer_dimension: 32,
+                quantizer_output_dimension: 512,
+                n_filters: 64,
+                n_residual_layers: 1,
+                ratios: vec![6, 5, 4],
+                kernel_size: 7,
+                last_kernel_size: 3,
+                residual_kernel_size: 3,
+                dilation_base: 2,
+                compress: 2,
+                transformer_d_model: 512,
+                transformer_num_heads: 8,
+                transformer_num_layers: 2,
+                transformer_layer_scale: 0.01,
+                transformer_context: 250,
+                transformer_max_period: 10000.0,
+                transformer_dim_feedforward: 2048,
+            },
+            temp,
+            lsd_decode_steps: 1,
+            eos_threshold: -4.0,
+        }
+    }
+}
+
 pub struct TTSModel<T: WithDTypeF, B: Backend> {
     pub flow_lm: FlowLM<T, B>,
     pub mimi: MimiModel<T, B>,
@@ -24,8 +69,12 @@ pub struct TTSState<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
-    pub fn load(vb: &Path<B>, cfg: &TTSConfig) -> Result<Self> {
-        let flow_lm = FlowLM::load(&vb.pp("flow_lm"), &cfg.flow_lm)?;
+    pub fn load(
+        vb: &Path<B>,
+        tokenizer: sentencepiece::SentencePieceProcessor,
+        cfg: &TTSConfig,
+    ) -> Result<Self> {
+        let flow_lm = FlowLM::load(&vb.pp("flow_lm"), tokenizer, &cfg.flow_lm)?;
         let mimi = MimiModel::load(&vb.pp("mimi"), &cfg.mimi)?;
 
         let speaker_proj = if vb.contains("flow_lm.speaker_proj_weight") {
