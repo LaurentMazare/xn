@@ -14,3 +14,6 @@ js-sys = "0.3"
 rand = { version = "0.9", default-features = false, features = ["std_rng"] }
 rand_distr = "0.5"
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = false
