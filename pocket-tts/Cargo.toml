@@ -1,0 +1,24 @@
+[package]
+name = "pocket_tts"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xn = { path = "../xn-core" }
+rand = "0.9"
+rand_distr = "0.5"
+sentencepiece = "0.13.1"
+tracing = "0.1.44"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hf-hub = "0.4"
+kaudio = "0.2.1"
+serde_json = "1.0"
+tracing-chrome = "0.7"
+
+[features]
+default = []
+cuda = ["xn/cuda"]

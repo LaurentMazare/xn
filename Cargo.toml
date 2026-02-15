@@ -1,0 +1,10 @@
+[workspace]
+members = ["xn-core", "pocket-tts"]
+resolver = "3"
+
+[profile.release]
+debug = true
+
+[profile.release-no-debug]
+inherits = "release"
+debug = false

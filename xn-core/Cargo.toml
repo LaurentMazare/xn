@@ -1,0 +1,53 @@
+[package]
+name = "xn"
+version = "0.1.0"
+edition = "2024"
+description = "Another minimalist deep-learning framework optimized for inference."
+repository = "https://github.com/LaurentMazare/xn"
+keywords = ["pytorch", "deep-learning", "machine-learning"]
+categories = ["science"]
+license = "MIT/Apache-2.0"
+
+[dependencies]
+gemm = "0.19.0"
+half = { version = "2.7.1", features = ["num-traits"] }
+libc = { version = "0.2", optional = true }
+libm = "0.2"
+memmap2 = "0.9"
+num-traits = "0.2.19"
+num_cpus = "1.17.0"
+rayon = "1.11.0"
+safetensors = "0.4"
+thiserror = "2.0.17"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+yoke = { version = "0.8.1", features = ["derive"] }
+
+cudarc = { version = "0.19.0", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"], default-features=false, optional = true }
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hf-hub = "0.4"
+kaudio = "0.2.1"
+paste = "1"
+rand = "0.9.2"
+serde_json = "1"
+tokenizers = "0.21"
+tracing-chrome = "0.7.2"
+
+[build-dependencies]
+bindgen_cuda = { version = "0.1.6", optional = true }
+
+[features]
+default = []
+accelerate = ["dep:libc"]
+cuda = ["dep:cudarc", "dep:bindgen_cuda"]
+
+[[example]]
+name = "basic_cuda"
+required-features = ["cuda"]
+
+[[example]]
+name = "cuda_thread_test"
+required-features = ["cuda"]
