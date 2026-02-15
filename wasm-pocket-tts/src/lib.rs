@@ -4,7 +4,7 @@ use wasm_bindgen::prelude::*;
 use pocket_tts::flow_lm;
 use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt};
 use xn::nn::VB;
-use xn::{CpuDevice, Tensor, CPU};
+use xn::{CPU, CpuDevice, Tensor};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
 struct PresetTokenizer {
@@ -13,7 +13,9 @@ struct PresetTokenizer {
 
 impl PresetTokenizer {
     fn new() -> Self {
-        Self { tokens: Mutex::new(Vec::new()) }
+        Self {
+            tokens: Mutex::new(Vec::new()),
+        }
     }
 
     fn set_tokens(&self, tokens: Vec<u32>) {
@@ -47,7 +49,10 @@ impl WasmRng {
         let std = temperature.sqrt();
         let distr = rand_distr::Normal::new(0f32, std).unwrap();
         let rng = rand::rngs::StdRng::seed_from_u64(42);
-        Self { inner: Box::new(rng), distr }
+        Self {
+            inner: Box::new(rng),
+            distr,
+        }
     }
 }
 
@@ -131,7 +136,12 @@ impl Model {
             voice_emb
         };
 
-        Ok(Model { inner: model, voice_emb, tokenizer, cfg })
+        Ok(Model {
+            inner: model,
+            voice_emb,
+            tokenizer,
+            cfg,
+        })
     }
 
     /// Prepare text for generation: capitalize, add punctuation, pad short text.
@@ -165,10 +175,14 @@ impl Model {
         let mut mimi_state = self.inner.init_mimi_state(1, 250).map_err(e)?;
 
         // Prompt with voice
-        self.inner.prompt_audio(&mut tts_state, &self.voice_emb).map_err(e)?;
+        self.inner
+            .prompt_audio(&mut tts_state, &self.voice_emb)
+            .map_err(e)?;
 
         // Prompt with text
-        self.inner.prompt_text(&mut tts_state, token_ids).map_err(e)?;
+        self.inner
+            .prompt_text(&mut tts_state, token_ids)
+            .map_err(e)?;
 
         let mut rng = WasmRng::new(temperature);
 
@@ -182,10 +196,15 @@ impl Model {
         let mut audio_chunks: Vec<Tensor<f32, CpuDevice>> = Vec::new();
 
         for _step in 0..max_frames {
-            let (next_latent, is_eos) =
-                self.inner.generate_step(&mut tts_state, &prev_latent, &mut rng).map_err(e)?;
+            let (next_latent, is_eos) = self
+                .inner
+                .generate_step(&mut tts_state, &prev_latent, &mut rng)
+                .map_err(e)?;
 
-            let audio_chunk = self.inner.decode_latent(&next_latent, &mut mimi_state).map_err(e)?;
+            let audio_chunk = self
+                .inner
+                .decode_latent(&next_latent, &mut mimi_state)
+                .map_err(e)?;
             audio_chunks.push(audio_chunk);
 
             if is_eos && eos_countdown.is_none() {
