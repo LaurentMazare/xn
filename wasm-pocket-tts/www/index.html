@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket TTS - WebAssembly Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { margin-bottom: 8px; }
+  .subtitle { color: #666; margin-bottom: 24px; }
+  .section { margin-bottom: 20px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  select, textarea, button { font-family: inherit; font-size: 14px; }
+  select { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; }
+  textarea { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; resize: vertical; }
+  button { padding: 10px 24px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: #1d4ed8; }
+  #status { margin-top: 12px; padding: 10px; background: #f1f5f9; border-radius: 4px; font-size: 13px; white-space: pre-wrap; }
+  .progress-bar { width: 100%; height: 6px; background: #e2e8f0; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  .progress-bar .fill { height: 100%; background: #2563eb; transition: width 0.2s; }
+  audio { width: 100%; margin-top: 12px; }
+  .controls { display: flex; gap: 10px; align-items: end; }
+  .controls .section { margin-bottom: 0; }
+</style>
+</head>
+<body>
+
+<h1>Pocket TTS</h1>
+<p class="subtitle">Text-to-speech in the browser via WebAssembly</p>
+
+<div class="section">
+  <label for="text">Text to speak</label>
+  <textarea id="text" rows="3">The quick brown fox jumps over the lazy dog.</textarea>
+</div>
+
+<div class="controls">
+  <div class="section">
+    <label for="voice">Voice</label>
+    <select id="voice">
+      <option value="alba" selected>Alba</option>
+      <option value="marius">Marius</option>
+      <option value="javert">Javert</option>
+      <option value="jean">Jean</option>
+      <option value="fantine">Fantine</option>
+      <option value="cosette">Cosette</option>
+      <option value="eponine">Eponine</option>
+      <option value="azelma">Azelma</option>
+    </select>
+  </div>
+  <button id="generate-btn" disabled>Generate</button>
+</div>
+
+<div class="progress-bar" id="progress-bar" style="display:none"><div class="fill" id="progress-fill"></div></div>
+<div id="status">Initializing...</div>
+<div id="audio-container"></div>
+
+<script type="module">
+import init, { Model } from './wasm_pocket_tts.js';
+
+const HF_BASE = 'https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main';
+const MODEL_URL = `${HF_BASE}/tts_b6369a24.safetensors`;
+const TOKENIZER_URL = `${HF_BASE}/tokenizer.model`;
+
+function voiceUrl(name) {
+  return `${HF_BASE}/embeddings/${name}.safetensors`;
+}
+
+const statusEl = document.getElementById('status');
+const btn = document.getElementById('generate-btn');
+const voiceSelect = document.getElementById('voice');
+const progressBar = document.getElementById('progress-bar');
+const progressFill = document.getElementById('progress-fill');
+
+function log(msg) {
+  statusEl.textContent = msg;
+  console.log(msg);
+}
+
+function showProgress(pct) {
+  progressBar.style.display = 'block';
+  progressFill.style.width = pct + '%';
+}
+
+function hideProgress() {
+  progressBar.style.display = 'none';
+}
+
+// ---- Fetch with progress ----
+async function fetchWithProgress(url, label) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
+  const total = parseInt(resp.headers.get('content-length') || '0', 10);
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (total > 0) {
+      const pct = Math.round(received / total * 100);
+      log(`${label}: ${pct}% (${(received / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB)`);
+      showProgress(pct);
+    } else {
+      log(`${label}: ${(received / 1e6).toFixed(1)} MB`);
+    }
+  }
+  hideProgress();
+  const buf = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return buf;
+}
+
+// ---- Minimal protobuf decoder for sentencepiece .model files ----
+function decodeSentencepieceModel(buffer) {
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  let pos = 0;
+
+  function readVarint() {
+    let result = 0, shift = 0;
+    while (pos < buffer.length) {
+      const b = buffer[pos++];
+      result |= (b & 0x7f) << shift;
+      shift += 7;
+      if ((b & 0x80) === 0) return result;
+    }
+    return result;
+  }
+
+  function readBytes(n) {
+    const data = buffer.slice(pos, pos + n);
+    pos += n;
+    return data;
+  }
+
+  function decodePiece(data) {
+    let pPos = 0, piece = '', score = 0, type = 1; // NORMAL=1
+    const pView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    while (pPos < data.length) {
+      const key = readVarIntFrom(data, pPos);
+      pPos = key.pos;
+      const fieldNum = key.val >>> 3;
+      const wireType = key.val & 0x7;
+      if (fieldNum === 1 && wireType === 2) {
+        const len = readVarIntFrom(data, pPos);
+        pPos = len.pos;
+        piece = new TextDecoder().decode(data.slice(pPos, pPos + len.val));
+        pPos += len.val;
+      } else if (fieldNum === 2 && wireType === 5) {
+        score = pView.getFloat32(pPos, true);
+        pPos += 4;
+      } else if (fieldNum === 3 && wireType === 0) {
+        const v = readVarIntFrom(data, pPos);
+        type = v.val;
+        pPos = v.pos;
+      } else {
+        // skip unknown field
+        if (wireType === 0) { const v = readVarIntFrom(data, pPos); pPos = v.pos; }
+        else if (wireType === 1) { pPos += 8; }
+        else if (wireType === 2) { const len = readVarIntFrom(data, pPos); pPos = len.pos + len.val; }
+        else if (wireType === 5) { pPos += 4; }
+        else break;
+      }
+    }
+    return { piece, score, type };
+  }
+
+  function readVarIntFrom(buf, p) {
+    let result = 0, shift = 0;
+    while (p < buf.length) {
+      const b = buf[p++];
+      result |= (b & 0x7f) << shift;
+      shift += 7;
+      if ((b & 0x80) === 0) return { val: result, pos: p };
+    }
+    return { val: result, pos: p };
+  }
+
+  const pieces = [];
+  while (pos < buffer.length) {
+    const key = readVarint();
+    const fieldNum = key >>> 3;
+    const wireType = key & 0x7;
+    if (fieldNum === 1 && wireType === 2) {
+      const len = readVarint();
+      const data = readBytes(len);
+      const p = decodePiece(data);
+      pieces.push(p);
+    } else {
+      // skip other fields
+      if (wireType === 0) { readVarint(); }
+      else if (wireType === 1) { pos += 8; }
+      else if (wireType === 2) { const len = readVarint(); pos += len; }
+      else if (wireType === 5) { pos += 4; }
+      else break;
+    }
+  }
+  return pieces;
+}
+
+// ---- Unigram tokenizer (Viterbi) ----
+class UnigramTokenizer {
+  constructor(pieces) {
+    // Build trie for efficient prefix matching
+    this.pieces = pieces;
+    this.vocab = new Map();
+    this.unkId = 0;
+    for (let i = 0; i < pieces.length; i++) {
+      const p = pieces[i];
+      if (p.type === 2) this.unkId = i; // UNKNOWN type
+      if (p.type === 1 || p.type === 4) { // NORMAL or USER_DEFINED
+        this.vocab.set(p.piece, { id: i, score: p.score });
+      }
+      // type 6 = BYTE pieces like <0x41>
+      if (p.type === 6) {
+        this.vocab.set(p.piece, { id: i, score: p.score });
+      }
+    }
+  }
+
+  encode(text) {
+    // Sentencepiece uses U+2581 (lower one eighth block) as space replacement
+    const normalized = '\u2581' + text.replace(/ /g, '\u2581');
+    return this._viterbi(normalized);
+  }
+
+  _viterbi(text) {
+    const n = text.length;
+    // best[i] = { score, len, id } = best way to tokenize text[0..i]
+    const best = new Array(n + 1);
+    best[0] = { score: 0, len: 0, id: -1 };
+    for (let i = 1; i <= n; i++) {
+      best[i] = { score: -Infinity, len: 0, id: -1 };
+    }
+
+    for (let i = 0; i < n; i++) {
+      if (best[i].score === -Infinity) continue;
+      // Try all substrings starting at i
+      for (let len = 1; len <= n - i && len <= 64; len++) {
+        const sub = text.substring(i, i + len);
+        const entry = this.vocab.get(sub);
+        if (entry) {
+          const newScore = best[i].score + entry.score;
+          if (newScore > best[i + len].score) {
+            best[i + len] = { score: newScore, len: len, id: entry.id };
+          }
+        }
+      }
+      // Fallback: if next position is unreachable, use single character (byte fallback)
+      if (best[i + 1].score === -Infinity) {
+        // Try byte-level encoding
+        const ch = text.charCodeAt(i);
+        const byteStr = `<0x${ch.toString(16).toUpperCase().padStart(2, '0')}>`;
+        const byteEntry = this.vocab.get(byteStr);
+        const fallbackId = byteEntry ? byteEntry.id : this.unkId;
+        const fallbackScore = byteEntry ? byteEntry.score : -100;
+        best[i + 1] = { score: best[i].score + fallbackScore, len: 1, id: fallbackId };
+      }
+    }
+
+    // Backtrack
+    const ids = [];
+    let p = n;
+    while (p > 0) {
+      ids.push(best[p].id);
+      p -= best[p].len;
+    }
+    ids.reverse();
+    return new Uint32Array(ids);
+  }
+}
+
+// ---- Main ----
+let model = null;
+let tokenizer = null;
+let cachedVoice = { name: null, data: null };
+
+async function loadTokenizer() {
+  log('Downloading tokenizer...');
+  const data = await fetchWithProgress(TOKENIZER_URL, 'Tokenizer');
+  const pieces = decodeSentencepieceModel(data);
+  tokenizer = new UnigramTokenizer(pieces);
+  log(`Tokenizer loaded (${pieces.length} pieces)`);
+}
+
+async function loadModel() {
+  log('Downloading model weights (this may take a while)...');
+  const modelData = await fetchWithProgress(MODEL_URL, 'Model weights');
+  const voiceName = voiceSelect.value;
+  log(`Downloading voice embedding (${voiceName})...`);
+  const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
+  cachedVoice = { name: voiceName, data: voiceData };
+
+  log('Initializing WASM model...');
+  model = new Model(modelData, voiceData);
+  log('Model ready!');
+}
+
+async function ensureVoice() {
+  const voiceName = voiceSelect.value;
+  if (cachedVoice.name === voiceName) return;
+  log(`Downloading voice embedding (${voiceName})...`);
+  const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
+  cachedVoice = { name: voiceName, data: voiceData };
+  // Need to reload model with new voice
+  log('Reloading model with new voice...');
+  // We'd need the model weights cached too. For simplicity, store them.
+  // This is handled below with cachedModelWeights.
+}
+
+let cachedModelWeights = null;
+
+async function initialize() {
+  try {
+    await init();
+    log('WASM initialized. Downloading tokenizer and model...');
+
+    // Download tokenizer and model in parallel
+    const tokenizerPromise = loadTokenizerData();
+    log('Downloading model weights (this may take a while)...');
+    cachedModelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
+
+    await tokenizerPromise;
+
+    const voiceName = voiceSelect.value;
+    log(`Downloading voice embedding (${voiceName})...`);
+    const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
+    cachedVoice = { name: voiceName, data: voiceData };
+
+    log('Initializing model...');
+    model = new Model(cachedModelWeights, voiceData);
+    log('Ready! Enter text and click Generate.');
+    btn.disabled = false;
+  } catch (e) {
+    log('Error during initialization: ' + e.message);
+    console.error(e);
+  }
+}
+
+async function loadTokenizerData() {
+  log('Downloading tokenizer...');
+  const data = await fetchWithProgress(TOKENIZER_URL, 'Tokenizer');
+  const pieces = decodeSentencepieceModel(data);
+  tokenizer = new UnigramTokenizer(pieces);
+  log(`Tokenizer loaded (${pieces.length} pieces)`);
+}
+
+async function generate() {
+  const text = document.getElementById('text').value.trim();
+  if (!text) return;
+  btn.disabled = true;
+
+  try {
+    // Check if voice changed
+    const voiceName = voiceSelect.value;
+    if (cachedVoice.name !== voiceName) {
+      log(`Downloading voice embedding (${voiceName})...`);
+      const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
+      cachedVoice = { name: voiceName, data: voiceData };
+      log('Reloading model with new voice...');
+      model = new Model(cachedModelWeights, voiceData);
+    }
+
+    // Prepare and tokenize text
+    const [processedText, framesAfterEos] = model.prepare_text(text);
+    const tokenIds = tokenizer.encode(processedText);
+    log(`Generating speech (${tokenIds.length} tokens)...`);
+
+    // Use setTimeout to let the UI update before the blocking generate call
+    await new Promise(r => setTimeout(r, 50));
+    const startTime = performance.now();
+    const pcm = model.generate(tokenIds, framesAfterEos, 0.7);
+    const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+    const sampleRate = model.sample_rate();
+    const duration = (pcm.length / sampleRate).toFixed(2);
+    log(`Generated ${duration}s of audio in ${elapsed}s`);
+
+    // Play audio
+    playAudio(pcm, sampleRate);
+  } catch (e) {
+    log('Error: ' + e.message);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function playAudio(pcm, sampleRate) {
+  const ctx = new AudioContext({ sampleRate });
+  const buffer = ctx.createBuffer(1, pcm.length, sampleRate);
+  buffer.getChannelData(0).set(pcm);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.start();
+
+  // Also create a download/replay element
+  const container = document.getElementById('audio-container');
+  container.innerHTML = '';
+  // Encode as WAV for the audio element
+  const wavBlob = encodeWav(pcm, sampleRate);
+  const url = URL.createObjectURL(wavBlob);
+  const audio = document.createElement('audio');
+  audio.controls = true;
+  audio.src = url;
+  container.appendChild(audio);
+}
+
+function encodeWav(samples, sampleRate) {
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  const blockAlign = numChannels * bitsPerSample / 8;
+  const dataSize = samples.length * blockAlign;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  function writeString(offset, str) {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  }
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    s = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    view.setInt16(offset, s, true);
+    offset += 2;
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+btn.addEventListener('click', generate);
+initialize();
+</script>
+</body>
+</html>

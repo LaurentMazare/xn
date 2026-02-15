@@ -63,6 +63,39 @@ fn load_tensor_data_with_key_map(
     Ok(tensor_data)
 }
 
+fn load_tensor_data_from_bytes(
+    buffers: &[Vec<u8>],
+) -> Result<std::collections::HashMap<String, TensorData<'_>>> {
+    load_tensor_data_from_bytes_with_key_map(buffers, |name| Some(name.to_string()))
+}
+
+fn load_tensor_data_from_bytes_with_key_map(
+    buffers: &[Vec<u8>],
+    key_map: impl Fn(&str) -> Option<String>,
+) -> Result<std::collections::HashMap<String, TensorData<'_>>> {
+    let mut tensor_data = std::collections::HashMap::new();
+    for buffer in buffers {
+        let tensors = safetensors::SafeTensors::deserialize(buffer)?;
+        for (name, tensor) in tensors.iter() {
+            let mapped_name = match key_map(name) {
+                Some(n) => n,
+                None => continue,
+            };
+            let shape: Shape = tensor.shape().into();
+            let data = tensor.data();
+            let dtype = match tensor.dtype() {
+                safetensors::Dtype::F32 => crate::DType::F32,
+                safetensors::Dtype::F16 => crate::DType::F16,
+                safetensors::Dtype::BF16 => crate::DType::BF16,
+                _ => continue,
+            };
+            let td = TensorData { data, shape, dtype };
+            tensor_data.insert(mapped_name, td);
+        }
+    }
+    Ok(tensor_data)
+}
+
 impl<'a, B: Backend> VarBuilder<'a, B> {
     pub fn load(mmaped_files: &'a MmapedFiles, device: B) -> Result<Self> {
         let tensor_data = load_tensor_data(mmaped_files)?;
@@ -115,10 +148,35 @@ struct VarBuilderYoke<'a> {
     tensor_data: std::collections::HashMap<String, TensorData<'a>>,
 }
 
-/// A self-contained VarBuilder that owns its memory-mapped files.
-/// This wrapper uses yoke to safely combine owned MmapedFiles with borrowed tensor data.
+#[derive(yoke::Yokeable)]
+struct VarBuilderYokeBytes<'a> {
+    tensor_data: std::collections::HashMap<String, TensorData<'a>>,
+}
+
+enum VBData {
+    Mmap(yoke::Yoke<VarBuilderYoke<'static>, Box<MmapedFiles>>),
+    Bytes(yoke::Yoke<VarBuilderYokeBytes<'static>, Vec<Vec<u8>>>),
+}
+
+impl VBData {
+    fn get_tensor<'a>(&'a self, name: &str) -> Option<&'a TensorData<'a>> {
+        match self {
+            Self::Mmap(yoke) => yoke.get().tensor_data.get(name),
+            Self::Bytes(yoke) => yoke.get().tensor_data.get(name),
+        }
+    }
+
+    fn tensor_names(&self) -> Vec<&str> {
+        match self {
+            Self::Mmap(yoke) => yoke.get().tensor_data.keys().map(|k| k.as_str()).collect(),
+            Self::Bytes(yoke) => yoke.get().tensor_data.keys().map(|k| k.as_str()).collect(),
+        }
+    }
+}
+
+/// A self-contained VarBuilder that owns its data (memory-mapped files or byte buffers).
 pub struct VB<B: Backend> {
-    yoke: yoke::Yoke<VarBuilderYoke<'static>, Box<MmapedFiles>>,
+    data: VBData,
     device: B,
 }
 
@@ -129,7 +187,7 @@ impl<B: Backend> VB<B> {
             let tensor_data = load_tensor_data(mmaps)?;
             Ok(VarBuilderYoke { tensor_data })
         })?;
-        Ok(Self { yoke, device })
+        Ok(Self { data: VBData::Mmap(yoke), device })
     }
 
     pub fn load_with_key_map<P: AsRef<std::path::Path>>(
@@ -142,11 +200,31 @@ impl<B: Backend> VB<B> {
             let tensor_data = load_tensor_data_with_key_map(mmaps, &key_map)?;
             Ok(VarBuilderYoke { tensor_data })
         })?;
-        Ok(Self { yoke, device })
+        Ok(Self { data: VBData::Mmap(yoke), device })
+    }
+
+    pub fn from_bytes(data: Vec<Vec<u8>>, device: B) -> Result<Self> {
+        let yoke = yoke::Yoke::try_attach_to_cart(data, |buffers| -> Result<_> {
+            let tensor_data = load_tensor_data_from_bytes(buffers)?;
+            Ok(VarBuilderYokeBytes { tensor_data })
+        })?;
+        Ok(Self { data: VBData::Bytes(yoke), device })
+    }
+
+    pub fn from_bytes_with_key_map(
+        data: Vec<Vec<u8>>,
+        device: B,
+        key_map: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let yoke = yoke::Yoke::try_attach_to_cart(data, |buffers| -> Result<_> {
+            let tensor_data = load_tensor_data_from_bytes_with_key_map(buffers, &key_map)?;
+            Ok(VarBuilderYokeBytes { tensor_data })
+        })?;
+        Ok(Self { data: VBData::Bytes(yoke), device })
     }
 
     pub fn get_tensor(&self, name: &str) -> Option<&TensorData<'_>> {
-        self.yoke.get().tensor_data.get(name)
+        self.data.get_tensor(name)
     }
 
     pub fn device(&self) -> &B {
@@ -158,12 +236,12 @@ impl<B: Backend> VB<B> {
         name: &str,
         shape: impl Into<Shape>,
     ) -> Result<Tensor<T, B>> {
-        let td = self.yoke.get().tensor_data.get(name);
+        let td = self.data.get_tensor(name);
         make_tensor(td, name, shape, &self.device)
     }
 
     pub fn tensor_names(&self) -> Vec<&str> {
-        self.yoke.get().tensor_data.keys().map(|k| k.as_str()).collect()
+        self.data.tensor_names()
     }
 
     pub fn root(self) -> Path<B> {

@@ -844,9 +844,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3180,6 +3182,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-pocket-tts"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "js-sys",
+ "pocket_tts",
+ "rand",
+ "rand_distr",
+ "wasm-bindgen",
+ "xn",
 ]
 
 [[package]]

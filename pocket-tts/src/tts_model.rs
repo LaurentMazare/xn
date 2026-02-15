@@ -71,7 +71,7 @@ pub struct TTSState<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
     pub fn load(
         vb: &Path<B>,
-        tokenizer: sentencepiece::SentencePieceProcessor,
+        tokenizer: Box<dyn crate::Tokenizer + Send + Sync>,
         cfg: &TTSConfig,
     ) -> Result<Self> {
         let flow_lm = FlowLM::load(&vb.pp("flow_lm"), tokenizer, &cfg.flow_lm)?;

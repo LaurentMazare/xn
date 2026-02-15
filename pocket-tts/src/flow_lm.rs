@@ -72,7 +72,7 @@ pub struct FlowLMState<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
     pub fn load(
         vb: &Path<B>,
-        tokenizer: sentencepiece::SentencePieceProcessor,
+        tokenizer: Box<dyn crate::Tokenizer + Send + Sync>,
         cfg: &FlowLMConfig,
     ) -> Result<Self> {
         let conditioner = LUTConditioner::load(

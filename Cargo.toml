@@ -1,5 +1,5 @@
 [workspace]
-members = ["xn-core", "pocket-tts"]
+members = ["xn-core", "pocket-tts", "wasm-pocket-tts"]
 resolver = "3"
 
 [profile.release]

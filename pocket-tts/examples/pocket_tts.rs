@@ -4,6 +4,15 @@ use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt};
 use xn::nn::VB;
 use xn::{Backend, Tensor};
 
+struct SpTokenizer(sentencepiece::SentencePieceProcessor);
+
+impl pocket_tts::Tokenizer for SpTokenizer {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        let pieces = self.0.encode(text).unwrap_or_default();
+        pieces.iter().map(|p| p.id).collect()
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "pocket-tts")]
 #[command(about = "Generate speech from text using Pocket TTS")]
@@ -186,7 +195,8 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let root = vb.root();
 
     let tokenizer_path = tokenizer_path.to_str().context("invalid tokenizer path")?;
-    let tokenizer = sentencepiece::SentencePieceProcessor::open(tokenizer_path)?;
+    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)?;
+    let tokenizer = SpTokenizer(sp);
 
     let cfg = TTSConfig::v202601(args.temperature);
 
@@ -203,7 +213,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         xn::with_f16c()
     );
 
-    let model: TTSModel<f32, Dev> = TTSModel::load(&root, tokenizer, &cfg)?;
+    let model: TTSModel<f32, Dev> = TTSModel::load(&root, Box::new(tokenizer), &cfg)?;
     tracing::info!("model loaded successfully!");
 
     // Prepare text
@@ -276,7 +286,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
             if wait_to_decode {
                 tracing::info!("waiting for generation to finish before decoding...");
                 while !is_done.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
             while let Ok(next_latent) = latent_rx.recv() {

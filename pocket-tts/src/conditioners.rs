@@ -1,8 +1,9 @@
+use crate::Tokenizer;
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 pub struct LUTConditioner<T: WithDTypeF, B: Backend> {
-    pub tokenizer: sentencepiece::SentencePieceProcessor,
+    pub tokenizer: Box<dyn Tokenizer + Send + Sync>,
     embed: Tensor<T, B>,
     pub dim: usize,
     pub output_dim: usize,
@@ -12,7 +13,7 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
     pub fn load(
         vb: &Path<B>,
         n_bins: usize,
-        tokenizer: sentencepiece::SentencePieceProcessor,
+        tokenizer: Box<dyn Tokenizer + Send + Sync>,
         dim: usize,
         output_dim: usize,
     ) -> Result<Self> {
@@ -22,8 +23,7 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
 
     /// Tokenize text and return token ids.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
-        let pieces = self.tokenizer.encode(text).unwrap_or_default();
-        pieces.iter().map(|p| p.id).collect()
+        self.tokenizer.encode(text)
     }
 
     /// Get embeddings for token ids. Returns [1, num_tokens, dim].
