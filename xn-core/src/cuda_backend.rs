@@ -185,6 +185,101 @@ fn kernel_name<T: WithDType>(base_name: &str) -> String {
     format!("{base_name}_{dtype_str}")
 }
 
+fn gemm_config<T: num_traits::Zero + num_traits::One + std::fmt::Debug>(
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_b: usize,
+    lhs_b_stride: usize,
+    rhs_b_stride: usize,
+    (_dst_cs, dst_rs): (usize, usize),
+    (lhs_m1, lhs_m2): (usize, usize),
+    (rhs_m1, rhs_m2): (usize, usize),
+) -> Result<StridedBatchedConfig<T>> {
+    use cudarc::cublas::sys::cublasOperation_t;
+
+    // Determine transposition and leading dimension for rhs (A in cuBLAS terms)
+    let (lda, transa) = if rhs_m1 == 1 || n == 1 {
+        (rhs_m2 as i32, cublasOperation_t::CUBLAS_OP_N)
+    } else if rhs_m2 == 1 || k == 1 {
+        (rhs_m1 as i32, cublasOperation_t::CUBLAS_OP_T)
+    } else {
+        crate::bail!("non-contiguous matmul rhs m:{m} n:{n} k:{k} strides:({rhs_m1}, {rhs_m2})")
+    };
+
+    // Determine transposition and leading dimension for lhs (B in cuBLAS terms)
+    let (ldb, transb) = if lhs_m1 == 1 || k == 1 {
+        (lhs_m2 as i32, cublasOperation_t::CUBLAS_OP_N)
+    } else if lhs_m2 == 1 || m == 1 {
+        (lhs_m1 as i32, cublasOperation_t::CUBLAS_OP_T)
+    } else {
+        crate::bail!("non-contiguous matmul lhs m:{m} n:{n} k:{k} strides:({lhs_m1}, {lhs_m2})")
+    };
+
+    // From the cublas documentation.
+    // https://docs.nvidia.com/cuda/cublas/#cublasgemmstridedbatchedex
+    // If m < 0 or n < 0 or k < 0, or
+    // if transa and transb are not one of CUBLAS_OP_N, CUBLAS_OP_C, CUBLAS_OP_T, or
+    // if lda < max(1, m) when transa == CUBLAS_OP_N and lda < max(1, k) otherwise, or
+    // if ldb < max(1, k) when transb == CUBLAS_OP_N and ldb < max(1, n) otherwise, or
+    // if ldc < max(1, m), or
+    // if alpha or beta are NULL, or
+    // if Atype or Btype or Ctype or algo or computeType is not supported
+    let min_lda = if transa == cublasOperation_t::CUBLAS_OP_N {
+        std::cmp::max(1, n as i32)
+    } else {
+        std::cmp::max(1, k as i32)
+    };
+    let min_ldb = if transb == cublasOperation_t::CUBLAS_OP_N {
+        std::cmp::max(1, k as i32)
+    } else {
+        std::cmp::max(1, m as i32)
+    };
+    let lda = if lda < min_lda {
+        if transa == cublasOperation_t::CUBLAS_OP_N && k == 1
+            || transa == cublasOperation_t::CUBLAS_OP_T && m == 1
+        {
+            min_lda
+        } else {
+            crate::bail!("gemm: invalid lda {lda} for transa {transa:?} m:{m} n:{n} k:{k}")
+        }
+    } else {
+        lda
+    };
+    let ldb = if ldb < min_ldb {
+        if transb == cublasOperation_t::CUBLAS_OP_N && m == 1
+            || transb == cublasOperation_t::CUBLAS_OP_T && k == 1
+        {
+            min_ldb
+        } else {
+            crate::bail!("gemm: invalid ldb {ldb} for transb {transb:?} m:{m} n:{n} k:{k}")
+        }
+    } else {
+        ldb
+    };
+
+    let gemm = GemmConfig {
+        alpha: T::one(),
+        beta: T::zero(),
+        m: n as i32,
+        n: m as i32,
+        k: k as i32,
+        lda,
+        ldb,
+        ldc: dst_rs as i32,
+        transa,
+        transb,
+    };
+    let cfg = StridedBatchedConfig {
+        batch_size: lhs_b as i32,
+        gemm,
+        stride_a: rhs_b_stride as i64,
+        stride_b: lhs_b_stride as i64,
+        stride_c: (m * n) as i64,
+    };
+    Ok(cfg)
+}
+
 /// Implementation of GEMM using cuBLAS for f32.
 fn gemm_f32(
     dst: &mut Storage<f32>,
@@ -200,46 +295,17 @@ fn gemm_f32(
     (lhs_m1, lhs_m2): (usize, usize),
     (rhs_m1, rhs_m2): (usize, usize),
 ) -> Result<()> {
-    use cudarc::cublas::sys::cublasOperation_t;
-
-    // Determine transposition and leading dimension for rhs (A in cuBLAS terms)
-    let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
-        (n as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        crate::bail!("non-contiguous matmul rhs m:{m} n:{n} k:{k} strides:({rhs_m1}, {rhs_m2})")
-    };
-
-    // Determine transposition and leading dimension for lhs (B in cuBLAS terms)
-    let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
-        (m as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        crate::bail!("non-contiguous matmul lhs m:{m} n:{n} k:{k} strides:({lhs_m1}, {lhs_m2})")
-    };
-
-    let gemm = GemmConfig {
-        alpha: 1.0f32,
-        beta: 0.0f32,
-        m: n as i32,
-        n: m as i32,
-        k: k as i32,
-        lda,
-        ldb,
-        ldc: dst_rs as i32,
-        transa,
-        transb,
-    };
-
-    let cfg = StridedBatchedConfig {
-        batch_size: lhs_b as i32,
-        gemm,
-        stride_a: rhs_b_stride as i64,
-        stride_b: lhs_b_stride as i64,
-        stride_c: (m * n) as i64,
-    };
+    let cfg = gemm_config(
+        m,
+        n,
+        k,
+        lhs_b,
+        lhs_b_stride,
+        rhs_b_stride,
+        (_dst_cs, dst_rs),
+        (lhs_m1, lhs_m2),
+        (rhs_m1, rhs_m2),
+    )?;
 
     let lhs_view = lhs.0.data.slice(lhs.1..);
     let rhs_view = rhs.0.data.slice(rhs.1..);
@@ -266,52 +332,22 @@ fn gemm_f16(
     (lhs_m1, lhs_m2): (usize, usize),
     (rhs_m1, rhs_m2): (usize, usize),
 ) -> Result<()> {
-    use cudarc::cublas::sys::cublasOperation_t;
-
-    let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
-        (n as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        crate::bail!("non-contiguous matmul rhs m:{m} n:{n} k:{k} strides:({rhs_m1}, {rhs_m2})")
-    };
-
-    let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
-        (m as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        crate::bail!("non-contiguous matmul lhs m:{m} n:{n} k:{k} strides:({lhs_m1}, {lhs_m2})")
-    };
-
-    let gemm = GemmConfig {
-        alpha: f16::ONE,
-        beta: f16::ZERO,
-        m: n as i32,
-        n: m as i32,
-        k: k as i32,
-        lda,
-        ldb,
-        ldc: dst_rs as i32,
-        transa,
-        transb,
-    };
-
-    let cfg = StridedBatchedConfig {
-        batch_size: lhs_b as i32,
-        gemm,
-        stride_a: rhs_b_stride as i64,
-        stride_b: lhs_b_stride as i64,
-        stride_c: (m * n) as i64,
-    };
-
+    let cfg = gemm_config(
+        m,
+        n,
+        k,
+        lhs_b,
+        lhs_b_stride,
+        rhs_b_stride,
+        (_dst_cs, dst_rs),
+        (lhs_m1, lhs_m2),
+        (rhs_m1, rhs_m2),
+    )?;
     let lhs_view = lhs.0.data.slice(lhs.1..);
     let rhs_view = rhs.0.data.slice(rhs.1..);
-
     unsafe {
         dst.device.blas.gemm_strided_batched(cfg, &rhs_view, &lhs_view, &mut dst.data)?;
     }
-
     Ok(())
 }
 
@@ -330,52 +366,22 @@ fn gemm_bf16(
     (lhs_m1, lhs_m2): (usize, usize),
     (rhs_m1, rhs_m2): (usize, usize),
 ) -> Result<()> {
-    use cudarc::cublas::sys::cublasOperation_t;
-
-    let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
-        (n as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        crate::bail!("non-contiguous matmul rhs m:{m} n:{n} k:{k} strides:({rhs_m1}, {rhs_m2})")
-    };
-
-    let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
-        (m as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        crate::bail!("non-contiguous matmul lhs m:{m} n:{n} k:{k} strides:({lhs_m1}, {lhs_m2})")
-    };
-
-    let gemm = GemmConfig {
-        alpha: bf16::ONE,
-        beta: bf16::ZERO,
-        m: n as i32,
-        n: m as i32,
-        k: k as i32,
-        lda,
-        ldb,
-        ldc: dst_rs as i32,
-        transa,
-        transb,
-    };
-
-    let cfg = StridedBatchedConfig {
-        batch_size: lhs_b as i32,
-        gemm,
-        stride_a: rhs_b_stride as i64,
-        stride_b: lhs_b_stride as i64,
-        stride_c: (m * n) as i64,
-    };
-
+    let cfg = gemm_config(
+        m,
+        n,
+        k,
+        lhs_b,
+        lhs_b_stride,
+        rhs_b_stride,
+        (_dst_cs, dst_rs),
+        (lhs_m1, lhs_m2),
+        (rhs_m1, rhs_m2),
+    )?;
     let lhs_view = lhs.0.data.slice(lhs.1..);
     let rhs_view = rhs.0.data.slice(rhs.1..);
-
     unsafe {
         dst.device.blas.gemm_strided_batched(cfg, &rhs_view, &lhs_view, &mut dst.data)?;
     }
-
     Ok(())
 }
 
