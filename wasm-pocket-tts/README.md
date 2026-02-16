@@ -2,6 +2,8 @@
 
 WebAssembly build of [Pocket TTS](../pocket-tts/) — run text-to-speech directly in the browser.
 
+Try it online [here](https://laurentmazare.github.io/pocket-tts).
+
 ## Prerequisites
 
 Install [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/):

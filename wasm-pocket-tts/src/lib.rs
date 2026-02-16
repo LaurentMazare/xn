@@ -3,9 +3,9 @@ use wasm_bindgen::prelude::*;
 
 use pocket_tts::flow_lm;
 use pocket_tts::mimi::MimiState;
-use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
+use pocket_tts::tts_model::{prepare_text_prompt, TTSConfig, TTSModel, TTSState};
 use xn::nn::VB;
-use xn::{CPU, CpuDevice, Tensor};
+use xn::{CpuDevice, Tensor, CPU};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
 struct PresetTokenizer {
@@ -109,42 +109,34 @@ pub struct Model {
     gen_state: Option<GenState>,
 }
 
-#[wasm_bindgen]
 impl Model {
-    #[wasm_bindgen(constructor)]
-    pub fn new(model_weights: &[u8], voice_weights: &[u8]) -> Result<Model, JsError> {
+    pub fn new_(model_weights: &[u8], voice_weights: &[u8]) -> xn::Result<Model> {
+        use xn::error::Context;
         let cfg = TTSConfig::v202601(0.7);
 
-        let vb = VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let vb = VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?;
         let root = vb.root();
         let tokenizer = std::sync::Arc::new(PresetTokenizer::new());
         let tokenizer_box: Box<dyn pocket_tts::Tokenizer + Send + Sync> =
             Box::new(SharedTokenizer(std::sync::Arc::clone(&tokenizer)));
-        let model: TTSModel<f32, CpuDevice> =
-            TTSModel::load(&root, tokenizer_box, &cfg).map_err(|e| JsError::new(&e.to_string()))?;
+        let model: TTSModel<f32, CpuDevice> = TTSModel::load(&root, tokenizer_box, &cfg)?;
 
         // Load voice embedding
-        let voice_vb = VB::from_bytes(vec![voice_weights.to_vec()], CPU)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let voice_vb = VB::from_bytes(vec![voice_weights.to_vec()], CPU)?;
         let voice_names = voice_vb.tensor_names();
         let voice_key = voice_names
             .first()
-            .ok_or_else(|| JsError::new("no tensors found in voice embedding file"))?
+            .context("no tensors found in voice embedding file")?
             .to_string();
         let voice_td = voice_vb
             .get_tensor(&voice_key)
-            .ok_or_else(|| JsError::new("voice tensor not found"))?;
+            .context("voice tensor not found")?;
         let voice_shape = voice_td.shape.clone();
         let voice_dims = voice_shape.dims().to_vec();
 
-        let voice_emb: Tensor<f32, CpuDevice> = voice_vb
-            .tensor(&voice_key, voice_shape)
-            .map_err(|e| JsError::new(&e.to_string()))?;
+        let voice_emb: Tensor<f32, CpuDevice> = voice_vb.tensor(&voice_key, voice_shape)?;
         let voice_emb = if voice_dims.len() == 2 {
-            voice_emb
-                .reshape((1, voice_dims[0], voice_dims[1]))
-                .map_err(|e| JsError::new(&e.to_string()))?
+            voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?
         } else {
             voice_emb
         };
@@ -158,121 +150,29 @@ impl Model {
         })
     }
 
-    /// Prepare text for generation: capitalize, add punctuation, pad short text.
-    /// Returns [processed_text, frames_after_eos] as a JS array.
-    pub fn prepare_text(&self, text: &str) -> js_sys::Array {
-        let (processed, frames_after_eos) = prepare_text_prompt(text);
-        let arr = js_sys::Array::new();
-        arr.push(&JsValue::from_str(&processed));
-        arr.push(&JsValue::from_f64(frames_after_eos as f64));
-        arr
-    }
-
-    /// Generate audio from token IDs.
-    /// Returns Float32Array of PCM audio samples at 24kHz.
-    pub fn generate(
-        &self,
-        token_ids: &[u32],
-        frames_after_eos: usize,
-        temperature: f32,
-    ) -> Result<js_sys::Float32Array, JsError> {
-        let e = |e: xn::Error| JsError::new(&e.to_string());
-
-        // Store token IDs in the preset tokenizer so it returns them if called.
-        self.tokenizer.set_tokens(token_ids.to_vec());
-
-        let num_tokens = token_ids.len();
-        let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-        let seq_budget = num_tokens + 512 + max_frames;
-
-        let mut tts_state = self.inner.init_flow_lm_state(1, seq_budget).map_err(e)?;
-        let mut mimi_state = self.inner.init_mimi_state(1, 250).map_err(e)?;
-
-        // Prompt with voice
-        self.inner
-            .prompt_audio(&mut tts_state, &self.voice_emb)
-            .map_err(e)?;
-
-        // Prompt with text
-        self.inner
-            .prompt_text(&mut tts_state, token_ids)
-            .map_err(e)?;
-
-        let mut rng = WasmRng::new(temperature);
-
-        // BOS marker: NaN tensor [1, 1, ldim]
-        let ldim = self.cfg.flow_lm.ldim;
-        let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-        let mut prev_latent: Tensor<f32, CpuDevice> =
-            Tensor::from_vec(nan_data, (1, 1, ldim), &CPU).map_err(e)?;
-
-        let mut eos_countdown: Option<usize> = None;
-        let mut audio_chunks: Vec<Tensor<f32, CpuDevice>> = Vec::new();
-
-        for _step in 0..max_frames {
-            let (next_latent, is_eos) = self
-                .inner
-                .generate_step(&mut tts_state, &prev_latent, &mut rng)
-                .map_err(e)?;
-
-            let audio_chunk = self
-                .inner
-                .decode_latent(&next_latent, &mut mimi_state)
-                .map_err(e)?;
-            audio_chunks.push(audio_chunk);
-
-            if is_eos && eos_countdown.is_none() {
-                eos_countdown = Some(frames_after_eos);
-            }
-
-            if let Some(ref mut countdown) = eos_countdown {
-                if *countdown == 0 {
-                    break;
-                }
-                *countdown -= 1;
-            }
-
-            prev_latent = next_latent;
-        }
-
-        // Concatenate audio
-        let audio_refs: Vec<&Tensor<f32, CpuDevice>> = audio_chunks.iter().collect();
-        let audio = Tensor::cat(&audio_refs, 2).map_err(e)?;
-        let audio = audio.narrow(0, ..1).map_err(e)?.contiguous().map_err(e)?;
-        let pcm = audio.to_vec().map_err(e)?;
-
-        Ok(js_sys::Float32Array::from(pcm.as_slice()))
-    }
-
-    pub fn start_generation(
+    pub fn start_generation_(
         &mut self,
         token_ids: &[u32],
         frames_after_eos: usize,
         temperature: f32,
-    ) -> Result<(), JsError> {
-        let e = |e: xn::Error| JsError::new(&e.to_string());
-
+    ) -> xn::Result<()> {
         self.tokenizer.set_tokens(token_ids.to_vec());
 
         let num_tokens = token_ids.len();
         let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
         let seq_budget = num_tokens + 512 + max_frames;
 
-        let mut tts_state = self.inner.init_flow_lm_state(1, seq_budget).map_err(e)?;
-        let mimi_state = self.inner.init_mimi_state(1, 250).map_err(e)?;
+        let mut tts_state = self.inner.init_flow_lm_state(1, seq_budget)?;
+        let mimi_state = self.inner.init_mimi_state(1, 250)?;
 
-        self.inner
-            .prompt_audio(&mut tts_state, &self.voice_emb)
-            .map_err(e)?;
-        self.inner
-            .prompt_text(&mut tts_state, token_ids)
-            .map_err(e)?;
+        self.inner.prompt_audio(&mut tts_state, &self.voice_emb)?;
+        self.inner.prompt_text(&mut tts_state, token_ids)?;
 
         let rng = WasmRng::new(temperature);
 
         let ldim = self.cfg.flow_lm.ldim;
         let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-        let prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU).map_err(e)?;
+        let prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU)?;
 
         self.gen_state = Some(GenState {
             tts_state,
@@ -284,13 +184,10 @@ impl Model {
             eos_countdown: None,
             step: 0,
         });
-
         Ok(())
     }
 
-    pub fn generation_step(&mut self) -> Result<Option<js_sys::Float32Array>, JsError> {
-        let e = |e: xn::Error| JsError::new(&e.to_string());
-
+    pub fn generation_step_(&mut self) -> xn::Result<Option<js_sys::Float32Array>> {
         let mut state = match self.gen_state.take() {
             Some(s) => s,
             None => return Ok(None),
@@ -300,15 +197,13 @@ impl Model {
             return Ok(None);
         }
 
-        let (next_latent, is_eos) = self
-            .inner
-            .generate_step(&mut state.tts_state, &state.prev_latent, &mut state.rng)
-            .map_err(e)?;
+        let (next_latent, is_eos) =
+            self.inner
+                .generate_step(&mut state.tts_state, &state.prev_latent, &mut state.rng)?;
 
         let audio_chunk = self
             .inner
-            .decode_latent(&next_latent, &mut state.mimi_state)
-            .map_err(e)?;
+            .decode_latent(&next_latent, &mut state.mimi_state)?;
 
         if is_eos && state.eos_countdown.is_none() {
             state.eos_countdown = Some(state.frames_after_eos);
@@ -328,12 +223,8 @@ impl Model {
         state.prev_latent = next_latent;
         state.step += 1;
 
-        let audio = audio_chunk
-            .narrow(0, ..1)
-            .map_err(e)?
-            .contiguous()
-            .map_err(e)?;
-        let pcm = audio.to_vec().map_err(e)?;
+        let audio = audio_chunk.narrow(0, ..1)?.contiguous()?;
+        let pcm = audio.to_vec()?;
         let result = js_sys::Float32Array::from(pcm.as_slice());
 
         if !done {
@@ -341,6 +232,39 @@ impl Model {
         }
 
         Ok(Some(result))
+    }
+}
+
+#[wasm_bindgen]
+impl Model {
+    #[wasm_bindgen(constructor)]
+    pub fn new(model_weights: &[u8], voice_weights: &[u8]) -> Result<Model, JsError> {
+        Self::new_(model_weights, voice_weights).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Prepare text for generation: capitalize, add punctuation, pad short text.
+    /// Returns [processed_text, frames_after_eos] as a JS array.
+    pub fn prepare_text(&self, text: &str) -> js_sys::Array {
+        let (processed, frames_after_eos) = prepare_text_prompt(text);
+        let arr = js_sys::Array::new();
+        arr.push(&JsValue::from_str(&processed));
+        arr.push(&JsValue::from_f64(frames_after_eos as f64));
+        arr
+    }
+
+    pub fn start_generation(
+        &mut self,
+        token_ids: &[u32],
+        frames_after_eos: usize,
+        temperature: f32,
+    ) -> Result<(), JsError> {
+        self.start_generation_(token_ids, frames_after_eos, temperature)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    pub fn generation_step(&mut self) -> Result<Option<js_sys::Float32Array>, JsError> {
+        self.generation_step_()
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 
     pub fn sample_rate(&self) -> usize {
