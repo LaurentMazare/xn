@@ -3,9 +3,9 @@ use wasm_bindgen::prelude::*;
 
 use pocket_tts::flow_lm;
 use pocket_tts::mimi::MimiState;
-use pocket_tts::tts_model::{prepare_text_prompt, TTSConfig, TTSModel, TTSState};
+use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
-use xn::{CpuDevice, Tensor, CPU};
+use xn::{CPU, CpuDevice, Tensor};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
 struct PresetTokenizer {
