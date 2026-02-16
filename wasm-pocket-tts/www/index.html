@@ -6,33 +6,38 @@
 <title>Pocket TTS - WebAssembly Demo</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #222; }
-  h1 { margin-bottom: 8px; }
-  .subtitle { color: #666; margin-bottom: 24px; }
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; background: #111; color: #ddd; }
+  h1 { margin-bottom: 8px; color: #eee; }
+  .subtitle { color: #888; margin-bottom: 24px; }
+  .subtitle a { color: #60a5fa; }
   .section { margin-bottom: 20px; }
-  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; color: #ccc; }
   select, textarea, button { font-family: inherit; font-size: 14px; }
-  select { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; }
-  textarea { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; resize: vertical; }
+  select { padding: 6px 10px; border: 1px solid #444; border-radius: 4px; background: #222; color: #ddd; }
+  textarea { width: 100%; padding: 10px; border: 1px solid #444; border-radius: 4px; resize: vertical; background: #1a1a1a; color: #ddd; }
   button { padding: 10px 24px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
-  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
   button:hover:not(:disabled) { background: #1d4ed8; }
-  #status { margin-top: 12px; padding: 10px; background: #f1f5f9; border-radius: 4px; font-size: 13px; white-space: pre-wrap; }
-  .progress-bar { width: 100%; height: 6px; background: #e2e8f0; border-radius: 3px; margin-top: 6px; overflow: hidden; }
+  #status { margin-top: 12px; padding: 10px; background: #1a1a2e; border: 1px solid #333; border-radius: 4px; font-size: 13px; white-space: pre-wrap; color: #aaa; }
+  .progress-bar { width: 100%; height: 6px; background: #333; border-radius: 3px; margin-top: 6px; overflow: hidden; }
   .progress-bar .fill { height: 100%; background: #2563eb; transition: width 0.2s; }
   audio { width: 100%; margin-top: 12px; }
   .controls { display: flex; gap: 10px; align-items: end; }
   .controls .section { margin-bottom: 0; }
+  #visualizer { width: 100%; height: 140px; margin-top: 16px; display: block; }
+  .slider-section { margin-bottom: 0; margin-left: auto; }
+  .slider-section label { display: block; font-weight: 600; margin-bottom: 6px; color: #ccc; }
+  .slider-section input[type="range"] { width: 120px; vertical-align: middle; }
+  .slider-section .slider-value { color: #aaa; font-size: 14px; margin-left: 4px; }
 </style>
 </head>
 <body>
 
-<h1>Pocket TTS</h1>
 <p class="subtitle"><a href="https://github.com/kyutai-labs/pocket-tts" target="_blank"> Pocket TTS</a> running in the browser via WebAssembly using <a href="https://github.com/LaurentMazare/xn/tree/main/wasm-pocket-tts#wasm-pocket-tts" target="_blank">xn</a> </p>
 
 <div class="section">
   <label for="text">Text to speak</label>
-  <textarea id="text" rows="3">The quick brown fox jumps over the lazy dog.</textarea>
+  <textarea id="text" rows="3">This is a test for the pocket text to speech system, showing great audio with only 100 million parameters.</textarea>
 </div>
 
 <div class="controls">
@@ -48,12 +53,17 @@
       <option value="azelma">Azelma</option>
     </select>
   </div>
-  <button id="load-btn">Load Weights</button>
+  <button id="load-btn">Load Weights (240MB)</button>
   <button id="generate-btn" style="display:none">Generate</button>
+  <div class="slider-section">
+    <label for="temperature">Temperature <span id="temp-value" class="slider-value">0.7</span></label>
+    <input type="range" id="temperature" min="0.1" max="1.0" step="0.1" value="0.7">
+  </div>
 </div>
 
 <div class="progress-bar" id="progress-bar" style="display:none"><div class="fill" id="progress-fill"></div></div>
 <div id="status"></div>
+<canvas id="visualizer"></canvas>
 <div id="audio-container"></div>
 
 <script type="module">
@@ -63,6 +73,14 @@ const btn = document.getElementById('generate-btn');
 const voiceSelect = document.getElementById('voice');
 const progressBar = document.getElementById('progress-bar');
 const progressFill = document.getElementById('progress-fill');
+const canvas = document.getElementById('visualizer');
+const canvasCtx = canvas.getContext('2d');
+const tempSlider = document.getElementById('temperature');
+const tempValue = document.getElementById('temp-value');
+
+tempSlider.addEventListener('input', () => {
+  tempValue.textContent = tempSlider.value;
+});
 
 function log(msg) {
   statusEl.textContent = msg;
@@ -78,6 +96,96 @@ function hideProgress() {
   progressBar.style.display = 'none';
 }
 
+// ---- Visualizer ----
+let analyser = null;
+let animFrameId = null;
+
+const BAR_COUNT = 32;
+const SEG_COUNT = 16;
+const SEG_GAP = 2;
+
+function resizeCanvas() {
+  canvas.width = canvas.clientWidth * devicePixelRatio;
+  canvas.height = canvas.clientHeight * devicePixelRatio;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+function segmentColor(segIndex, totalSegs) {
+  const t = segIndex / (totalSegs - 1); // 0 = bottom, 1 = top
+  if (t < 0.1) return '#e03030';       // red
+  if (t < 0.25) return '#e07020';      // orange
+  return '#30c040';                     // green
+}
+
+function makeAnalyser(ctx) {
+  const a = ctx.createAnalyser();
+  a.fftSize = 1024;
+  a.minDecibels = -90;
+  a.maxDecibels = -10;
+  a.smoothingTimeConstant = 0.5;
+  return a;
+}
+
+function drawBars() {
+  animFrameId = requestAnimationFrame(drawBars);
+
+  const w = canvas.width;
+  const h = canvas.height;
+  canvasCtx.fillStyle = '#111';
+  canvasCtx.fillRect(0, 0, w, h);
+
+  if (!analyser) return;
+
+  const freqData = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(freqData);
+
+  const barWidth = Math.floor(w / BAR_COUNT);
+  const gap = 2 * devicePixelRatio;
+  const innerBarW = barWidth - gap;
+  const segH = Math.floor(h / SEG_COUNT);
+  const segGap = SEG_GAP * devicePixelRatio;
+  const innerSegH = segH - segGap;
+
+  // Use only the lower half of the spectrum (most relevant for speech)
+  const usableBins = Math.floor(freqData.length / 2);
+  const binsPerBar = Math.max(1, Math.floor(usableBins / BAR_COUNT));
+
+  for (let i = 0; i < BAR_COUNT; i++) {
+    // Peak (not average) of the frequency bins for this bar — more visible
+    let peak = 0;
+    const startBin = i * binsPerBar;
+    for (let b = 0; b < binsPerBar; b++) {
+      peak = Math.max(peak, freqData[startBin + b]);
+    }
+    const litSegs = Math.round((peak / 255) * SEG_COUNT);
+
+    const x = i * barWidth + gap / 2;
+
+    for (let s = 0; s < litSegs; s++) {
+      const y = h - (s + 1) * segH + segGap / 2;
+      canvasCtx.fillStyle = segmentColor(s, SEG_COUNT);
+      canvasCtx.fillRect(x, y, innerBarW, innerSegH);
+    }
+
+    // Draw dim segments above the lit ones
+    for (let s = litSegs; s < SEG_COUNT; s++) {
+      const y = h - (s + 1) * segH + segGap / 2;
+      canvasCtx.fillStyle = '#191919';
+      canvasCtx.fillRect(x, y, innerBarW, innerSegH);
+    }
+  }
+}
+
+function startVisualizer() {
+  if (animFrameId) cancelAnimationFrame(animFrameId);
+  drawBars();
+}
+
+function stopVisualizer() {
+  // The analyser naturally returns zeros when no audio is playing
+}
+
 // ---- Worker setup ----
 const worker = new Worker('worker.js', { type: 'module' });
 
@@ -88,6 +196,8 @@ let startTime = 0;
 let firstChunkTime = null;
 let allChunks = [];
 let generating = false;
+let replayAudioCtx = null;
+let replaySource = null;
 
 worker.onmessage = (e) => {
   const { type, ...data } = e.data;
@@ -125,18 +235,16 @@ worker.onmessage = (e) => {
       const chunk = new Float32Array(data.data);
       if (!firstChunkTime) {
         firstChunkTime = performance.now() - startTime;
-        // Set start time relative to now for the first chunk
         nextStartTime = audioCtx.currentTime;
       }
 
-      // Ensure we never schedule in the past
       nextStartTime = Math.max(nextStartTime, audioCtx.currentTime);
 
       const buf = audioCtx.createBuffer(1, chunk.length, sampleRate);
       buf.getChannelData(0).set(chunk);
       const src = audioCtx.createBufferSource();
       src.buffer = buf;
-      src.connect(audioCtx.destination);
+      src.connect(analyser);
       src.start(nextStartTime);
       nextStartTime += chunk.length / sampleRate;
 
@@ -161,6 +269,7 @@ worker.onmessage = (e) => {
       audio.controls = true;
       audio.src = url;
       container.appendChild(audio);
+      hookAudioElement(audio);
 
       btn.disabled = false;
       generating = false;
@@ -175,6 +284,21 @@ worker.onmessage = (e) => {
       break;
   }
 };
+
+function hookAudioElement(audio) {
+  // Set up the audio graph eagerly so it's ready when the user hits play
+  replayAudioCtx = new AudioContext({ sampleRate });
+  const replayAnalyser = makeAnalyser(replayAudioCtx);
+  replaySource = replayAudioCtx.createMediaElementSource(audio);
+  replaySource.connect(replayAnalyser);
+  replayAnalyser.connect(replayAudioCtx.destination);
+
+  audio.addEventListener('play', () => {
+    if (replayAudioCtx.state === 'suspended') replayAudioCtx.resume();
+    analyser = replayAnalyser;
+    startVisualizer();
+  });
+}
 
 function concatenateChunks(chunks) {
   const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
@@ -202,14 +326,21 @@ function generate() {
   firstChunkTime = null;
   allChunks = [];
 
+  // Reset replay state since we're creating a new AudioContext
+  replayAudioCtx = null;
+  replaySource = null;
+
   // AudioContext must be created/resumed from a user gesture
   audioCtx = new AudioContext({ sampleRate });
+  analyser = makeAnalyser(audioCtx);
+  analyser.connect(audioCtx.destination);
+  startVisualizer();
 
   worker.postMessage({
     type: 'generate',
     text,
     voiceName: voiceSelect.value,
-    temperature: 0.7,
+    temperature: parseFloat(tempSlider.value),
   });
 }
 
@@ -253,6 +384,9 @@ function encodeWav(samples, sampleRate) {
 
 loadBtn.addEventListener('click', loadWeights);
 btn.addEventListener('click', generate);
+
+// Start the render loop (draws empty bars until audio plays)
+startVisualizer();
 </script>
 </body>
 </html>

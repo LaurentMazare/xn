@@ -198,12 +198,17 @@ class UnigramTokenizer {
 // ---- Worker state ----
 const VOICE_NAMES = ['alba', 'marius', 'javert', 'fantine', 'cosette', 'eponine', 'azelma'];
 
+// Start WASM compilation immediately so the optimizing compiler (TurboFan)
+// finishes well before the first generation runs.
+const wasmModulePromise = WebAssembly.compileStreaming(fetch('wasm_pocket_tts_bg.wasm'));
+
 let model = null;
 let tokenizer = null;
 let voiceIndexMap = {};
 
 async function handleLoad() {
-  await init();
+  const wasmModule = await wasmModulePromise;
+  await init(wasmModule);
   post('status', { message: 'WASM initialized. Downloading tokenizer and model...' });
 
   const tokData = await fetchWithProgress(TOKENIZER_URL, 'Tokenizer');
