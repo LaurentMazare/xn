@@ -79,8 +79,16 @@ function hideProgress() {
   progressBar.style.display = 'none';
 }
 
-// ---- Worker setup ----
-const worker = new Worker('worker.js', { type: 'module' });
+// ---- Two-worker setup ----
+// gen_worker: downloads weights, tokenizes, runs generate_step_only (produces latents)
+// decode_worker: runs decode_latent_step (consumes latents, produces audio)
+// They communicate directly via a MessageChannel.
+const genWorker = new Worker('gen_worker.js', { type: 'module' });
+const decodeWorker = new Worker('decode_worker.js', { type: 'module' });
+
+const channel = new MessageChannel();
+genWorker.postMessage({ type: 'init_port' }, [channel.port1]);
+decodeWorker.postMessage({ type: 'init_port' }, [channel.port2]);
 
 let sampleRate = 24000;
 let audioCtx = null;
@@ -89,8 +97,10 @@ let startTime = 0;
 let firstChunkTime = null;
 let allChunks = [];
 let generating = false;
+let decoderReady = false;
 
-worker.onmessage = (e) => {
+// ---- Messages from the generation worker ----
+genWorker.onmessage = (e) => {
   const { type, ...data } = e.data;
 
   switch (type) {
@@ -113,24 +123,47 @@ worker.onmessage = (e) => {
 
     case 'loaded':
       sampleRate = data.sampleRate;
-      loadBtn.style.display = 'none';
-      btn.style.display = '';
-      log('Ready! Enter text and click Generate.');
+      if (decoderReady) {
+        loadBtn.style.display = 'none';
+        btn.style.display = '';
+        log('Ready! Enter text and click Generate.');
+      } else {
+        log('Generator ready, waiting for decoder...');
+      }
       break;
 
     case 'gen_start':
       log(`Generating speech (${data.numTokens} tokens)...`);
       break;
 
+    case 'error':
+      log('Error: ' + data.message);
+      console.error(data.message);
+      btn.disabled = false;
+      generating = false;
+      break;
+  }
+};
+
+// ---- Messages from the decode worker ----
+decodeWorker.onmessage = (e) => {
+  const { type, ...data } = e.data;
+
+  switch (type) {
+    case 'decoder_ready':
+      decoderReady = true;
+      loadBtn.style.display = 'none';
+      btn.style.display = '';
+      log('Ready! Enter text and click Generate.');
+      break;
+
     case 'chunk': {
       const chunk = new Float32Array(data.data);
       if (!firstChunkTime) {
         firstChunkTime = performance.now() - startTime;
-        // Set start time relative to now for the first chunk
         nextStartTime = audioCtx.currentTime;
       }
 
-      // Ensure we never schedule in the past
       nextStartTime = Math.max(nextStartTime, audioCtx.currentTime);
 
       const buf = audioCtx.createBuffer(1, chunk.length, sampleRate);
@@ -152,7 +185,6 @@ worker.onmessage = (e) => {
       const firstAudio = firstChunkTime != null ? (firstChunkTime / 1000).toFixed(2) : '?';
       log(`Generated ${duration}s of audio in ${totalTime}s (first audio: ${firstAudio}s)`);
 
-      // Create WAV download/replay element
       const allPcm = concatenateChunks(allChunks);
       const wavBlob = encodeWav(allPcm, sampleRate);
       const url = URL.createObjectURL(wavBlob);
@@ -169,7 +201,7 @@ worker.onmessage = (e) => {
     }
 
     case 'error':
-      log('Error: ' + data.message);
+      log('Decode error: ' + data.message);
       console.error(data.message);
       btn.disabled = false;
       generating = false;
@@ -190,7 +222,7 @@ function concatenateChunks(chunks) {
 
 function loadWeights() {
   loadBtn.disabled = true;
-  worker.postMessage({ type: 'load', voiceName: voiceSelect.value });
+  genWorker.postMessage({ type: 'load', voiceName: voiceSelect.value });
 }
 
 function generate() {
@@ -203,10 +235,9 @@ function generate() {
   firstChunkTime = null;
   allChunks = [];
 
-  // AudioContext must be created/resumed from a user gesture
   audioCtx = new AudioContext({ sampleRate });
 
-  worker.postMessage({
+  genWorker.postMessage({
     type: 'generate',
     text,
     voiceName: voiceSelect.value,

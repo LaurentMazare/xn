@@ -2,7 +2,7 @@ use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 use pocket_tts::flow_lm;
-use pocket_tts::mimi::MimiState;
+use pocket_tts::mimi::{MimiModel, MimiState};
 use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
 use xn::{CPU, CpuDevice, Tensor};
@@ -100,6 +100,20 @@ struct GenState {
     step: usize,
 }
 
+struct GenOnlyState {
+    tts_state: TTSState<f32, CpuDevice>,
+    prev_latent: Tensor<f32, CpuDevice>,
+    rng: WasmRng,
+    max_frames: usize,
+    frames_after_eos: usize,
+    eos_countdown: Option<usize>,
+    step: usize,
+}
+
+struct DecodeState {
+    mimi_state: MimiState<f32, CpuDevice>,
+}
+
 #[wasm_bindgen]
 pub struct Model {
     inner: TTSModel<f32, CpuDevice>,
@@ -107,6 +121,8 @@ pub struct Model {
     tokenizer: std::sync::Arc<PresetTokenizer>,
     cfg: TTSConfig,
     gen_state: Option<GenState>,
+    gen_only_state: Option<GenOnlyState>,
+    decode_state: Option<DecodeState>,
 }
 
 impl Model {
@@ -147,6 +163,8 @@ impl Model {
             tokenizer,
             cfg,
             gen_state: None,
+            gen_only_state: None,
+            decode_state: None,
         })
     }
 
@@ -233,6 +251,103 @@ impl Model {
 
         Ok(Some(result))
     }
+
+    pub fn start_generation_only_(
+        &mut self,
+        token_ids: &[u32],
+        frames_after_eos: usize,
+        temperature: f32,
+    ) -> xn::Result<()> {
+        self.tokenizer.set_tokens(token_ids.to_vec());
+
+        let num_tokens = token_ids.len();
+        let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
+        let seq_budget = num_tokens + 512 + max_frames;
+
+        let mut tts_state = self.inner.init_flow_lm_state(1, seq_budget)?;
+
+        self.inner.prompt_audio(&mut tts_state, &self.voice_emb)?;
+        self.inner.prompt_text(&mut tts_state, token_ids)?;
+
+        let rng = WasmRng::new(temperature);
+
+        let ldim = self.cfg.flow_lm.ldim;
+        let nan_data: Vec<f32> = vec![f32::NAN; ldim];
+        let prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU)?;
+
+        self.gen_only_state = Some(GenOnlyState {
+            tts_state,
+            prev_latent,
+            rng,
+            max_frames,
+            frames_after_eos,
+            eos_countdown: None,
+            step: 0,
+        });
+        Ok(())
+    }
+
+    pub fn generate_step_only_(&mut self) -> xn::Result<Option<js_sys::Float32Array>> {
+        let mut state = match self.gen_only_state.take() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        if state.step >= state.max_frames {
+            return Ok(None);
+        }
+
+        let (next_latent, is_eos) =
+            self.inner
+                .generate_step(&mut state.tts_state, &state.prev_latent, &mut state.rng)?;
+
+        let latent_data = next_latent.to_vec()?;
+
+        if is_eos && state.eos_countdown.is_none() {
+            state.eos_countdown = Some(state.frames_after_eos);
+        }
+
+        let done = if let Some(ref mut countdown) = state.eos_countdown {
+            if *countdown == 0 {
+                true
+            } else {
+                *countdown -= 1;
+                false
+            }
+        } else {
+            false
+        };
+
+        state.prev_latent = next_latent;
+        state.step += 1;
+
+        if !done {
+            self.gen_only_state = Some(state);
+        }
+
+        Ok(Some(js_sys::Float32Array::from(latent_data.as_slice())))
+    }
+
+    pub fn init_decoder_(&mut self) -> xn::Result<()> {
+        let mimi_state = self.inner.init_mimi_state(1, 250)?;
+        self.decode_state = Some(DecodeState { mimi_state });
+        Ok(())
+    }
+
+    pub fn decode_latent_step_(&mut self, latent_data: &[f32]) -> xn::Result<js_sys::Float32Array> {
+        let state = self.decode_state.as_mut().ok_or_else(|| {
+            xn::error::Error::msg("decoder not initialized, call init_decoder first")
+        })?;
+
+        let ldim = self.cfg.flow_lm.ldim;
+        let latent = Tensor::from_vec(latent_data.to_vec(), (1, 1, ldim), &CPU)?;
+
+        let audio_chunk = self.inner.decode_latent(&latent, &mut state.mimi_state)?;
+        let audio = audio_chunk.narrow(0, ..1)?.contiguous()?;
+        let pcm = audio.to_vec()?;
+
+        Ok(js_sys::Float32Array::from(pcm.as_slice()))
+    }
 }
 
 #[wasm_bindgen]
@@ -269,5 +384,144 @@ impl Model {
 
     pub fn sample_rate(&self) -> usize {
         self.inner.sample_rate()
+    }
+
+    /// Like start_generation but without initializing mimi decoder state.
+    /// Use with generate_step_only for the generation-only worker.
+    pub fn start_generation_only(
+        &mut self,
+        token_ids: &[u32],
+        frames_after_eos: usize,
+        temperature: f32,
+    ) -> Result<(), JsError> {
+        self.start_generation_only_(token_ids, frames_after_eos, temperature)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Run a single generate step, returning the raw latent as Float32Array.
+    /// Returns null when generation is complete.
+    pub fn generate_step_only(&mut self) -> Result<Option<js_sys::Float32Array>, JsError> {
+        self.generate_step_only_()
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Initialize the mimi decoder state. Call before decode_latent_step.
+    pub fn init_decoder(&mut self) -> Result<(), JsError> {
+        self.init_decoder_()
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Decode a latent vector (from generate_step_only) into audio samples.
+    pub fn decode_latent_step(&mut self, latent_data: &[f32]) -> Result<js_sys::Float32Array, JsError> {
+        self.decode_latent_step_(latent_data)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+}
+
+// ---- Lightweight decoder: only loads mimi weights + emb normalization ----
+
+/// Only keep mimi weights and the two flow_lm normalization tensors.
+fn remap_key_decoder_only(name: &str) -> Option<String> {
+    if name.contains("quantizer.vq")
+        || name.contains("quantizer.logvar_proj")
+        || name.contains("learnt_padding")
+    {
+        return None;
+    }
+    if name.starts_with("mimi.") {
+        let mut name = name.to_string();
+        name = name.replace("mimi.model.", "mimi.");
+        return Some(name);
+    }
+    if name == "flow_lm.emb_std" || name == "flow_lm.emb_mean" {
+        return Some(name.to_string());
+    }
+    None
+}
+
+#[wasm_bindgen]
+pub struct Decoder {
+    mimi: MimiModel<f32, CpuDevice>,
+    emb_std: Tensor<f32, CpuDevice>,
+    emb_mean: Tensor<f32, CpuDevice>,
+    cfg: TTSConfig,
+    decode_state: Option<DecodeState>,
+}
+
+impl Decoder {
+    pub fn new_(model_weights: &[u8]) -> xn::Result<Decoder> {
+        let cfg = TTSConfig::v202601(0.7);
+        let vb =
+            VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key_decoder_only)?;
+        let root = vb.root();
+
+        let mimi = MimiModel::load(&root.pp("mimi"), &cfg.mimi)?;
+        let flow_lm_vb = root.pp("flow_lm");
+        let emb_std: Tensor<f32, CpuDevice> = flow_lm_vb.tensor("emb_std", (cfg.flow_lm.ldim,))?;
+        let emb_mean: Tensor<f32, CpuDevice> =
+            flow_lm_vb.tensor("emb_mean", (cfg.flow_lm.ldim,))?;
+
+        Ok(Decoder {
+            mimi,
+            emb_std,
+            emb_mean,
+            cfg,
+            decode_state: None,
+        })
+    }
+
+    pub fn init_decoder_(&mut self) -> xn::Result<()> {
+        let mimi_state = self.mimi.init_state(1, 250)?;
+        self.decode_state = Some(DecodeState { mimi_state });
+        Ok(())
+    }
+
+    pub fn decode_latent_step_(&mut self, latent_data: &[f32]) -> xn::Result<js_sys::Float32Array> {
+        let state = self.decode_state.as_mut().ok_or_else(|| {
+            xn::error::Error::msg("decoder not initialized, call init_decoder first")
+        })?;
+
+        let ldim = self.cfg.flow_lm.ldim;
+        let latent = Tensor::from_vec(latent_data.to_vec(), (1, 1, ldim), &CPU)?;
+
+        // Denormalize latent (same as TTSModel::decode_latent)
+        let denorm = latent
+            .broadcast_mul(&self.emb_std)?
+            .broadcast_add(&self.emb_mean)?;
+        let transposed = denorm.transpose(1, 2)?.contiguous()?;
+        let quantized = self.mimi.quantizer.forward(&transposed)?;
+        let audio_chunk = self
+            .mimi
+            .decode_from_latent(&quantized, &mut state.mimi_state)?;
+
+        let audio = audio_chunk.narrow(0, ..1)?.contiguous()?;
+        let pcm = audio.to_vec()?;
+
+        Ok(js_sys::Float32Array::from(pcm.as_slice()))
+    }
+}
+
+#[wasm_bindgen]
+impl Decoder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(model_weights: &[u8]) -> Result<Decoder, JsError> {
+        Self::new_(model_weights).map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    pub fn init_decoder(&mut self) -> Result<(), JsError> {
+        self.init_decoder_()
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    pub fn decode_latent_step(
+        &mut self,
+        latent_data: &[f32],
+    ) -> Result<js_sys::Float32Array, JsError> {
+        self.decode_latent_step_(latent_data)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    pub fn sample_rate(&self) -> usize {
+        self.mimi.sample_rate
     }
 }

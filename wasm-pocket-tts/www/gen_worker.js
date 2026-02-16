@@ -200,6 +200,7 @@ let model = null;
 let tokenizer = null;
 let cachedVoice = { name: null, data: null };
 let cachedModelWeights = null;
+let decodePort = null;
 
 async function handleLoad(voiceName) {
   await init();
@@ -219,6 +220,10 @@ async function handleLoad(voiceName) {
   post('status', { message: 'Initializing model...' });
   model = new Model(cachedModelWeights, voiceData);
   const sampleRate = model.sample_rate();
+
+  // Signal decode worker to initialize (it fetches model from browser cache)
+  decodePort.postMessage({ type: 'init' });
+
   post('loaded', { sampleRate });
 }
 
@@ -236,24 +241,34 @@ async function handleGenerate(text, voiceName, temperature) {
 
   post('gen_start', { numTokens: tokenIds.length });
 
-  model.start_generation(tokenIds, framesAfterEos, temperature);
+  decodePort.postMessage({ type: 'gen_start' });
+  model.start_generation_only(tokenIds, framesAfterEos, temperature);
 
   const genStart = performance.now();
   let step = 0;
   while (true) {
-    const chunk = model.generation_step();
-    if (!chunk) break;
-    post('chunk', { data: chunk, step }, [chunk.buffer]);
+    const latent = model.generate_step_only();
+    if (!latent) break;
+    decodePort.postMessage(
+      { type: 'decode', latent, step },
+      [latent.buffer],
+    );
     step++;
   }
   const genElapsed = performance.now() - genStart;
-  console.log(`[worker] ${step} steps in ${genElapsed.toFixed(0)}ms (${(genElapsed / step).toFixed(1)}ms/step)`);
+  console.log(`[gen_worker] ${step} generate steps in ${genElapsed.toFixed(0)}ms (${(genElapsed / step).toFixed(1)}ms/step)`);
 
-  post('done');
+  decodePort.postMessage({ type: 'gen_done' });
 }
 
 self.onmessage = async (e) => {
   const { type, ...data } = e.data;
+
+  if (type === 'init_port') {
+    decodePort = e.ports[0];
+    return;
+  }
+
   try {
     if (type === 'load') {
       await handleLoad(data.voiceName);
