@@ -1,13 +1,23 @@
 use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn log(s: &str);
+}
+
+macro_rules! console_log {
+    ($($t:tt)*) => (log(&format!($($t)*)))
+}
+
 use pocket_tts::flow_lm::{self, FlowLMState};
 use pocket_tts::mimi::MimiState;
 use pocket_tts::mimi_transformer::{LayerAttentionState, StreamingTransformerState};
 use pocket_tts::transformer::StreamingMHAState;
-use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
+use pocket_tts::tts_model::{prepare_text_prompt, TTSConfig, TTSModel, TTSState};
 use xn::nn::VB;
-use xn::{CPU, CpuDevice, Tensor};
+use xn::{CpuDevice, Tensor, TypedTensor, CPU};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
 struct PresetTokenizer {
@@ -91,18 +101,15 @@ fn remap_key(name: &str) -> Option<String> {
     Some(name)
 }
 
-/// Budget for the small KV cache used when caching voice states.
-/// Only needs to fit the audio prompt tokens (~50-100), not the full generation.
-const VOICE_CACHE_SEQ_BUDGET: usize = 512;
-
 /// Creates a new TTSState with a larger seq_budget, copying the used KV entries
 /// from a cached state (which was allocated with a smaller budget).
 fn resize_tts_state(
     cached: &TTSState<f32, CpuDevice>,
     new_seq_budget: usize,
 ) -> xn::Result<TTSState<f32, CpuDevice>> {
+    console_log!("[resize_tts_state] resizing to seq_budget={new_seq_budget}");
     let mut new_layer_states = Vec::new();
-    for layer_state in &cached.flow_lm_state.transformer_state.layer_states {
+    for layer_state in cached.flow_lm_state.transformer_state.layer_states.iter() {
         match layer_state {
             LayerAttentionState::FlowLm(mha_state) => {
                 let current_end = mha_state.current_end;
@@ -177,35 +184,52 @@ impl Model {
         })
     }
 
-    fn load_voice_emb(voice_weights: &[u8]) -> xn::Result<Tensor<f32, CpuDevice>> {
-        use xn::error::Context;
-        let voice_vb = VB::from_bytes(vec![voice_weights.to_vec()], CPU)?;
-        let voice_names = voice_vb.tensor_names();
-        let voice_key = voice_names
-            .first()
-            .context("no tensors found in voice embedding file")?
-            .to_string();
-        let voice_td = voice_vb
-            .get_tensor(&voice_key)
-            .context("voice tensor not found")?;
-        let voice_shape = voice_td.shape.clone();
-        let voice_dims = voice_shape.dims().to_vec();
-
-        let voice_emb: Tensor<f32, CpuDevice> = voice_vb.tensor(&voice_key, voice_shape)?;
-        let voice_emb = if voice_dims.len() == 2 {
-            voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?
-        } else {
-            voice_emb
-        };
-        Ok(voice_emb)
-    }
-
-    /// Load a voice embedding, run prompt_audio, and cache the resulting state.
+    /// Load a pre-computed KV cache state from a safetensors buffer.
+    /// The file contains `transformer.layers.{i}.self_attn/cache` (shape [2, 1, seq, 16, 64])
+    /// and `transformer.layers.{i}.self_attn/current_end` (single f32) for each layer.
     /// Returns the voice index for use with start_generation.
-    pub fn add_voice_(&mut self, voice_weights: &[u8]) -> xn::Result<usize> {
-        let voice_emb = Self::load_voice_emb(voice_weights)?;
-        let mut tts_state = self.inner.init_flow_lm_state(1, VOICE_CACHE_SEQ_BUDGET)?;
-        self.inner.prompt_audio(&mut tts_state, &voice_emb)?;
+    pub fn add_voice_(&mut self, state_bytes: &[u8]) -> xn::Result<usize> {
+        console_log!(
+            "[add_voice] loading safetensors, {} bytes",
+            state_bytes.len()
+        );
+        let tensors = xn::safetensors::load_from_buffer(state_bytes, &CPU)?;
+        let num_layers = 6;
+        let mut layer_states = Vec::with_capacity(num_layers);
+
+        for i in 0..num_layers {
+            let cache_name = format!("transformer.layers.{i}.self_attn/cache");
+
+            let cache = match tensors.get(&cache_name) {
+                Some(TypedTensor::F32(t)) => t,
+                _ => xn::bail!("expected f32 tensor: {cache_name}"),
+            };
+
+            // cache shape: (2, batch, seq_len, num_heads, head_dim)
+            let (two, batch, seq_len, num_heads, head_dim) = cache.dims5()?;
+            if two != 2 {
+                xn::bail!("expected first dim of size 2 in cache tensor");
+            }
+            let k_cache = cache
+                .narrow(0, 0..1)?
+                .contiguous()?
+                .reshape((batch, seq_len, num_heads, head_dim))?;
+            let v_cache = cache
+                .narrow(0, 1..2)?
+                .contiguous()?
+                .reshape((batch, seq_len, num_heads, head_dim))?;
+            layer_states.push(LayerAttentionState::FlowLm(StreamingMHAState {
+                k_cache,
+                v_cache,
+                current_end: seq_len,
+            }));
+        }
+
+        let tts_state = TTSState {
+            flow_lm_state: FlowLMState {
+                transformer_state: StreamingTransformerState { layer_states },
+            },
+        };
         let idx = self.voice_states.len();
         self.voice_states.push(tts_state);
         Ok(idx)
@@ -218,6 +242,13 @@ impl Model {
         frames_after_eos: usize,
         temperature: f32,
     ) -> xn::Result<()> {
+        console_log!(
+            "[start_generation] voice_index={} num_tokens={} frames_after_eos={} temperature={}",
+            voice_index,
+            token_ids.len(),
+            frames_after_eos,
+            temperature
+        );
         self.tokenizer.set_tokens(token_ids.to_vec());
 
         let num_tokens = token_ids.len();
@@ -225,11 +256,16 @@ impl Model {
         let seq_budget = num_tokens + 512 + max_frames;
 
         // Resize the cached voice state (small budget) into a full-sized state.
+        if voice_index >= self.voice_states.len() {
+            xn::bail!("invalid voice index: {voice_index}");
+        }
         let cached = &self.voice_states[voice_index];
         let mut tts_state = resize_tts_state(cached, seq_budget)?;
         let mimi_state = self.inner.init_mimi_state(1, 250)?;
 
+        console_log!("[start_generation] running prompt_text...");
         self.inner.prompt_text(&mut tts_state, token_ids)?;
+        console_log!("[start_generation] prompt_text done, starting generation loop");
 
         let rng = WasmRng::new(temperature);
 

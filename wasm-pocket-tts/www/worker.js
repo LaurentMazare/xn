@@ -5,7 +5,7 @@ const MODEL_URL = `${HF_BASE}/tts_b6369a24.safetensors`;
 const TOKENIZER_URL = `${HF_BASE}/tokenizer.model`;
 
 function voiceUrl(name) {
-  return `${HF_BASE}/embeddings/${name}.safetensors`;
+  return `${HF_BASE}/embeddings_v2/${name}.safetensors`;
 }
 
 function post(type, data = {}, transferables = []) {
@@ -196,7 +196,7 @@ class UnigramTokenizer {
 }
 
 // ---- Worker state ----
-const VOICE_NAMES = ['alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma'];
+const VOICE_NAMES = ['alba', 'marius', 'javert', 'fantine', 'cosette', 'eponine', 'azelma'];
 
 let model = null;
 let tokenizer = null;
