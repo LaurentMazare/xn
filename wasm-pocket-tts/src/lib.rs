@@ -5,9 +5,9 @@ use pocket_tts::flow_lm::{self, FlowLMState};
 use pocket_tts::mimi::MimiState;
 use pocket_tts::mimi_transformer::{LayerAttentionState, StreamingTransformerState};
 use pocket_tts::transformer::StreamingMHAState;
-use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
+use pocket_tts::tts_model::{prepare_text_prompt, TTSConfig, TTSModel, TTSState};
 use xn::nn::VB;
-use xn::{CPU, CpuDevice, Tensor};
+use xn::{CpuDevice, Tensor, CPU};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
 struct PresetTokenizer {

@@ -64,7 +64,7 @@ pub struct TTSModel<T: WithDTypeF, B: Backend> {
     eos_threshold: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TTSState<T: WithDTypeF, B: Backend> {
     pub flow_lm_state: FlowLMState<T, B>,
 }

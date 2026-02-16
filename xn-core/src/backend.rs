@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::{BinaryOp, UnaryOp};
 
-pub trait Backend: Sized + Clone + 'static + Sync + Send {
+pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
     type Storage<T: crate::WithDType>: Sized + Sync + Send + 'static;
 
     fn name(&self) -> String;

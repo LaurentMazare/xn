@@ -65,7 +65,7 @@ pub struct FlowLM<T: WithDTypeF, B: Backend> {
     pub ldim: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FlowLMState<T: WithDTypeF, B: Backend> {
     pub transformer_state: StreamingTransformerState<T, B>,
 }
