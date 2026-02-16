@@ -7,6 +7,7 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 // ---- KV Cache ----
 
 /// Simple append-based KV cache with optional context window trimming.
+#[derive(Clone)]
 pub struct KvCache<T: WithDTypeF, B: Backend> {
     k: Option<Tensor<T, B>>,
     v: Option<Tensor<T, B>>,
@@ -64,11 +65,13 @@ impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
 
 // ---- State types ----
 
+#[derive(Clone)]
 pub enum LayerAttentionState<T: WithDTypeF, B: Backend> {
     Mimi(KvCache<T, B>),
     FlowLm(StreamingMHAState<T, B>),
 }
 
+#[derive(Clone)]
 pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
     pub layer_states: Vec<LayerAttentionState<T, B>>,
 }

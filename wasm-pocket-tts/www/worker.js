@@ -196,12 +196,13 @@ class UnigramTokenizer {
 }
 
 // ---- Worker state ----
+const VOICE_NAMES = ['alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma'];
+
 let model = null;
 let tokenizer = null;
-let cachedVoice = { name: null, data: null };
-let cachedModelWeights = null;
+let voiceIndexMap = {};
 
-async function handleLoad(voiceName) {
+async function handleLoad() {
   await init();
   post('status', { message: 'WASM initialized. Downloading tokenizer and model...' });
 
@@ -210,33 +211,30 @@ async function handleLoad(voiceName) {
   tokenizer = new UnigramTokenizer(pieces);
   post('status', { message: `Tokenizer loaded (${pieces.length} pieces)` });
 
-  cachedModelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
-
-  post('status', { message: `Downloading voice embedding (${voiceName})...` });
-  const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
-  cachedVoice = { name: voiceName, data: voiceData };
+  const modelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
 
   post('status', { message: 'Initializing model...' });
-  model = new Model(cachedModelWeights, voiceData);
+  model = new Model(modelWeights);
+
+  for (const name of VOICE_NAMES) {
+    post('status', { message: `Loading voice: ${name}...` });
+    const voiceData = await fetchWithProgress(voiceUrl(name), `Voice: ${name}`);
+    voiceIndexMap[name] = model.add_voice(voiceData);
+  }
+
   const sampleRate = model.sample_rate();
   post('loaded', { sampleRate });
 }
 
 async function handleGenerate(text, voiceName, temperature) {
-  if (cachedVoice.name !== voiceName) {
-    post('status', { message: `Downloading voice embedding (${voiceName})...` });
-    const voiceData = await fetchWithProgress(voiceUrl(voiceName), 'Voice embedding');
-    cachedVoice = { name: voiceName, data: voiceData };
-    post('status', { message: 'Reloading model with new voice...' });
-    model = new Model(cachedModelWeights, voiceData);
-  }
+  const voiceIndex = voiceIndexMap[voiceName];
 
   const [processedText, framesAfterEos] = model.prepare_text(text);
   const tokenIds = tokenizer.encode(processedText);
 
   post('gen_start', { numTokens: tokenIds.length });
 
-  model.start_generation(tokenIds, framesAfterEos, temperature);
+  model.start_generation(voiceIndex, tokenIds, framesAfterEos, temperature);
 
   let step = 0;
   while (true) {
@@ -253,7 +251,7 @@ self.onmessage = async (e) => {
   const { type, ...data } = e.data;
   try {
     if (type === 'load') {
-      await handleLoad(data.voiceName);
+      await handleLoad();
     } else if (type === 'generate') {
       await handleGenerate(data.text, data.voiceName, data.temperature);
     }
