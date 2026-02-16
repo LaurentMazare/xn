@@ -10,6 +10,7 @@ pub mod inplace_ops;
 pub mod models;
 pub mod nn;
 pub mod ops;
+pub mod safetensors;
 pub mod shape;
 pub mod tensor;
 pub mod tensor_view;
@@ -19,7 +20,7 @@ pub use backend::Backend;
 pub use dtype::{DType, WithDType, WithDTypeF};
 pub use error::{Error, Result};
 pub use shape::{D, Dim, Shape};
-pub use tensor::Tensor;
+pub use tensor::{Tensor, TypedTensor};
 pub use tensor_view::{TensorOrView, TensorView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -35,12 +35,34 @@ pub struct Tensor<T: WithDType, B: Backend> {
     pub(crate) _marker: std::marker::PhantomData<T>,
 }
 
-pub enum TypedTensor<'a, B: Backend> {
-    F16(&'a Tensor<half::f16, B>),
-    BF16(&'a Tensor<half::bf16, B>),
-    F32(&'a Tensor<f32, B>),
-    I64(&'a Tensor<i64, B>),
-    U8(&'a Tensor<u8, B>),
+pub enum TypedTensor<B: Backend> {
+    F16(Tensor<half::f16, B>),
+    BF16(Tensor<half::bf16, B>),
+    F32(Tensor<f32, B>),
+    I64(Tensor<i64, B>),
+    U8(Tensor<u8, B>),
+}
+
+impl<B: Backend> TypedTensor<B> {
+    pub fn dtype(&self) -> DType {
+        match self {
+            Self::F16(_) => DType::F16,
+            Self::BF16(_) => DType::BF16,
+            Self::F32(_) => DType::F32,
+            Self::I64(_) => DType::I64,
+            Self::U8(_) => DType::U8,
+        }
+    }
+
+    pub fn shape(&self) -> &Shape {
+        match self {
+            Self::F16(t) => t.shape(),
+            Self::BF16(t) => t.shape(),
+            Self::F32(t) => t.shape(),
+            Self::I64(t) => t.shape(),
+            Self::U8(t) => t.shape(),
+        }
+    }
 }
 
 impl<T: WithDType, B: Backend> Tensor<T, B> {
@@ -309,15 +331,15 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
         Self::cat(&unsqueezed_refs, dim)
     }
 
-    pub fn downcast(&self) -> Result<TypedTensor<'_, B>> {
+    pub fn downcast(&self) -> Result<TypedTensor<B>> {
         use crate::error::Context;
         let slf = self as &dyn std::any::Any;
         let tt = match T::DTYPE {
-            DType::F16 => TypedTensor::F16(slf.downcast_ref().context("downcast to f16")?),
-            DType::BF16 => TypedTensor::BF16(slf.downcast_ref().context("downcast to bf16")?),
-            DType::F32 => TypedTensor::F32(slf.downcast_ref().context("downcast to f32")?),
-            DType::I64 => TypedTensor::I64(slf.downcast_ref().context("downcast to i64")?),
-            DType::U8 => TypedTensor::U8(slf.downcast_ref().context("downcast to u8")?),
+            DType::F16 => TypedTensor::F16(slf.downcast_ref::<Tensor<half::f16, B>>().context("downcast to f16")?.clone()),
+            DType::BF16 => TypedTensor::BF16(slf.downcast_ref::<Tensor<half::bf16, B>>().context("downcast to bf16")?.clone()),
+            DType::F32 => TypedTensor::F32(slf.downcast_ref::<Tensor<f32, B>>().context("downcast to f32")?.clone()),
+            DType::I64 => TypedTensor::I64(slf.downcast_ref::<Tensor<i64, B>>().context("downcast to i64")?.clone()),
+            DType::U8 => TypedTensor::U8(slf.downcast_ref::<Tensor<u8, B>>().context("downcast to u8")?.clone()),
         };
         Ok(tt)
     }
