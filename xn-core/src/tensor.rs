@@ -335,11 +335,21 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
         use crate::error::Context;
         let slf = self as &dyn std::any::Any;
         let tt = match T::DTYPE {
-            DType::F16 => TypedTensor::F16(slf.downcast_ref::<Tensor<half::f16, B>>().context("downcast to f16")?.clone()),
-            DType::BF16 => TypedTensor::BF16(slf.downcast_ref::<Tensor<half::bf16, B>>().context("downcast to bf16")?.clone()),
-            DType::F32 => TypedTensor::F32(slf.downcast_ref::<Tensor<f32, B>>().context("downcast to f32")?.clone()),
-            DType::I64 => TypedTensor::I64(slf.downcast_ref::<Tensor<i64, B>>().context("downcast to i64")?.clone()),
-            DType::U8 => TypedTensor::U8(slf.downcast_ref::<Tensor<u8, B>>().context("downcast to u8")?.clone()),
+            DType::F16 => TypedTensor::F16(
+                slf.downcast_ref::<Tensor<half::f16, B>>().context("downcast to f16")?.clone(),
+            ),
+            DType::BF16 => TypedTensor::BF16(
+                slf.downcast_ref::<Tensor<half::bf16, B>>().context("downcast to bf16")?.clone(),
+            ),
+            DType::F32 => TypedTensor::F32(
+                slf.downcast_ref::<Tensor<f32, B>>().context("downcast to f32")?.clone(),
+            ),
+            DType::I64 => TypedTensor::I64(
+                slf.downcast_ref::<Tensor<i64, B>>().context("downcast to i64")?.clone(),
+            ),
+            DType::U8 => TypedTensor::U8(
+                slf.downcast_ref::<Tensor<u8, B>>().context("downcast to u8")?.clone(),
+            ),
         };
         Ok(tt)
     }

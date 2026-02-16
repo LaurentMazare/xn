@@ -32,9 +32,7 @@ fn tensors_from_safetensors<B: Backend>(
             safetensors::Dtype::I64 => {
                 TypedTensor::I64(load_tensor::<i64, B>(data, shape, device)?)
             }
-            safetensors::Dtype::U8 => {
-                TypedTensor::U8(load_tensor::<u8, B>(data, shape, device)?)
-            }
+            safetensors::Dtype::U8 => TypedTensor::U8(load_tensor::<u8, B>(data, shape, device)?),
             _ => continue,
         };
         map.insert(name.to_string(), typed);
