@@ -40,6 +40,12 @@ pub struct Device {
     modules: Arc<Mutex<ModuleCache>>,
 }
 
+impl std::fmt::Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device").field("ordinal", &self.cuda.ordinal()).finish()
+    }
+}
+
 impl Device {
     pub fn new(ordinal: usize) -> Result<Self> {
         let cuda = cudarc::driver::CudaContext::new(ordinal)?;
