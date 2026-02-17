@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt};
+use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences};
 use xn::nn::VB;
 use xn::{Backend, Tensor};
 
@@ -10,6 +10,10 @@ impl pocket_tts::Tokenizer for SpTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         let pieces = self.0.encode(text).unwrap_or_default();
         pieces.iter().map(|p| p.id).collect()
+    }
+
+    fn decode(&self, tokens: &[u32]) -> String {
+        self.0.decode_piece_ids(tokens).unwrap_or_default()
     }
 }
 
@@ -188,15 +192,18 @@ impl pocket_tts::flow_lm::Rng for Rng {
     }
 }
 
-fn spawn<F>(f: F) -> std::thread::JoinHandle<()>
+fn spawn<F, R>(f: F) -> std::thread::JoinHandle<R>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnOnce() -> Result<R>,
     F: Send + 'static,
+    R: Send + 'static,
 {
-    std::thread::spawn(move || {
-        if let Err(e) = f() {
+    std::thread::spawn(move || match f() {
+        Err(e) => {
             tracing::error!(?e, "thread error");
+            std::process::exit(1);
         }
+        Ok(res) => res,
     })
 }
 
@@ -209,6 +216,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let tokenizer_path = tokenizer_path.to_str().context("invalid tokenizer path")?;
     let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)?;
     let tokenizer = SpTokenizer(sp);
+    let chunks = split_into_best_sentences(&tokenizer, &args.text, None);
 
     let cfg = TTSConfig::v202601(args.temperature);
 
@@ -228,23 +236,21 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let model: TTSModel<f32, Dev> = TTSModel::load(&root, Box::new(tokenizer), &cfg)?;
     tracing::info!("model loaded successfully!");
 
-    // Prepare text
-    let (text, frames_after_eos) = prepare_text_prompt(&args.text);
-
-    // Tokenize
-    let tokens = model.flow_lm.conditioner.tokenize(&text);
-    let num_tokens = tokens.len();
-    tracing::info!(?text, ?num_tokens, "processing text");
-
-    // Max generation frames
-    let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-
-    // Budget for transformer state: text tokens + voice frames + generation frames
-    let seq_budget = num_tokens + 512 + max_frames;
-
+    let mut max_seq_budget = 0;
+    let mut all_tokens = vec![];
+    for chunk in chunks.iter() {
+        let (text, frames_after_eos) = prepare_text_prompt(chunk);
+        let tokens = model.flow_lm.conditioner.tokenize(&text);
+        let num_tokens = tokens.len();
+        tracing::info!(?text, ?num_tokens, "processing text");
+        let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
+        let seq_budget = num_tokens + 512 + max_frames;
+        max_seq_budget = max_seq_budget.max(seq_budget);
+        all_tokens.push((tokens, max_frames, frames_after_eos));
+    }
     // Init states
-    let mut tts_state = model.init_flow_lm_state(1, seq_budget)?;
-    let mut mimi_state = model.init_mimi_state(1, 250)?;
+    let mut tts_state = model.init_flow_lm_state(1, max_seq_budget)?;
+    let mimi_state = model.init_mimi_state(1, 250)?;
 
     // Load voice embedding
     let voice_vb = VB::load(&[&voice_path], dev.clone())?;
@@ -269,88 +275,94 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
     tracing::info!("done prompting with voice conditioning in {elapsed_ms:.2}ms");
 
-    // Prompt with text
-    tracing::info!("prompting with text conditioning ({} tokens)...", tokens.len());
-    let start = std::time::Instant::now();
-    model.prompt_text(&mut tts_state, &tokens)?;
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    tracing::info!("done prompting with text conditioning in {elapsed_ms:.2}ms");
-
     let start = std::time::Instant::now();
     tracing::info!("starting generation...");
-
-    // BOS marker: NaN tensor [1, 1, ldim]
-    let ldim = cfg.flow_lm.ldim;
-    let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-    let mut prev_latent: Tensor<f32, Dev> = Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?;
-
-    let mut eos_countdown: Option<usize> = None;
-
-    let (latent_tx, latent_rx) = std::sync::mpsc::channel();
+    let mut all_audios = vec![];
     let model = std::sync::Arc::new(model);
-    let is_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let jh = spawn({
-        let wait_to_decode = args.wait_to_decode;
-        let model = model.clone();
-        let is_done = is_done.clone();
-        move || {
-            let mut audio_chunks: Vec<Tensor<f32, Dev>> = Vec::new();
-            if wait_to_decode {
-                tracing::info!("waiting for generation to finish before decoding...");
-                while !is_done.load(std::sync::atomic::Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+    for (tokens, max_frames, frames_after_eos) in all_tokens.into_iter() {
+        tracing::info!("prompting with text conditioning ({} tokens)...", tokens.len());
+        let start = std::time::Instant::now();
+        let mut tts_state = tts_state.clone();
+        let mut mimi_state = mimi_state.clone();
+        model.prompt_text(&mut tts_state, &tokens)?;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!("done prompting with text conditioning in {elapsed_ms:.2}ms");
+
+        // BOS marker: NaN tensor [1, 1, ldim]
+        let ldim = cfg.flow_lm.ldim;
+        let nan_data: Vec<f32> = vec![f32::NAN; ldim];
+        let mut prev_latent: Tensor<f32, Dev> = Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?;
+
+        let mut eos_countdown: Option<usize> = None;
+
+        let (latent_tx, latent_rx) = std::sync::mpsc::channel();
+        let is_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let jh = spawn({
+            let wait_to_decode = args.wait_to_decode;
+            let model = model.clone();
+            let is_done = is_done.clone();
+            move || {
+                let mut audio_chunks: Vec<Tensor<f32, Dev>> = Vec::new();
+                if wait_to_decode {
+                    tracing::info!("waiting for generation to finish before decoding...");
+                    while !is_done.load(std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
                 }
+                while let Ok(next_latent) = latent_rx.recv() {
+                    // Decode latent to audio
+                    let audio_chunk = model.decode_latent(&next_latent, &mut mimi_state)?;
+                    audio_chunks.push(audio_chunk);
+                }
+                // Concatenate audio
+                let audio_refs: Vec<&Tensor<f32, Dev>> = audio_chunks.iter().collect();
+                let audio = Tensor::cat(&audio_refs, 2)?;
+                let audio = audio.narrow(0, ..1)?.contiguous()?;
+                Ok::<_, anyhow::Error>(audio)
             }
-            while let Ok(next_latent) = latent_rx.recv() {
-                // Decode latent to audio
-                let audio_chunk = model.decode_latent(&next_latent, &mut mimi_state)?;
-                audio_chunks.push(audio_chunk);
+        });
+
+        for step in 0..max_frames {
+            let (next_latent, is_eos) =
+                model.generate_step(&mut tts_state, &prev_latent, &mut rng)?;
+            latent_tx.send(next_latent.clone())?;
+
+            if is_eos && eos_countdown.is_none() {
+                eos_countdown = Some(frames_after_eos);
             }
-            let elapsed = start.elapsed().as_secs_f64();
-            // Concatenate audio
-            let audio_refs: Vec<&Tensor<f32, Dev>> = audio_chunks.iter().collect();
-            let audio = Tensor::cat(&audio_refs, 2)?;
-            let audio = audio.narrow(0, ..1)?.contiguous()?;
-            let pcm = audio.to_vec()?;
-            let duration = pcm.len() as f64 / cfg.mimi.sample_rate as f64;
 
-            let rtf = duration / elapsed;
-            tracing::info!("generated {duration:.2}s in {elapsed:.2}s (RTF={rtf:.3})");
-
-            // Write WAV
-            let output_file = std::fs::File::create(&args.output)?;
-            let mut writer = std::io::BufWriter::new(output_file);
-            kaudio::wav::write_pcm_as_wav(&mut writer, &pcm, cfg.mimi.sample_rate as u32, 1)?;
-            tracing::info!("saving output to {}", args.output.display());
-
-            Ok::<_, anyhow::Error>(())
-        }
-    });
-
-    for step in 0..max_frames {
-        let (next_latent, is_eos) = model.generate_step(&mut tts_state, &prev_latent, &mut rng)?;
-        latent_tx.send(next_latent.clone())?;
-
-        if is_eos && eos_countdown.is_none() {
-            eos_countdown = Some(frames_after_eos);
-        }
-
-        if let Some(ref mut countdown) = eos_countdown {
-            if *countdown == 0 {
-                tracing::info!(?step, "reached eos");
-                break;
+            if let Some(ref mut countdown) = eos_countdown {
+                if *countdown == 0 {
+                    tracing::info!(?step, "reached eos");
+                    break;
+                }
+                *countdown -= 1;
             }
-            *countdown -= 1;
-        }
 
-        prev_latent = next_latent;
+            prev_latent = next_latent;
 
-        if (step + 1) % 25 == 0 {
-            tracing::info!(?step, ?max_frames, "generation progress");
+            if (step + 1) % 25 == 0 {
+                tracing::info!(?step, ?max_frames, "generation progress");
+            }
         }
+        std::mem::drop(latent_tx); // Close channel to signal generation thread to finish
+        is_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let audio = jh.join().map_err(|_| anyhow::anyhow!("cannot join thread"))?;
+        all_audios.push(audio);
     }
-    std::mem::drop(latent_tx); // Close channel to signal generation thread to finish
-    is_done.store(true, std::sync::atomic::Ordering::SeqCst);
-    jh.join().map_err(|_| anyhow::anyhow!("cannot join thread"))?;
+    let all_audios = all_audios.iter().collect::<Vec<&Tensor<f32, Dev>>>();
+    let audio = Tensor::cat(&all_audios, 2)?;
+    let pcm = audio.to_vec()?;
+    let duration = pcm.len() as f64 / cfg.mimi.sample_rate as f64;
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let rtf = duration / elapsed;
+    tracing::info!("generated {duration:.2}s in {elapsed:.2}s (RTF={rtf:.3})");
+
+    // Write WAV
+    let output_file = std::fs::File::create(&args.output)?;
+    let mut writer = std::io::BufWriter::new(output_file);
+    kaudio::wav::write_pcm_as_wav(&mut writer, &pcm, cfg.mimi.sample_rate as u32, 1)?;
+    tracing::info!("saving output to {}", args.output.display());
     Ok(())
 }

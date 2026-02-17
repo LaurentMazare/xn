@@ -11,6 +11,7 @@ pub struct SEANetResnetBlock<T: WithDTypeF, B: Backend> {
     convs: Vec<StreamingConv1d<T, B>>,
 }
 
+#[derive(Debug, Clone)]
 pub struct SEANetResnetBlockState<T: WithDTypeF, B: Backend> {
     conv_states: Vec<StreamingConv1dState<T, B>>,
 }
@@ -83,6 +84,7 @@ pub struct SEANetEncoder<T: WithDTypeF, B: Backend> {
 
 type EncoderLayerState<T, B> = (Vec<SEANetResnetBlockState<T, B>>, StreamingConv1dState<T, B>);
 
+#[derive(Debug, Clone)]
 pub struct SEANetEncoderState<T: WithDTypeF, B: Backend> {
     init_conv_state: StreamingConv1dState<T, B>,
     layer_states: Vec<EncoderLayerState<T, B>>,
@@ -228,6 +230,7 @@ pub struct SEANetDecoder<T: WithDTypeF, B: Backend> {
 
 type DecoderLayerState<T, B> = (StreamingConvTr1dState<T, B>, Vec<SEANetResnetBlockState<T, B>>);
 
+#[derive(Debug, Clone)]
 pub struct SEANetDecoderState<T: WithDTypeF, B: Backend> {
     init_conv_state: StreamingConv1dState<T, B>,
     layer_states: Vec<DecoderLayerState<T, B>>,

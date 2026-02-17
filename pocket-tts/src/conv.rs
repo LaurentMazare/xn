@@ -79,6 +79,7 @@ impl<T: WithDTypeF, B: Backend> ConvTranspose1d<T, B> {
 }
 
 /// Streaming state for StreamingConv1d.
+#[derive(Debug, Clone)]
 pub struct StreamingConv1dState<T: WithDTypeF, B: Backend> {
     pub previous: Tensor<T, B>,
     pub first: bool,
@@ -180,6 +181,7 @@ impl<T: WithDTypeF, B: Backend> StreamingConv1d<T, B> {
 }
 
 /// Streaming state for StreamingConvTranspose1d.
+#[derive(Debug, Clone)]
 pub struct StreamingConvTr1dState<T: WithDTypeF, B: Backend> {
     pub partial: Tensor<T, B>,
 }

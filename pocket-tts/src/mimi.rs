@@ -46,6 +46,7 @@ pub struct MimiModel<T: WithDTypeF, B: Backend> {
     _dimension: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct MimiState<T: WithDTypeF, B: Backend> {
     _encoder_state: SEANetEncoderState<T, B>,
     decoder_state: SEANetDecoderState<T, B>,

@@ -14,4 +14,5 @@ pub mod tts_model;
 
 pub trait Tokenizer {
     fn encode(&self, text: &str) -> Vec<u32>;
+    fn decode(&self, tokens: &[u32]) -> String;
 }

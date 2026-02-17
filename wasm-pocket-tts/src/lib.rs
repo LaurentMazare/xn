@@ -40,6 +40,10 @@ impl pocket_tts::Tokenizer for PresetTokenizer {
     fn encode(&self, _text: &str) -> Vec<u32> {
         self.tokens.lock().unwrap().clone()
     }
+
+    fn decode(&self, _tokens: &[u32]) -> String {
+        String::new()
+    }
 }
 
 /// Wrapper to allow sharing a PresetTokenizer via Arc while implementing the Tokenizer trait.
@@ -48,6 +52,10 @@ struct SharedTokenizer(std::sync::Arc<PresetTokenizer>);
 impl pocket_tts::Tokenizer for SharedTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         self.0.encode(text)
+    }
+
+    fn decode(&self, tokens: &[u32]) -> String {
+        self.0.decode(tokens)
     }
 }
 

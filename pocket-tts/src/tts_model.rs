@@ -198,6 +198,83 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
     }
 }
 
+pub const MAX_TOKENS_PER_CHUNK: usize = 50;
+
+/// Split text into sentence-aligned chunks that fit within a token budget.
+///
+/// This mirrors the Python `split_into_best_sentences` function: it prepares the text,
+/// tokenizes it, finds sentence boundaries (after `.`, `!`, `...`, `?` tokens), then
+/// greedily groups sentences into chunks of at most `max_tokens` tokens each.
+pub fn split_into_best_sentences(
+    tokenizer: &dyn crate::Tokenizer,
+    text: &str,
+    max_tokens: Option<usize>,
+) -> Vec<String> {
+    let max_tokens = max_tokens.unwrap_or(MAX_TOKENS_PER_CHUNK);
+    let (prepared, _) = prepare_text_prompt(text);
+    let prepared = prepared.trim().to_string();
+    let tokens = tokenizer.encode(&prepared);
+
+    // Get end-of-sentence token ids by tokenizing ".!...?" and skipping the first token
+    // (the first token includes the leading space marker from sentencepiece).
+    let eos_marker_tokens = tokenizer.encode(".!...?");
+    let eos_tokens =
+        if eos_marker_tokens.len() > 1 { &eos_marker_tokens[1..] } else { &eos_marker_tokens[..] };
+
+    // Find sentence boundary indices: positions where a non-EOS token follows one or more EOS tokens.
+    let mut sentence_boundaries = vec![0usize];
+    let mut prev_was_eos = false;
+
+    for (idx, &token) in tokens.iter().enumerate() {
+        if eos_tokens.contains(&token) {
+            prev_was_eos = true;
+        } else {
+            if prev_was_eos {
+                sentence_boundaries.push(idx);
+            }
+            prev_was_eos = false;
+        }
+    }
+    sentence_boundaries.push(tokens.len());
+
+    // Build (token_count, sentence_text) pairs by decoding each token sub-range.
+    let mut sentences = Vec::new();
+    for window in sentence_boundaries.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        let text = tokenizer.decode(&tokens[start..end]);
+        sentences.push((end - start, text));
+    }
+
+    // Greedily group sentences into chunks that stay under max_tokens.
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+    let mut current_token_count = 0;
+
+    for (nb_tokens, sentence) in sentences {
+        if current_chunk.is_empty() {
+            current_chunk = sentence;
+            current_token_count = nb_tokens;
+            continue;
+        }
+
+        if current_token_count + nb_tokens > max_tokens {
+            chunks.push(current_chunk.trim().to_string());
+            current_chunk = sentence;
+            current_token_count = nb_tokens;
+        } else {
+            current_chunk.push(' ');
+            current_chunk.push_str(&sentence);
+            current_token_count += nb_tokens;
+        }
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk.trim().to_string());
+    }
+
+    chunks
+}
+
 /// Prepare text for generation: capitalize, add punctuation, pad short text.
 pub fn prepare_text_prompt(text: &str) -> (String, usize) {
     let mut text = text.trim().to_string();
