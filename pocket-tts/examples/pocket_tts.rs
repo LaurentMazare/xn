@@ -188,6 +188,18 @@ impl pocket_tts::flow_lm::Rng for Rng {
     }
 }
 
+fn spawn<F>(f: F) -> std::thread::JoinHandle<()>
+where
+    F: FnOnce() -> Result<()>,
+    F: Send + 'static,
+{
+    std::thread::spawn(move || {
+        if let Err(e) = f() {
+            tracing::error!(?e, "thread error");
+        }
+    })
+}
+
 fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let (model_path, tokenizer_path, voice_path) = download_files(&args.voice)?;
 
@@ -277,7 +289,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let (latent_tx, latent_rx) = std::sync::mpsc::channel();
     let model = std::sync::Arc::new(model);
     let is_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let jh = std::thread::spawn({
+    let jh = spawn({
         let wait_to_decode = args.wait_to_decode;
         let model = model.clone();
         let is_done = is_done.clone();
@@ -339,7 +351,6 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     }
     std::mem::drop(latent_tx); // Close channel to signal generation thread to finish
     is_done.store(true, std::sync::atomic::Ordering::SeqCst);
-    jh.join().map_err(|_| anyhow::anyhow!("cannot join thread"))??;
-
+    jh.join().map_err(|_| anyhow::anyhow!("cannot join thread"))?;
     Ok(())
 }
