@@ -263,6 +263,7 @@ impl<T: WithDType, B: Backend> TensorView<T, B> {
         })
     }
 
+    #[tracing::instrument(skip_all)]
     pub fn contiguous(&self) -> Result<Tensor<T, B>> {
         if self.is_contiguous() && self.start_offset == 0 {
             return Ok(Tensor {
