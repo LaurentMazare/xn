@@ -1,3 +1,5 @@
+mod dequantize;
+
 use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
@@ -176,7 +178,8 @@ impl Model {
     pub fn new_(model_weights: &[u8]) -> xn::Result<Model> {
         let cfg = TTSConfig::v202601(0.7);
 
-        let vb = VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?;
+        let model_bytes = dequantize::dequantize_if_needed(model_weights);
+        let vb = VB::from_bytes_with_key_map(vec![model_bytes], CPU, remap_key)?;
         let root = vb.root();
         let tokenizer = std::sync::Arc::new(PresetTokenizer::new());
         let tokenizer_box: Box<dyn pocket_tts::Tokenizer + Send + Sync> =
