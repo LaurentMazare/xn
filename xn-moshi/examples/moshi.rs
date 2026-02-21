@@ -410,6 +410,11 @@ fn run_asr<Dev: Backend>(input: std::path::PathBuf, temperature: f64, dev: Dev) 
     );
     println!("---");
 
+    // Accumulate all text tokens (re-inserting the separator token 3 that
+    // triggers word emission) so that SentencePiece can handle spacing.
+    let mut all_text_tokens: Vec<u32> = vec![];
+    let mut last_decoded_len = 0;
+
     for chunk_idx in 0..num_chunks {
         let start = chunk_idx * chunk_size;
         let end = (start + chunk_size).min(pcm_data.len());
@@ -423,13 +428,16 @@ fn run_asr<Dev: Backend>(input: std::path::PathBuf, temperature: f64, dev: Dev) 
         let msgs = asr.step_pcm(&pcm, &mut state, &mask, |_, _, _| {})?;
 
         for msg in msgs {
-            match msg {
-                AsrMsg::Word { tokens, .. } => {
-                    let text = sp.decode_piece_ids(&tokens).unwrap_or_default();
-                    print!("{text}");
+            if let AsrMsg::Word { tokens, .. } = msg {
+                all_text_tokens.push(3); // re-insert space/separator token
+                all_text_tokens.extend_from_slice(&tokens);
+                let text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
+                let new_chars = text.len() - last_decoded_len;
+                if new_chars > 0 {
+                    print!("{}", &text[last_decoded_len..]);
                     std::io::stdout().flush()?;
                 }
-                _ => {}
+                last_decoded_len = text.len();
             }
         }
     }
