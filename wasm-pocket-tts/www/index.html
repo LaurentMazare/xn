@@ -53,6 +53,9 @@
       <option value="azelma">Azelma</option>
     </select>
   </div>
+  <label style="display:flex;align-items:center;gap:4px;font-weight:400;cursor:pointer">
+    <input type="checkbox" id="quantized"> INT8
+  </label>
   <button id="load-btn">Load Weights (240MB)</button>
   <button id="generate-btn" style="display:none">Generate</button>
   <div class="slider-section">
@@ -77,9 +80,16 @@ const canvas = document.getElementById('visualizer');
 const canvasCtx = canvas.getContext('2d');
 const tempSlider = document.getElementById('temperature');
 const tempValue = document.getElementById('temp-value');
+const quantizedCb = document.getElementById('quantized');
 
 tempSlider.addEventListener('input', () => {
   tempValue.textContent = tempSlider.value;
+});
+
+quantizedCb.addEventListener('change', () => {
+  loadBtn.textContent = quantizedCb.checked
+    ? 'Load Weights (139MB, INT8)'
+    : 'Load Weights (240MB)';
 });
 
 function log(msg) {
@@ -313,7 +323,8 @@ function concatenateChunks(chunks) {
 
 function loadWeights() {
   loadBtn.disabled = true;
-  worker.postMessage({ type: 'load', voiceName: voiceSelect.value });
+  quantizedCb.disabled = true;
+  worker.postMessage({ type: 'load', voiceName: voiceSelect.value, quantized: quantizedCb.checked });
 }
 
 function generate() {

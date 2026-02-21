@@ -1,7 +1,14 @@
 import init, { Model } from './wasm_pocket_tts.js';
 
 const HF_BASE = 'https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main';
-const MODEL_URL = `${HF_BASE}/tts_b6369a24.safetensors`;
+const HF_INT8 = 'https://huggingface.co/idle-intelligence/pocket-tts-int8/resolve/main';
+
+function modelUrl(quantized) {
+  return quantized
+    ? `${HF_INT8}/model.safetensors`
+    : `${HF_BASE}/tts_b6369a24.safetensors`;
+}
+
 const TOKENIZER_URL = `${HF_BASE}/tokenizer.model`;
 
 function voiceUrl(name) {
@@ -206,7 +213,7 @@ let model = null;
 let tokenizer = null;
 let voiceIndexMap = {};
 
-async function handleLoad() {
+async function handleLoad(quantized) {
   const wasmModule = await wasmModulePromise;
   await init(wasmModule);
   post('status', { message: 'WASM initialized. Downloading tokenizer and model...' });
@@ -216,7 +223,8 @@ async function handleLoad() {
   tokenizer = new UnigramTokenizer(pieces);
   post('status', { message: `Tokenizer loaded (${pieces.length} pieces)` });
 
-  const modelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
+  const modelLabel = quantized ? 'Model weights (INT8)' : 'Model weights';
+  const modelWeights = await fetchWithProgress(modelUrl(quantized), modelLabel);
 
   post('status', { message: 'Initializing model...' });
   model = new Model(modelWeights);
@@ -256,7 +264,7 @@ self.onmessage = async (e) => {
   const { type, ...data } = e.data;
   try {
     if (type === 'load') {
-      await handleLoad();
+      await handleLoad(data.quantized);
     } else if (type === 'generate') {
       await handleGenerate(data.text, data.voiceName, data.temperature);
     }

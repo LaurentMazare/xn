@@ -3189,10 +3189,12 @@ name = "wasm-pocket-tts"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "half",
  "js-sys",
  "pocket_tts",
  "rand",
  "rand_distr",
+ "safetensors",
  "wasm-bindgen",
  "xn",
 ]
