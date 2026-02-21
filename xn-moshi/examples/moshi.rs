@@ -56,6 +56,10 @@ enum Command {
         #[arg(long, default_value_t = false)]
         f32: bool,
 
+        /// Batch size for computation (ASR output uses first element only).
+        #[arg(short, long, default_value_t = 1)]
+        batch_size: usize,
+
         /// Write a chrome tracing profile.
         #[arg(long)]
         chrome_tracing: bool,
@@ -158,6 +162,7 @@ fn main() -> Result<()> {
             temperature,
             cpu,
             f32: use_f32,
+            batch_size,
             chrome_tracing,
         } => {
             let _guard = if chrome_tracing {
@@ -170,7 +175,7 @@ fn main() -> Result<()> {
             {
                 if cpu {
                     println!("Using CPU");
-                    run_asr::<f32, _>(input, temperature, xn::CPU)?;
+                    run_asr::<f32, _>(input, temperature, batch_size, xn::CPU)?;
                 } else {
                     let dev = xn::cuda_backend::Device::new(0)?;
                     unsafe {
@@ -178,10 +183,10 @@ fn main() -> Result<()> {
                     }
                     if use_f32 {
                         println!("Using CUDA (f32)");
-                        run_asr::<f32, _>(input, temperature, dev)?;
+                        run_asr::<f32, _>(input, temperature, batch_size, dev)?;
                     } else {
                         println!("Using CUDA (bf16)");
-                        run_asr::<half::bf16, _>(input, temperature, dev)?;
+                        run_asr::<half::bf16, _>(input, temperature, batch_size, dev)?;
                     }
                 }
             }
@@ -190,7 +195,7 @@ fn main() -> Result<()> {
                 let _ = cpu;
                 let _ = use_f32;
                 println!("Using CPU");
-                run_asr::<f32, _>(input, temperature, xn::CPU)?;
+                run_asr::<f32, _>(input, temperature, batch_size, xn::CPU)?;
             }
         }
     }
@@ -359,6 +364,7 @@ fn audio_to_audio<Dev: Backend>(
 fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     input: std::path::PathBuf,
     temperature: f64,
+    batch_size: usize,
     dev: Dev,
 ) -> Result<()> {
     use std::io::Write;
@@ -411,8 +417,8 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     // --- Create ASR ---
     let asr_delay_in_tokens = 31; // 2.5s * 12.5fps
     let asr = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
-    let mut state = asr.init_state(1)?;
-    let mask = StreamMask::all_active(1);
+    let mut state = asr.init_state(batch_size)?;
+    let mask = StreamMask::all_active(batch_size);
 
     // --- Process audio ---
     let chunk_size = 1920; // 80ms at 24kHz
@@ -420,8 +426,8 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     let start_time = std::time::Instant::now();
 
     println!(
-        "\nProcessing ({} chunks of {} samples)...",
-        num_chunks, chunk_size
+        "\nProcessing ({} chunks of {} samples, batch_size={})...",
+        num_chunks, chunk_size, batch_size
     );
     println!("---");
 
@@ -438,21 +444,29 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
             chunk.resize(chunk_size, 0.0);
         }
 
-        let audio: Tensor<f32, Dev> = Tensor::from_vec(chunk, (1, 1, chunk_size), &dev)?;
+        // Replicate the same audio chunk across the batch.
+        let chunk_batched: Vec<f32> = chunk.repeat(batch_size);
+        let audio: Tensor<f32, Dev> =
+            Tensor::from_vec(chunk_batched, (batch_size, 1, chunk_size), &dev)?;
         let pcm = StreamTensor::from_tensor(audio);
         let msgs = asr.step_pcm(&pcm, &mut state, &mask, |_, _, _| {})?;
 
         for msg in msgs {
-            if let AsrMsg::Word { tokens, .. } = msg {
-                all_text_tokens.push(3); // re-insert space/separator token
-                all_text_tokens.extend_from_slice(&tokens);
-                let text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
-                let new_chars = text.len() - last_decoded_len;
-                if new_chars > 0 {
-                    print!("{}", &text[last_decoded_len..]);
-                    std::io::stdout().flush()?;
+            if let AsrMsg::Word {
+                tokens, batch_idx, ..
+            } = msg
+            {
+                if batch_idx == 0 {
+                    all_text_tokens.push(3); // re-insert space/separator token
+                    all_text_tokens.extend_from_slice(&tokens);
+                    let text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
+                    let new_chars = text.len() - last_decoded_len;
+                    if new_chars > 0 {
+                        print!("{}", &text[last_decoded_len..]);
+                        std::io::stdout().flush()?;
+                    }
+                    last_decoded_len = text.len();
                 }
-                last_decoded_len = text.len();
             }
         }
     }

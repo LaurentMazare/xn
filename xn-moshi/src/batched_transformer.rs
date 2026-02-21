@@ -60,8 +60,9 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
         // pos: (batch, t) -> unsqueeze to (batch, t, 1)
         let pos = pos.unsqueeze(2)?;
         // inv_freq: (1, 1, half_dim)
-        // matmul: (batch, t, 1) x (1, 1, half_dim) -> (batch, t, half_dim)
-        let freqs = pos.matmul(&self.inv_freq)?;
+        // broadcast_mul: (batch, t, 1) * (1, 1, half_dim) -> (batch, t, half_dim)
+        // (equivalent to matmul when inner dim is 1, but supports batch broadcasting)
+        let freqs = pos.broadcast_mul(&self.inv_freq)?;
         let cos = freqs.cos()?;
         let sin = freqs.sin()?;
         Ok(Rope { cos, sin })
