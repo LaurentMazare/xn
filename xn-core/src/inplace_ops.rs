@@ -358,6 +358,7 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         }
 
         let (m, n, k) = (lhs_m, rhs_n, lhs_k);
+
         let dst_elems = lhs_batch * m * n;
         let dst_data = self.storage()?;
         let storage_len = B::storage_len(&*dst_data);
@@ -400,6 +401,13 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let mut dst = self.storage_mut()?;
         let (lhs_data, lhs_o) = lhs.storage_and_offset()?;
         let (rhs_data, rhs_o) = rhs.storage_and_offset()?;
+
+        let (lhs_batch, rhs_b_stride, m, n, k) = if lhs_b_stride == m * lhs_rs && rhs_batch == 1 {
+            // Both inputs are contiguous, treat as single batch for better performance.
+            (1, 1, lhs_batch * lhs_m, rhs_n, lhs_k)
+        } else {
+            (lhs_batch, rhs_b_stride, m, n, k)
+        };
         B::gemm(
             &mut *dst,
             (&*lhs_data, lhs_o),

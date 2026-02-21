@@ -31,16 +31,20 @@ fn main() -> Result<()> {
     println!("C = A @ B");
     println!("C shape: {:?}", c.dims());
     println!("C data: {:?}", c.to_vec()?);
-
     // Benchmark matmul with bs=32, m=1, n=11264, k=2048
-    let (bs, m, n, k) = (32, 1, 11264, 2048);
+    run_mm_benchmark(32, 1, 11264, 2048, &device)?;
+    run_mm_benchmark(1, 32, 11264, 2048, &device)?;
+    Ok(())
+}
+
+fn run_mm_benchmark(bs: usize, m: usize, n: usize, k: usize, device: &Device) -> Result<()> {
     println!("\nBenchmarking matmul ({bs}x{m}x{k}) @ (1x{k}x{n})...");
     let a_data: Vec<half::bf16> =
         (0..bs * m * k).map(|i| half::bf16::from_f32((i % 127) as f32 * 0.01)).collect();
     let b_data: Vec<half::bf16> =
         (0..k * n).map(|i| half::bf16::from_f32((i % 113) as f32 * 0.01)).collect();
-    let a: Tensor<half::bf16, Device> = Tensor::from_vec(a_data, (bs, m, k), &device)?;
-    let b: Tensor<half::bf16, Device> = Tensor::from_vec(b_data, (k, n), &device)?;
+    let a: Tensor<half::bf16, Device> = Tensor::from_vec(a_data, (bs, m, k), device)?;
+    let b: Tensor<half::bf16, Device> = Tensor::from_vec(b_data, (k, n), device)?;
 
     // Warmup
     let _warmup = a.matmul(&b)?;

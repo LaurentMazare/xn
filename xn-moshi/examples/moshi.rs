@@ -63,6 +63,9 @@ enum Command {
         /// Write a chrome tracing profile.
         #[arg(long)]
         chrome_tracing: bool,
+
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -164,6 +167,7 @@ fn main() -> Result<()> {
             f32: use_f32,
             batch_size,
             chrome_tracing,
+            verbose,
         } => {
             let _guard = if chrome_tracing {
                 Some(init_tracing())
@@ -175,7 +179,7 @@ fn main() -> Result<()> {
             {
                 if cpu {
                     println!("Using CPU");
-                    run_asr::<f32, _>(input, temperature, batch_size, xn::CPU)?;
+                    run_asr::<f32, _>(input, temperature, batch_size, verbose, xn::CPU)?;
                 } else {
                     let dev = xn::cuda_backend::Device::new(0)?;
                     unsafe {
@@ -183,10 +187,10 @@ fn main() -> Result<()> {
                     }
                     if use_f32 {
                         println!("Using CUDA (f32)");
-                        run_asr::<f32, _>(input, temperature, batch_size, dev)?;
+                        run_asr::<f32, _>(input, temperature, batch_size, verbose, dev)?;
                     } else {
                         println!("Using CUDA (bf16)");
-                        run_asr::<half::bf16, _>(input, temperature, batch_size, dev)?;
+                        run_asr::<half::bf16, _>(input, temperature, batch_size, verbose, dev)?;
                     }
                 }
             }
@@ -195,7 +199,7 @@ fn main() -> Result<()> {
                 let _ = cpu;
                 let _ = use_f32;
                 println!("Using CPU");
-                run_asr::<f32, _>(input, temperature, batch_size, xn::CPU)?;
+                run_asr::<f32, _>(input, temperature, batch_size, verbose, xn::CPU)?;
             }
         }
     }
@@ -365,6 +369,7 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     input: std::path::PathBuf,
     temperature: f64,
     batch_size: usize,
+    verbose: bool,
     dev: Dev,
 ) -> Result<()> {
     use std::io::Write;
@@ -449,7 +454,16 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
         let audio: Tensor<f32, Dev> =
             Tensor::from_vec(chunk_batched, (batch_size, 1, chunk_size), &dev)?;
         let pcm = StreamTensor::from_tensor(audio);
+        let start_time = std::time::Instant::now();
         let msgs = asr.step_pcm(&pcm, &mut state, &mask, |_, _, _| {})?;
+        if verbose {
+            println!(
+                "  chunk {}/{} processed in {:.2}ms",
+                chunk_idx + 1,
+                num_chunks,
+                start_time.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         for msg in msgs {
             if let AsrMsg::Word {
@@ -461,7 +475,7 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
                     all_text_tokens.extend_from_slice(&tokens);
                     let text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
                     let new_chars = text.len() - last_decoded_len;
-                    if new_chars > 0 {
+                    if new_chars > 0 && !verbose {
                         print!("{}", &text[last_decoded_len..]);
                         std::io::stdout().flush()?;
                     }
@@ -473,6 +487,10 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
 
     println!();
     println!("---");
+    if verbose {
+        let decoded_text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
+        println!("{decoded_text}\n---");
+    }
 
     let elapsed = start_time.elapsed();
     let audio_duration = pcm_data.len() as f64 / target_sample_rate as f64;
