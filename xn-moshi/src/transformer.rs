@@ -1,5 +1,5 @@
 use crate::streaming::StreamTensor;
-use xn::nn::{Linear, var_builder::Path};
+use xn::nn::{var_builder::Path, Linear};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
