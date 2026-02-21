@@ -1,6 +1,6 @@
-use crate::{Backend, Result, Shape, Tensor, TensorView, WithDType, shape::Dim};
+use crate::{Backend, Result, Shape, Tensor, TensorView, WithDTypeF, shape::Dim};
 
-pub struct Cache<T: WithDType, B: Backend> {
+pub struct Cache<T: WithDTypeF, B: Backend> {
     all_data: Tensor<T, B>,
     dim: usize,
     current_seq_len: usize,
@@ -8,7 +8,7 @@ pub struct Cache<T: WithDType, B: Backend> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: WithDType, B: Backend> Cache<T, B> {
+impl<T: WithDTypeF, B: Backend> Cache<T, B> {
     pub fn new<S: Into<Shape>, D: Dim>(dim: D, shape: S, dev: &B) -> Result<Self> {
         let shape = shape.into();
         let dim = dim.to_index(&shape, "kv-cache")?;
@@ -53,12 +53,12 @@ impl<T: WithDType, B: Backend> Cache<T, B> {
     }
 }
 
-pub struct KvCache<T: WithDType, B: Backend> {
+pub struct KvCache<T: WithDTypeF, B: Backend> {
     k: Cache<T, B>,
     v: Cache<T, B>,
 }
 
-impl<T: WithDType, B: Backend> KvCache<T, B> {
+impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
     pub fn new<S: Into<Shape>, D: Dim>(dim: D, shape: S, dev: &B) -> Result<Self> {
         let shape = shape.into();
         let dim = dim.to_index(&shape, "kv-cache")?;
@@ -89,7 +89,7 @@ impl<T: WithDType, B: Backend> KvCache<T, B> {
 }
 
 #[derive(Debug, Clone)]
-pub struct RotatingCache<T: WithDType, B: Backend> {
+pub struct RotatingCache<T: WithDTypeF, B: Backend> {
     all_data: Option<Tensor<T, B>>,
     dim: usize,
     // `offset` is the current write index in the buffer
@@ -101,7 +101,7 @@ pub struct RotatingCache<T: WithDType, B: Backend> {
     max_seq_len: usize,
 }
 
-impl<T: WithDType, B: Backend> RotatingCache<T, B> {
+impl<T: WithDTypeF, B: Backend> RotatingCache<T, B> {
     pub fn new(dim: usize, max_seq_len: usize) -> Self {
         Self { all_data: None, dim, offset: 0, current_seq_len: 0, max_seq_len }
     }
@@ -258,12 +258,12 @@ impl<T: WithDType, B: Backend> RotatingCache<T, B> {
 }
 
 #[derive(Debug, Clone)]
-pub struct RotatingKvCache<T: WithDType, B: Backend> {
+pub struct RotatingKvCache<T: WithDTypeF, B: Backend> {
     k: RotatingCache<T, B>,
     v: RotatingCache<T, B>,
 }
 
-impl<T: WithDType, B: Backend> RotatingKvCache<T, B> {
+impl<T: WithDTypeF, B: Backend> RotatingKvCache<T, B> {
     pub fn new(dim: usize, max_seq_len: usize) -> Self {
         let k = RotatingCache::new(dim, max_seq_len);
         let v = RotatingCache::new(dim, max_seq_len);
@@ -330,30 +330,30 @@ impl<T: WithDType, B: Backend> RotatingKvCache<T, B> {
 }
 
 #[derive(Debug, Clone)]
-pub struct IndicesAndMask<B: Backend> {
+pub struct IndicesAndMask<T: WithDTypeF, B: Backend> {
     indices: Tensor<i64, B>,
-    mask: Tensor<f32, B>,
+    mask: Tensor<T, B>,
 }
 
-impl<B: Backend> IndicesAndMask<B> {
-    pub fn mask(&self) -> &Tensor<f32, B> {
+impl<T: WithDTypeF, B: Backend> IndicesAndMask<T, B> {
+    pub fn mask(&self) -> &Tensor<T, B> {
         &self.mask
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ScatteredKvCache<T: WithDType, B: Backend> {
+pub struct ScatteredKvCache<T: WithDTypeF, B: Backend> {
     k: Tensor<T, B>,
     v: Tensor<T, B>,
     context: usize,
 }
 
-impl<T: WithDType, B: Backend> ScatteredKvCache<T, B> {
+impl<T: WithDTypeF, B: Backend> ScatteredKvCache<T, B> {
     pub fn append(
         &mut self,
         k: &Tensor<T, B>,
         v: &Tensor<T, B>,
-        iam: &IndicesAndMask<B>,
+        iam: &IndicesAndMask<T, B>,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
         if self.context <= k.dim(2)? {
             return Ok((k.clone(), v.clone()));
@@ -391,7 +391,7 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
         Ok(Self { positions, indices, context, device: device.clone() })
     }
 
-    pub fn make_cache<T: WithDType>(
+    pub fn make_cache<T: WithDTypeF>(
         &self,
         num_heads: usize,
         head_dim: usize,
@@ -422,11 +422,11 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
     }
 
     #[allow(clippy::needless_range_loop)]
-    pub fn indices_and_mask(
+    pub fn indices_and_mask<T: WithDTypeF>(
         &mut self,
         seq_len: usize,
         batch_mask: &[bool],
-    ) -> Result<IndicesAndMask<B>> {
+    ) -> Result<IndicesAndMask<T, B>> {
         // mask shape is (b, h, t, k)
         let context = self.context;
         if self.context <= seq_len {
@@ -436,14 +436,14 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
         let mut cache_indices = Vec::with_capacity(self.batch_size());
         for (batch_i, &batch_mask) in batch_mask.iter().enumerate() {
             if !batch_mask {
-                let masks: Vec<Vec<f32>> = vec![vec![0.0; context]; seq_len];
+                let masks: Vec<Vec<T>> = vec![vec![T::zero(); context]; seq_len];
                 let indices = vec![self.indices[batch_i] as i64; seq_len];
                 attention_masks.push(masks);
                 cache_indices.push(indices);
             } else {
                 let start_index = self.indices[batch_i];
                 let start_pos = self.positions[batch_i];
-                let mut masks: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+                let mut masks: Vec<Vec<T>> = Vec::with_capacity(seq_len);
                 let mut indices = Vec::with_capacity(seq_len);
                 let mut all_pos = vec![usize::MAX; context];
                 if start_pos < context {
@@ -470,10 +470,17 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
 
                 for seq_i in 0..seq_len {
                     let my_pos = seq_i + start_pos;
-                    let mask = all_pos
-                        .iter()
-                        .map(|&pos| if pos <= my_pos { 0.0 } else { f32::NEG_INFINITY })
-                        .collect::<Vec<f32>>();
+                    let mask =
+                        all_pos
+                            .iter()
+                            .map(|&pos| {
+                                if pos <= my_pos {
+                                    T::zero()
+                                } else {
+                                    T::from_f32(f32::NEG_INFINITY)
+                                }
+                            })
+                            .collect::<Vec<T>>();
                     masks.push(mask);
                 }
 
@@ -482,7 +489,7 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
             }
         }
         let attention_masks =
-            attention_masks.into_iter().flat_map(|m| m.into_iter().flatten()).collect::<Vec<f32>>();
+            attention_masks.into_iter().flat_map(|m| m.into_iter().flatten()).collect::<Vec<T>>();
         let mask = Tensor::from_vec(
             attention_masks,
             (self.batch_size(), 1, seq_len, context),
@@ -498,11 +505,11 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
     }
 
     #[allow(clippy::needless_range_loop)]
-    fn indices_and_mask_abs(
+    fn indices_and_mask_abs<T: WithDTypeF>(
         &mut self,
         seq_len: usize,
         batch_mask: &[bool],
-    ) -> Result<IndicesAndMask<B>> {
+    ) -> Result<IndicesAndMask<T, B>> {
         let mask = self.get_mask_abs(seq_len, seq_len)?;
         let mut cache_indices = Vec::with_capacity(self.batch_size());
         for (batch_i, &batch_mask) in batch_mask.iter().enumerate() {
@@ -528,20 +535,20 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
         Ok(IndicesAndMask { indices, mask })
     }
 
-    fn get_mask_abs(&self, size1: usize, size2: usize) -> Result<Tensor<f32, B>> {
+    fn get_mask_abs<T: WithDTypeF>(&self, size1: usize, size2: usize) -> Result<Tensor<T, B>> {
         let context = self.context;
         let mask: Vec<_> = (0..size1)
             .flat_map(|i| {
                 (0..size2).map(move |j| {
                     if size1 + j > size2 + i || size1 + j + context < size2 + i {
-                        f32::NEG_INFINITY
+                        T::from_f32(f32::NEG_INFINITY)
                     } else {
-                        0.0
+                        T::zero()
                     }
                 })
             })
             .collect();
-        Tensor::<f32, B>::from_vec(mask, (size1, size2), self.device())
+        Tensor::<T, B>::from_vec(mask, (size1, size2), self.device())
     }
 }
 

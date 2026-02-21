@@ -110,17 +110,17 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
 // Layer Scale
 // ============================================================================
 
-struct LayerScale<T: WithDTypeF, B: Backend> {
+pub(crate) struct LayerScale<T: WithDTypeF, B: Backend> {
     scale: Tensor<T, B>,
 }
 
 impl<T: WithDTypeF, B: Backend> LayerScale<T, B> {
-    fn load(vb: &Path<B>, d_model: usize) -> Result<Self> {
+    pub(crate) fn load(vb: &Path<B>, d_model: usize) -> Result<Self> {
         let scale = vb.tensor("scale", (d_model,))?;
         Ok(Self { scale })
     }
 
-    fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    pub(crate) fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         xs.broadcast_mul(&self.scale)
     }
 }
@@ -129,7 +129,7 @@ impl<T: WithDTypeF, B: Backend> LayerScale<T, B> {
 // Normalization
 // ============================================================================
 
-enum Norm<T: WithDTypeF, B: Backend> {
+pub(crate) enum Norm<T: WithDTypeF, B: Backend> {
     LayerNorm {
         weight: Tensor<T, B>,
         bias: Tensor<T, B>,
@@ -142,7 +142,7 @@ enum Norm<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> Norm<T, B> {
-    fn load(vb: &Path<B>, d_model: usize, norm_type: crate::NormType) -> Result<Self> {
+    pub(crate) fn load(vb: &Path<B>, d_model: usize, norm_type: crate::NormType) -> Result<Self> {
         match norm_type {
             crate::NormType::LayerNorm => {
                 let weight = if vb.contains("alpha") {
@@ -164,7 +164,7 @@ impl<T: WithDTypeF, B: Backend> Norm<T, B> {
         }
     }
 
-    fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    pub(crate) fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         match self {
             Self::LayerNorm { weight, bias, eps } => xs.layer_norm(weight, bias, *eps),
             Self::RmsNorm { alpha, eps } => xs.rms_norm(alpha, *eps),
@@ -176,7 +176,7 @@ impl<T: WithDTypeF, B: Backend> Norm<T, B> {
 // MLP
 // ============================================================================
 
-enum Mlp<T: WithDTypeF, B: Backend> {
+pub(crate) enum Mlp<T: WithDTypeF, B: Backend> {
     NoGating {
         linear1_weight: Tensor<T, B>,
         linear1_bias: Option<Tensor<T, B>>,
@@ -193,7 +193,7 @@ enum Mlp<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
-    fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
+    pub(crate) fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
         let d_model = cfg.d_model;
         match cfg.gating {
             None => {
@@ -252,7 +252,7 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
     }
 
     #[tracing::instrument(name = "mlp-forward", skip_all)]
-    fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    pub(crate) fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         match self {
             Self::NoGating {
                 linear1_weight,

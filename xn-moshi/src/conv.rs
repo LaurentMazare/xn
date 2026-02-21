@@ -1,4 +1,4 @@
-use crate::streaming::{StreamMask, StreamTensor, apply_state_mask};
+use crate::streaming::{apply_state_mask, StreamMask, StreamTensor};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 

@@ -1,3 +1,4 @@
+pub mod batched_transformer;
 pub mod conv;
 pub mod mimi;
 pub mod quantization;
