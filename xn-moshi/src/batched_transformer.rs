@@ -1,7 +1,7 @@
 use crate::streaming::{StreamMask, StreamTensor};
 use crate::transformer::{Config, LayerScale, Mlp, Norm, PositionalEmbedding};
 use xn::models::kv_cache::{IndicesAndMask, ScatteredCacheBuilder, ScatteredKvCache};
-use xn::nn::{var_builder::Path, Linear};
+use xn::nn::{Linear, var_builder::Path};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
