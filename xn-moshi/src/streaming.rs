@@ -116,6 +116,10 @@ impl StreamMask {
         Self(Some(mask))
     }
 
+    pub fn all_active(batch_size: usize) -> Self {
+        Self(Some(vec![true; batch_size]))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_none()
     }

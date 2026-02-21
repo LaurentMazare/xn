@@ -1,4 +1,4 @@
-use crate::streaming::StreamMask;
+use crate::streaming::{StreamMask, StreamTensor};
 use crate::transformer::{Config, LayerScale, Mlp, Norm, PositionalEmbedding};
 use xn::models::kv_cache::{IndicesAndMask, ScatteredCacheBuilder, ScatteredKvCache};
 use xn::nn::var_builder::Path;
@@ -166,19 +166,16 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
 
         let q = qkv
             .narrow(2, ..d_model)?
-            .contiguous()?
             .reshape((b, t, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
         let k = qkv
             .narrow(2, d_model..2 * d_model)?
-            .contiguous()?
             .reshape((b, t, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
         let v = qkv
             .narrow(2, 2 * d_model..3 * d_model)?
-            .contiguous()?
             .reshape((b, t, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -490,5 +487,19 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
             ys
         };
         Ok(vec![ys])
+    }
+
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut BatchedTransformerState<T, B>,
+        mask: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
+        let xs = match xs.as_option() {
+            None => return Ok(StreamTensor::empty()),
+            Some(xs) => xs,
+        };
+        let ys = self.forward(xs, state, mask)?;
+        Ok(StreamTensor::from_tensor(ys[0].clone()))
     }
 }

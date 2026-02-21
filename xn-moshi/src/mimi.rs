@@ -1,5 +1,5 @@
 use crate::streaming::{StreamMask, StreamTensor};
-use crate::{conv, quantization, seanet, transformer};
+use crate::{batched_transformer as bt, conv, quantization, seanet, transformer};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -88,13 +88,13 @@ impl Config {
 
 pub struct MimiEncodeState<T: WithDTypeF, B: Backend> {
     pub encoder: seanet::EncoderState<T, B>,
-    pub encoder_transformer: transformer::TransformerState<T, B>,
+    pub encoder_transformer: bt::BatchedTransformerState<T, B>,
     pub downsample: conv::Conv1dState<T, B>,
 }
 
 pub struct MimiDecodeState<T: WithDTypeF, B: Backend> {
     pub upsample: conv::ConvTr1dState<T, B>,
-    pub decoder_transformer: transformer::TransformerState<T, B>,
+    pub decoder_transformer: bt::BatchedTransformerState<T, B>,
     pub decoder: seanet::DecoderState<T, B>,
 }
 
@@ -105,8 +105,8 @@ pub struct MimiDecodeState<T: WithDTypeF, B: Backend> {
 pub struct Mimi<T: WithDTypeF, B: Backend> {
     encoder: seanet::SeaNetEncoder<T, B>,
     decoder: seanet::SeaNetDecoder<T, B>,
-    encoder_transformer: transformer::ProjectedTransformer<T, B>,
-    decoder_transformer: transformer::ProjectedTransformer<T, B>,
+    encoder_transformer: bt::BatchedProjectedTransformer<T, B>,
+    decoder_transformer: bt::BatchedProjectedTransformer<T, B>,
     downsample: conv::ConvDownsample1d<T, B>,
     upsample: conv::ConvTrUpsample1d<T, B>,
     quantizer: quantization::SplitResidualVectorQuantizer<T, B>,
@@ -114,23 +114,21 @@ pub struct Mimi<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
-    pub fn load(vb: &Path<B>, cfg: Config, device: &B) -> Result<Self> {
+    pub fn load(vb: &Path<B>, cfg: Config) -> Result<Self> {
         let dim = cfg.seanet.dimension;
 
         let encoder = seanet::SeaNetEncoder::load(&vb.pp("encoder"), &cfg.seanet)?;
         let decoder = seanet::SeaNetDecoder::load(&vb.pp("decoder"), &cfg.seanet)?;
 
-        let encoder_transformer = transformer::ProjectedTransformer::load(
+        let encoder_transformer = bt::BatchedProjectedTransformer::load(
             &vb.pp("encoder_transformer"),
             dim,
             &cfg.transformer,
-            device,
         )?;
-        let decoder_transformer = transformer::ProjectedTransformer::load(
+        let decoder_transformer = bt::BatchedProjectedTransformer::load(
             &vb.pp("decoder_transformer"),
             dim,
             &cfg.transformer,
-            device,
         )?;
 
         let quantizer = quantization::SplitResidualVectorQuantizer::load(
@@ -177,27 +175,33 @@ impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
         &self.config
     }
 
-    pub fn init_encode_state(&self) -> MimiEncodeState<T, B> {
-        MimiEncodeState {
+    pub fn init_encode_state(&self, batch_size: usize) -> Result<MimiEncodeState<T, B>> {
+        let state = MimiEncodeState {
             encoder: self.encoder.init_state(),
-            encoder_transformer: self.encoder_transformer.init_state(),
+            encoder_transformer: self.encoder_transformer.init_state(batch_size)?,
             downsample: self.downsample.init_state(),
-        }
+        };
+        Ok(state)
     }
 
-    pub fn init_decode_state(&self) -> MimiDecodeState<T, B> {
-        MimiDecodeState {
+    pub fn init_decode_state(&self, batch_size: usize) -> Result<MimiDecodeState<T, B>> {
+        let state = MimiDecodeState {
             upsample: self.upsample.init_state(),
-            decoder_transformer: self.decoder_transformer.init_state(),
+            decoder_transformer: self.decoder_transformer.init_state(batch_size)?,
             decoder: self.decoder.init_state(),
-        }
+        };
+        Ok(state)
     }
 
     /// Encode audio to codes (non-streaming).
     pub fn encode(&self, xs: &Tensor<T, B>) -> Result<Tensor<i64, B>> {
+        let batch_size = xs.dim(0)?;
         let xs = self.encoder.forward(xs)?;
-        let mut tf_state = self.encoder_transformer.init_state();
-        let xs = self.encoder_transformer.forward(&xs, &mut tf_state)?;
+        let mut tf_state = self.encoder_transformer.init_state(batch_size)?;
+        let mask = StreamMask::all_active(batch_size);
+        let xs = self
+            .encoder_transformer
+            .forward(&xs, &mut tf_state, &mask)?;
         let xs = &xs[0];
         let xs = self.downsample.forward(xs)?;
         self.quantizer.encode(&xs)
@@ -205,10 +209,14 @@ impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
 
     /// Decode codes to audio (non-streaming).
     pub fn decode(&self, codes: &Tensor<i64, B>) -> Result<Tensor<T, B>> {
+        let batch_size = codes.dim(0)?;
         let emb = self.quantizer.decode(codes)?;
         let emb = self.upsample.forward(&emb)?;
-        let mut tf_state = self.decoder_transformer.init_state();
-        let outs = self.decoder_transformer.forward(&emb, &mut tf_state)?;
+        let mut tf_state = self.decoder_transformer.init_state(batch_size)?;
+        let mask = StreamMask::all_active(batch_size);
+        let outs = self
+            .decoder_transformer
+            .forward(&emb, &mut tf_state, &mask)?;
         self.decoder.forward(&outs[0])
     }
 

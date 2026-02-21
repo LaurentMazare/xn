@@ -1,4 +1,4 @@
-use crate::streaming::{StreamMask, StreamTensor};
+use crate::streaming::StreamTensor;
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -643,7 +643,6 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
         &self,
         xs: &StreamTensor<T, B>,
         state: &mut TransformerState<T, B>,
-        _mask: &StreamMask,
     ) -> Result<StreamTensor<T, B>> {
         match xs.as_option() {
             None => Ok(StreamTensor::empty()),

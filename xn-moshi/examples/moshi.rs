@@ -39,7 +39,7 @@ enum Command {
 }
 
 fn download_model() -> Result<std::path::PathBuf> {
-    use hf_hub::{Repo, RepoType, api::sync::Api};
+    use hf_hub::{api::sync::Api, Repo, RepoType};
     let repo_id = "kyutai/moshiko-candle-q8";
     println!("Downloading model from {repo_id}...");
     let api = Api::new()?;
@@ -139,7 +139,7 @@ fn audio_to_audio<Dev: Backend>(
         "  sample_rate={}, frame_rate={}, codebooks={}",
         config.sample_rate, config.frame_rate, codebooks
     );
-    let model: Mimi<f32, Dev> = Mimi::load(&vb.root(), config, &dev)?;
+    let model: Mimi<f32, Dev> = Mimi::load(&vb.root(), config)?;
     println!("  Model loaded");
 
     // --- Streaming encode ---
@@ -150,8 +150,8 @@ fn audio_to_audio<Dev: Backend>(
         "\nEncoding ({} chunks of {} samples)...",
         num_chunks, chunk_size
     );
-    let mut enc_state = model.init_encode_state();
-    let mask = StreamMask::empty();
+    let mut enc_state = model.init_encode_state(1)?;
+    let mask = StreamMask::all_active(1);
 
     let encode_start = std::time::Instant::now();
     let mut all_codes: Vec<Tensor<i64, Dev>> = Vec::with_capacity(num_chunks);
@@ -201,7 +201,7 @@ fn audio_to_audio<Dev: Backend>(
 
     // --- Streaming decode ---
     println!("\nDecoding ({} frames)...", total_frames);
-    let mut dec_state = model.init_decode_state();
+    let mut dec_state = model.init_decode_state(1)?;
     let decode_start = std::time::Instant::now();
     let mut all_decoded: Vec<Tensor<f32, Dev>> = Vec::with_capacity(total_frames);
 
