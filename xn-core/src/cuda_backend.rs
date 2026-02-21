@@ -2,7 +2,7 @@
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
 use half::{bf16, f16};
 use std::sync::{Arc, Mutex};
@@ -313,12 +313,9 @@ fn gemm_f32(
         (rhs_m1, rhs_m2),
     )?;
 
-    let lhs_view = lhs.0.data.slice(lhs.1..);
-    let rhs_view = rhs.0.data.slice(rhs.1..);
-
-    unsafe {
-        dst.device.blas.gemm_strided_batched(cfg, &rhs_view, &lhs_view, &mut dst.data)?;
-    }
+    let lhs = lhs.0.data.slice(lhs.1..);
+    let rhs = rhs.0.data.slice(rhs.1..);
+    unsafe { gemm_strided_batched_f32(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
 
     Ok(())
 }
@@ -349,11 +346,10 @@ fn gemm_f16(
         (lhs_m1, lhs_m2),
         (rhs_m1, rhs_m2),
     )?;
-    let lhs_view = lhs.0.data.slice(lhs.1..);
-    let rhs_view = rhs.0.data.slice(rhs.1..);
-    unsafe {
-        dst.device.blas.gemm_strided_batched(cfg, &rhs_view, &lhs_view, &mut dst.data)?;
-    }
+    let lhs = lhs.0.data.slice(lhs.1..);
+    let rhs = rhs.0.data.slice(rhs.1..);
+    unsafe { gemm_strided_batched_f16(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
+
     Ok(())
 }
 
@@ -383,11 +379,9 @@ fn gemm_bf16(
         (lhs_m1, lhs_m2),
         (rhs_m1, rhs_m2),
     )?;
-    let lhs_view = lhs.0.data.slice(lhs.1..);
-    let rhs_view = rhs.0.data.slice(rhs.1..);
-    unsafe {
-        dst.device.blas.gemm_strided_batched(cfg, &rhs_view, &lhs_view, &mut dst.data)?;
-    }
+    let lhs = lhs.0.data.slice(lhs.1..);
+    let rhs = rhs.0.data.slice(rhs.1..);
+    unsafe { gemm_strided_batched_bf16(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
     Ok(())
 }
 
@@ -2065,4 +2059,178 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
+}
+
+unsafe fn gemm_strided_batched_f32(
+    cublas: &cudarc::cublas::CudaBlas,
+    cfg: StridedBatchedConfig<f32>,
+    a: &cudarc::driver::CudaView<f32>,
+    b: &cudarc::driver::CudaView<f32>,
+    c: &mut CudaSlice<f32>,
+) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
+    use cudarc::cublas::sys;
+    use cudarc::driver::DevicePtrMut;
+
+    let compute_type = if gemm_reduced_precision_f32() {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+    } else {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+    };
+    let alpha = &cfg.gemm.alpha as *const f32 as *const _;
+    let beta = &cfg.gemm.beta as *const f32 as *const _;
+
+    let stream = c.stream().clone();
+    let (a, _guard_a) = a.device_ptr(&stream);
+    let (b, _guard_b) = b.device_ptr(&stream);
+    let (c, _guard_c) = c.device_ptr_mut(&stream);
+
+    unsafe {
+        cudarc::cublas::result::gemm_strided_batched_ex(
+            *cublas.handle(),
+            cfg.gemm.transa,
+            cfg.gemm.transb,
+            cfg.gemm.m,
+            cfg.gemm.n,
+            cfg.gemm.k,
+            alpha,
+            a as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.gemm.lda,
+            cfg.stride_a,
+            b as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.gemm.ldb,
+            cfg.stride_b,
+            beta,
+            c as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.gemm.ldc,
+            cfg.stride_c,
+            cfg.batch_size,
+            compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+}
+
+unsafe fn gemm_strided_batched_f16(
+    cublas: &cudarc::cublas::CudaBlas,
+    cfg: StridedBatchedConfig<f16>,
+    a: &cudarc::driver::CudaView<f16>,
+    b: &cudarc::driver::CudaView<f16>,
+    c: &mut CudaSlice<f16>,
+) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
+    use cudarc::cublas::sys;
+    use cudarc::driver::DevicePtrMut;
+
+    let alpha = cfg.gemm.alpha;
+    let beta = cfg.gemm.beta;
+    let alpha_f32: f32 = cfg.gemm.alpha.to_f32();
+    let beta_f32: f32 = cfg.gemm.beta.to_f32();
+    let (compute_type, alpha, beta) = if gemm_reduced_precision_f16() {
+        (
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+            (&alpha) as *const f16 as *const _,
+            (&beta) as *const f16 as *const _,
+        )
+    } else {
+        (
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            (&alpha_f32) as *const f32 as *const _,
+            (&beta_f32) as *const f32 as *const _,
+        )
+    };
+
+    let stream = c.stream().clone();
+    let (a, _guard_a) = a.device_ptr(&stream);
+    let (b, _guard_b) = b.device_ptr(&stream);
+    let (c, _guard_c) = c.device_ptr_mut(&stream);
+    unsafe {
+        cudarc::cublas::result::gemm_strided_batched_ex(
+            *cublas.handle(),
+            cfg.gemm.transa,
+            cfg.gemm.transb,
+            cfg.gemm.m,
+            cfg.gemm.n,
+            cfg.gemm.k,
+            alpha,
+            a as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            cfg.gemm.lda,
+            cfg.stride_a,
+            b as *const _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            cfg.gemm.ldb,
+            cfg.stride_b,
+            beta,
+            c as *mut _,
+            sys::cudaDataType_t::CUDA_R_16F,
+            cfg.gemm.ldc,
+            cfg.stride_c,
+            cfg.batch_size,
+            compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
+}
+
+unsafe fn gemm_strided_batched_bf16(
+    cublas: &cudarc::cublas::CudaBlas,
+    cfg: StridedBatchedConfig<bf16>,
+    a: &cudarc::driver::CudaView<bf16>,
+    b: &cudarc::driver::CudaView<bf16>,
+    c: &mut CudaSlice<bf16>,
+) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
+    use cudarc::cublas::sys;
+    use cudarc::driver::DevicePtrMut;
+
+    let alpha_f32: f32 = cfg.gemm.alpha.to_f32();
+    let beta_f32: f32 = cfg.gemm.beta.to_f32();
+    // The type for alpha and beta depends on the computeType.
+    // https://docs.nvidia.com/cuda/cublas/index.html#cublasgemmstridedbatchedex
+    let (compute_type, alpha, beta) = if gemm_reduced_precision_bf16() {
+        (
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
+            (&alpha_f32) as *const f32 as *const _,
+            (&beta_f32) as *const f32 as *const _,
+        )
+    } else {
+        (
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            (&alpha_f32) as *const f32 as *const _,
+            (&beta_f32) as *const f32 as *const _,
+        )
+    };
+
+    let stream = c.stream().clone();
+    let (a, _guard_a) = a.device_ptr(&stream);
+    let (b, _guard_b) = b.device_ptr(&stream);
+    let (c, _guard_c) = c.device_ptr_mut(&stream);
+    unsafe {
+        cudarc::cublas::result::gemm_strided_batched_ex(
+            *cublas.handle(),
+            cfg.gemm.transa,
+            cfg.gemm.transb,
+            cfg.gemm.m,
+            cfg.gemm.n,
+            cfg.gemm.k,
+            alpha,
+            a as *const _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            cfg.gemm.lda,
+            cfg.stride_a,
+            b as *const _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            cfg.gemm.ldb,
+            cfg.stride_b,
+            beta,
+            c as *mut _,
+            sys::cudaDataType_t::CUDA_R_16BF,
+            cfg.gemm.ldc,
+            cfg.stride_c,
+            cfg.batch_size,
+            compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+        )
+    }
 }
