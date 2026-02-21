@@ -32,14 +32,14 @@ fn main() -> Result<()> {
     println!("C shape: {:?}", c.dims());
     println!("C data: {:?}", c.to_vec()?);
 
-    // Benchmark matmul with m=1, n=11264, k=2048
-    let (m, n, k) = (1, 11264, 2048);
-    println!("\nBenchmarking matmul ({m}x{k}) @ ({k}x{n})...");
+    // Benchmark matmul with bs=32, m=1, n=11264, k=2048
+    let (bs, m, n, k) = (32, 1, 11264, 2048);
+    println!("\nBenchmarking matmul ({bs}x{m}x{k}) @ (1x{k}x{n})...");
     let a_data: Vec<half::bf16> =
-        (0..m * k).map(|i| half::bf16::from_f32((i % 127) as f32 * 0.01)).collect();
+        (0..bs * m * k).map(|i| half::bf16::from_f32((i % 127) as f32 * 0.01)).collect();
     let b_data: Vec<half::bf16> =
         (0..k * n).map(|i| half::bf16::from_f32((i % 113) as f32 * 0.01)).collect();
-    let a: Tensor<half::bf16, Device> = Tensor::from_vec(a_data, (m, k), &device)?;
+    let a: Tensor<half::bf16, Device> = Tensor::from_vec(a_data, (bs, m, k), &device)?;
     let b: Tensor<half::bf16, Device> = Tensor::from_vec(b_data, (k, n), &device)?;
 
     // Warmup
@@ -55,7 +55,7 @@ fn main() -> Result<()> {
     let elapsed = start.elapsed();
 
     let avg_us = elapsed.as_micros() as f64 / num_iters as f64;
-    let flops = 2.0 * m as f64 * n as f64 * k as f64;
+    let flops = 2.0 * bs as f64 * m as f64 * n as f64 * k as f64;
     let tflops = flops * num_iters as f64 / elapsed.as_secs_f64() / 1e12;
     println!("{num_iters} iters in {elapsed:.2?} ({avg_us:.1} us/iter, {tflops:.2} TFLOP/s)");
 
