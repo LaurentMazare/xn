@@ -315,6 +315,7 @@ pub struct BatchedTransformer<T: WithDTypeF, B: Backend> {
     num_kv: usize,
     head_dim: usize,
     context: usize,
+    device: B,
 }
 
 impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
@@ -356,15 +357,12 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
             num_kv,
             head_dim,
             context: cfg.context,
+            device: vb.device().clone(),
         })
     }
 
-    pub fn init_state(
-        &self,
-        batch_size: usize,
-        device: &B,
-    ) -> Result<BatchedTransformerState<T, B>> {
-        let builder = ScatteredCacheBuilder::new(batch_size, self.context, device)?;
+    pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<T, B>> {
+        let builder = ScatteredCacheBuilder::new(batch_size, self.context, &self.device)?;
         let mut kv_caches = Vec::with_capacity(self.layers.len());
         for _ in &self.layers {
             kv_caches.push(builder.make_cache(self.num_kv, self.head_dim)?);
@@ -462,12 +460,8 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
         })
     }
 
-    pub fn init_state(
-        &self,
-        batch_size: usize,
-        device: &B,
-    ) -> Result<BatchedTransformerState<T, B>> {
-        self.transformer.init_state(batch_size, device)
+    pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<T, B>> {
+        self.transformer.init_state(batch_size)
     }
 
     pub fn forward(
