@@ -1,5 +1,5 @@
 use crate::streaming::StreamTensor;
-use xn::nn::{Linear, var_builder::Path};
+use xn::nn::{var_builder::Path, Linear};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
@@ -252,8 +252,7 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
 struct StreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
     in_proj_weight: Tensor<T, B>,
     in_proj_bias: Option<Tensor<T, B>>,
-    out_proj_weight: Tensor<T, B>,
-    out_proj_bias: Option<Tensor<T, B>>,
+    out_proj: Linear<T, B>,
     num_heads: usize,
     head_dim: usize,
     max_seq_len: usize,
@@ -275,19 +274,11 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
             None
         };
 
-        let vb_out = vb_attn.pp("out_proj");
-        let out_proj_weight = vb_out.tensor("weight", (d_model, d_model))?;
-        let out_proj_bias = if cfg.bias_attn {
-            Some(vb_out.tensor("bias", (d_model,))?)
-        } else {
-            None
-        };
-
+        let out_proj = Linear::load_o(&vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
         Ok(Self {
             in_proj_weight,
             in_proj_bias,
-            out_proj_weight,
-            out_proj_bias,
+            out_proj,
             num_heads,
             head_dim,
             max_seq_len: cfg.context,
@@ -354,10 +345,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
                 .transpose(1, 2)?
                 .reshape((b, t, self.num_heads * self.head_dim))?;
 
-        let mut out = xn::ops::matmul_t(&attn_output, &self.out_proj_weight)?;
-        if let Some(bias) = &self.out_proj_bias {
-            out = out.broadcast_add(bias)?;
-        }
+        let out = self.out_proj.forward(&attn_output)?;
         Ok(out)
     }
 
@@ -518,8 +506,8 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
 // ============================================================================
 
 pub struct ProjectedTransformer<T: WithDTypeF, B: Backend> {
-    input_proj: Option<Tensor<T, B>>,
-    output_proj: Option<Tensor<T, B>>,
+    input_proj: Option<Linear<T, B>>,
+    output_proj: Option<Linear<T, B>>,
     transformer: StreamingTransformer<T, B>,
     conv_layout: bool,
 }
@@ -527,20 +515,17 @@ pub struct ProjectedTransformer<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
     pub fn load(vb: &Path<B>, input_dim: usize, cfg: &Config, device: &B) -> Result<Self> {
         let input_proj = if input_dim != cfg.d_model {
-            Some(
-                vb.pp("input_proj")
-                    .tensor("weight", (cfg.d_model, input_dim))?,
-            )
+            Some(Linear::load(&vb.pp("input_proj"), input_dim, cfg.d_model)?)
         } else {
             None
         };
 
         let output_proj = if input_dim != cfg.d_model {
-            Some(
-                vb.pp("output_projs")
-                    .pp(0)
-                    .tensor("weight", (input_dim, cfg.d_model))?,
-            )
+            Some(Linear::load(
+                &vb.pp("output_proj").pp(0),
+                cfg.d_model,
+                input_dim,
+            )?)
         } else {
             None
         };
@@ -570,12 +555,12 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
             xs.clone()
         };
         let xs = match &self.input_proj {
-            Some(proj) => xs.matmul_t(proj)?,
+            Some(proj) => proj.forward(&xs)?,
             None => xs,
         };
         let xs = self.transformer.forward(&xs, state)?;
         let ys = match &self.output_proj {
-            Some(proj) => xs.matmul_t(proj)?,
+            Some(proj) => proj.forward(&xs)?,
             None => xs,
         };
         let ys = if self.conv_layout {
