@@ -1,5 +1,7 @@
+pub mod asr;
 pub mod batched_transformer;
 pub mod conv;
+pub mod lm;
 pub mod mimi;
 pub mod quantization;
 pub mod seanet;

@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use xn::nn::VB;
 use xn::{Backend, Tensor};
-use xn_moshi::mimi::{Config, Mimi};
+use xn_moshi::asr::{Asr, AsrMsg};
+use xn_moshi::lm::{self, LmModel};
+use xn_moshi::mimi::{self, Mimi};
 use xn_moshi::streaming::{StreamMask, StreamTensor};
 
 #[derive(Parser, Debug)]
@@ -36,19 +38,68 @@ enum Command {
         #[arg(long)]
         chrome_tracing: bool,
     },
+
+    /// Run speech-to-text on an audio file.
+    Asr {
+        /// Input audio file to process.
+        input: std::path::PathBuf,
+
+        /// Sampling temperature (0 for greedy).
+        #[arg(short, long, default_value_t = 0.0)]
+        temperature: f64,
+
+        /// Use CPU even if CUDA is available.
+        #[arg(long, default_value_t = false)]
+        cpu: bool,
+
+        /// Write a chrome tracing profile.
+        #[arg(long)]
+        chrome_tracing: bool,
+    },
 }
 
-fn download_model() -> Result<std::path::PathBuf> {
+fn download_mimi_model() -> Result<std::path::PathBuf> {
     use hf_hub::{Repo, RepoType, api::sync::Api};
     let repo_id = "kyutai/moshiko-candle-q8";
-    println!("Downloading model from {repo_id}...");
+    println!("Downloading mimi model from {repo_id}...");
     let api = Api::new()?;
     let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
     let model_path = repo
         .get("tokenizer-e351c8d8-checkpoint125.safetensors")
-        .context("model safetensors not found")?;
-    println!("  Model at {}", model_path.display());
+        .context("mimi safetensors not found")?;
+    println!("  Mimi at {}", model_path.display());
     Ok(model_path)
+}
+
+struct AsrFiles {
+    lm: std::path::PathBuf,
+    mimi: std::path::PathBuf,
+    tokenizer: std::path::PathBuf,
+}
+
+fn download_asr_model() -> Result<AsrFiles> {
+    use hf_hub::{Repo, RepoType, api::sync::Api};
+    let repo_id = "kyutai/stt-2.6b-en-candle";
+    println!("Downloading ASR model from {repo_id}...");
+    let api = Api::new()?;
+    let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+    let lm = repo
+        .get("model.safetensors")
+        .context("LM safetensors not found")?;
+    println!("  LM at {}", lm.display());
+    let mimi = repo
+        .get("mimi-pytorch-e351c8d8@125.safetensors")
+        .context("mimi safetensors not found")?;
+    println!("  Mimi at {}", mimi.display());
+    let tokenizer = repo
+        .get("tokenizer_en_audio_4000.model")
+        .context("tokenizer not found")?;
+    println!("  Tokenizer at {}", tokenizer.display());
+    Ok(AsrFiles {
+        lm,
+        mimi,
+        tokenizer,
+    })
 }
 
 fn init_tracing() -> tracing_chrome::FlushGuard {
@@ -97,6 +148,40 @@ fn main() -> Result<()> {
                 audio_to_audio(input, output, codebooks, xn::CPU)?;
             }
         }
+
+        Command::Asr {
+            input,
+            temperature,
+            cpu,
+            chrome_tracing,
+        } => {
+            let _guard = if chrome_tracing {
+                Some(init_tracing())
+            } else {
+                None
+            };
+
+            #[cfg(feature = "cuda")]
+            {
+                if cpu {
+                    println!("Using CPU");
+                    run_asr(input, temperature, xn::CPU)?;
+                } else {
+                    println!("Using CUDA");
+                    let dev = xn::cuda_backend::Device::new(0)?;
+                    unsafe {
+                        dev.disable_event_tracking();
+                    }
+                    run_asr(input, temperature, dev)?;
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = cpu;
+                println!("Using CPU");
+                run_asr(input, temperature, xn::CPU)?;
+            }
+        }
     }
 
     Ok(())
@@ -131,10 +216,10 @@ fn audio_to_audio<Dev: Backend>(
     };
 
     // --- Load model ---
-    let model_path = download_model()?;
+    let model_path = download_mimi_model()?;
     println!("Loading model weights...");
     let vb = VB::load(&[model_path], dev.clone())?;
-    let config = Config::v0_1(Some(codebooks));
+    let config = mimi::Config::v0_1(Some(codebooks));
     println!(
         "  sample_rate={}, frame_rate={}, codebooks={}",
         config.sample_rate, config.frame_rate, codebooks
@@ -255,6 +340,109 @@ fn audio_to_audio<Dev: Backend>(
         "  Total:    {:.2}s ({:.1}x realtime)",
         total.as_secs_f64(),
         audio_duration / total.as_secs_f64()
+    );
+
+    Ok(())
+}
+
+fn run_asr<Dev: Backend>(input: std::path::PathBuf, temperature: f64, dev: Dev) -> Result<()> {
+    use std::io::Write;
+
+    let target_sample_rate: usize = 24000;
+
+    // --- Load audio ---
+    println!("Loading audio from {}...", input.display());
+    let (pcm_data, sample_rate) = kaudio::pcm_decode(&input)?;
+    let audio_duration = pcm_data.len() as f64 / sample_rate as f64;
+    println!(
+        "  {} samples at {} Hz ({:.2}s)",
+        pcm_data.len(),
+        sample_rate,
+        audio_duration
+    );
+
+    let pcm_data = if sample_rate as usize != target_sample_rate {
+        println!(
+            "  Resampling {} Hz -> {} Hz",
+            sample_rate, target_sample_rate
+        );
+        kaudio::resample(&pcm_data, sample_rate as usize, target_sample_rate)?
+    } else {
+        pcm_data
+    };
+
+    // --- Download models ---
+    let files = download_asr_model()?;
+
+    // --- Load tokenizer ---
+    let tokenizer_path = files.tokenizer.to_str().context("invalid tokenizer path")?;
+    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("failed to open tokenizer: {e}"))?;
+
+    // --- Load mimi ---
+    println!("Loading mimi weights...");
+    let mimi_vb = VB::load(&[files.mimi], dev.clone())?;
+    let mimi_config = mimi::Config::v0_1(Some(32));
+    let mimi: Mimi<f32, Dev> = Mimi::load(&mimi_vb.root(), mimi_config)?;
+    println!("  Mimi loaded");
+
+    // --- Load LM ---
+    println!("Loading LM weights...");
+    let lm_vb = VB::load(&[files.lm], dev.clone())?;
+    let lm_config = lm::Config::stt_2_6b();
+    let lm: LmModel<f32, Dev> = LmModel::load(&lm_vb.root(), &lm_config)?;
+    println!("  LM loaded");
+
+    // --- Create ASR ---
+    let asr_delay_in_tokens = 31; // 2.5s * 12.5fps
+    let asr = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
+    let mut state = asr.init_state(1)?;
+    let mask = StreamMask::all_active(1);
+
+    // --- Process audio ---
+    let chunk_size = 1920; // 80ms at 24kHz
+    let num_chunks = pcm_data.len().div_ceil(chunk_size);
+    let start_time = std::time::Instant::now();
+
+    println!(
+        "\nProcessing ({} chunks of {} samples)...",
+        num_chunks, chunk_size
+    );
+    println!("---");
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(pcm_data.len());
+        let mut chunk: Vec<f32> = pcm_data[start..end].to_vec();
+        if chunk.len() < chunk_size {
+            chunk.resize(chunk_size, 0.0);
+        }
+
+        let audio: Tensor<f32, Dev> = Tensor::from_vec(chunk, (1, 1, chunk_size), &dev)?;
+        let pcm = StreamTensor::from_tensor(audio);
+        let msgs = asr.step_pcm(&pcm, &mut state, &mask, |_, _, _| {})?;
+
+        for msg in msgs {
+            match msg {
+                AsrMsg::Word { tokens, .. } => {
+                    let text = sp.decode_piece_ids(&tokens).unwrap_or_default();
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    println!();
+    println!("---");
+
+    let elapsed = start_time.elapsed();
+    let audio_duration = pcm_data.len() as f64 / target_sample_rate as f64;
+    println!(
+        "Done in {:.2}s ({:.1}x realtime)",
+        elapsed.as_secs_f64(),
+        audio_duration / elapsed.as_secs_f64()
     );
 
     Ok(())

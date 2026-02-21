@@ -3623,6 +3623,8 @@ dependencies = [
  "clap",
  "hf-hub",
  "kaudio",
+ "rand",
+ "sentencepiece",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
