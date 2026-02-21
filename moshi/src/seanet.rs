@@ -1,5 +1,7 @@
-use crate::conv::{Norm, PadMode, StreamableConv1d, StreamableConvTranspose1d};
-use crate::streaming::{StreamMask, StreamTensor, StreamingModule};
+use crate::conv::{
+    Conv1dState, ConvTr1dState, Norm, PadMode, StreamableConv1d, StreamableConvTranspose1d,
+};
+use crate::streaming::{StreamMask, StreamTensor};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -46,6 +48,37 @@ pub struct Config {
     pub lstm: usize,
     pub disable_norm_outer_blocks: usize,
     pub final_activation: Option<Activation>,
+}
+
+// ============================================================================
+// Streaming State Types
+// ============================================================================
+
+pub struct ResnetBlockState<T: WithDTypeF, B: Backend> {
+    pub block_convs: Vec<Conv1dState<T, B>>,
+    pub shortcut: Option<Conv1dState<T, B>>,
+}
+
+pub struct EncoderState<T: WithDTypeF, B: Backend> {
+    pub init_conv: Conv1dState<T, B>,
+    pub layers: Vec<EncoderLayerState<T, B>>,
+    pub final_conv: Conv1dState<T, B>,
+}
+
+pub struct EncoderLayerState<T: WithDTypeF, B: Backend> {
+    pub residuals: Vec<ResnetBlockState<T, B>>,
+    pub downsample: Conv1dState<T, B>,
+}
+
+pub struct DecoderState<T: WithDTypeF, B: Backend> {
+    pub init_conv: Conv1dState<T, B>,
+    pub layers: Vec<DecoderLayerState<T, B>>,
+    pub final_conv: Conv1dState<T, B>,
+}
+
+pub struct DecoderLayerState<T: WithDTypeF, B: Backend> {
+    pub upsample: ConvTr1dState<T, B>,
+    pub residuals: Vec<ResnetBlockState<T, B>>,
 }
 
 // ============================================================================
@@ -124,6 +157,13 @@ impl<T: WithDTypeF, B: Backend> SeaNetResnetBlock<T, B> {
         })
     }
 
+    pub fn init_state(&self) -> ResnetBlockState<T, B> {
+        ResnetBlockState {
+            block_convs: self.block.iter().map(|c| c.init_state()).collect(),
+            shortcut: self.shortcut.as_ref().map(|c| c.init_state()),
+        }
+    }
+
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let mut ys = xs.clone();
         for conv in &self.block {
@@ -135,29 +175,27 @@ impl<T: WithDTypeF, B: Backend> SeaNetResnetBlock<T, B> {
             Some(shortcut) => ys.add(&shortcut.forward(xs)?),
         }
     }
-}
 
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for SeaNetResnetBlock<T, B> {
-    fn reset_state(&mut self) {
-        for conv in &mut self.block {
-            conv.reset_state();
-        }
-        if let Some(shortcut) = &mut self.shortcut {
-            shortcut.reset_state();
-        }
-    }
-
-    fn step(&mut self, xs: &StreamTensor<T, B>, mask: &StreamMask) -> Result<StreamTensor<T, B>> {
+    // TODO: The reference implementation uses StreamingBinOp (Add) here to properly
+    // synchronize the block and shortcut streams, which may produce output at different
+    // steps due to causal padding delays. Our direct add works for the current mimi
+    // configuration but would break if the block and shortcut have mismatched delays.
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut ResnetBlockState<T, B>,
+        mask: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
         let xs = match xs.as_option() {
             None => return Ok(StreamTensor::empty()),
             Some(xs) => xs,
         };
 
         let mut ys = StreamTensor::from_tensor(xs.clone());
-        for conv in &mut self.block {
+        for (conv, conv_state) in self.block.iter().zip(state.block_convs.iter_mut()) {
             if let Some(y) = ys.as_option() {
                 let y = self.activation.apply(y)?;
-                ys = conv.step(&StreamTensor::from_tensor(y), mask)?;
+                ys = conv.step(&StreamTensor::from_tensor(y), conv_state, mask)?;
             }
         }
 
@@ -166,15 +204,17 @@ impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for SeaNetResnetBlock<T, B
             Some(ys) => ys,
         };
 
-        let result = match &mut self.shortcut {
-            None => ys.add(xs)?,
-            Some(shortcut) => {
-                let short = shortcut.step(&StreamTensor::from_tensor(xs.clone()), mask)?;
+        let result = match (&self.shortcut, &mut state.shortcut) {
+            (None, _) => ys.add(xs)?,
+            (Some(shortcut), Some(shortcut_state)) => {
+                let short =
+                    shortcut.step(&StreamTensor::from_tensor(xs.clone()), shortcut_state, mask)?;
                 match short.as_option() {
                     Some(s) => ys.add(s)?,
                     None => return Ok(StreamTensor::empty()),
                 }
             }
+            _ => xn::bail!("shortcut module and state mismatch"),
         };
         Ok(StreamTensor::from_tensor(result))
     }
@@ -302,6 +342,21 @@ impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
         })
     }
 
+    pub fn init_state(&self) -> EncoderState<T, B> {
+        EncoderState {
+            init_conv: self.init_conv.init_state(),
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| EncoderLayerState {
+                    residuals: layer.residuals.iter().map(|r| r.init_state()).collect(),
+                    downsample: layer.downsample.init_state(),
+                })
+                .collect(),
+            final_conv: self.final_conv.init_state(),
+        }
+    }
+
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let mut xs = self.init_conv.forward(xs)?;
         for layer in &self.layers {
@@ -314,35 +369,34 @@ impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
         xs = self.activation.apply(&xs)?;
         self.final_conv.forward(&xs)
     }
-}
-
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for SeaNetEncoder<T, B> {
-    fn reset_state(&mut self) {
-        self.init_conv.reset_state();
-        for layer in &mut self.layers {
-            for residual in &mut layer.residuals {
-                residual.reset_state();
-            }
-            layer.downsample.reset_state();
-        }
-        self.final_conv.reset_state();
-    }
 
     #[tracing::instrument(name = "sea-encoder", skip_all)]
-    fn step(&mut self, xs: &StreamTensor<T, B>, m: &StreamMask) -> Result<StreamTensor<T, B>> {
-        let mut xs = self.init_conv.step(xs, m)?;
-        for layer in &mut self.layers {
-            for residual in &mut layer.residuals {
-                xs = residual.step(&xs, m)?;
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut EncoderState<T, B>,
+        m: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
+        let mut xs = self.init_conv.step(xs, &mut state.init_conv, m)?;
+        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
+            for (residual, res_state) in
+                layer.residuals.iter().zip(layer_state.residuals.iter_mut())
+            {
+                xs = residual.step(&xs, res_state, m)?;
             }
             if let Some(x) = xs.as_option() {
                 let x = self.activation.apply(x)?;
-                xs = layer.downsample.step(&StreamTensor::from_tensor(x), m)?;
+                xs = layer.downsample.step(
+                    &StreamTensor::from_tensor(x),
+                    &mut layer_state.downsample,
+                    m,
+                )?;
             }
         }
         if let Some(x) = xs.as_option() {
             let x = self.activation.apply(x)?;
-            self.final_conv.step(&StreamTensor::from_tensor(x), m)
+            self.final_conv
+                .step(&StreamTensor::from_tensor(x), &mut state.final_conv, m)
         } else {
             Ok(StreamTensor::empty())
         }
@@ -472,6 +526,21 @@ impl<T: WithDTypeF, B: Backend> SeaNetDecoder<T, B> {
         })
     }
 
+    pub fn init_state(&self) -> DecoderState<T, B> {
+        DecoderState {
+            init_conv: self.init_conv.init_state(),
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| DecoderLayerState {
+                    upsample: layer.upsample.init_state(),
+                    residuals: layer.residuals.iter().map(|r| r.init_state()).collect(),
+                })
+                .collect(),
+            final_conv: self.final_conv.init_state(),
+        }
+    }
+
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let mut xs = self.init_conv.forward(xs)?;
         for layer in &self.layers {
@@ -488,37 +557,37 @@ impl<T: WithDTypeF, B: Backend> SeaNetDecoder<T, B> {
         }
         Ok(xs)
     }
-}
-
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for SeaNetDecoder<T, B> {
-    fn reset_state(&mut self) {
-        self.init_conv.reset_state();
-        for layer in &mut self.layers {
-            layer.upsample.reset_state();
-            for residual in &mut layer.residuals {
-                residual.reset_state();
-            }
-        }
-        self.final_conv.reset_state();
-    }
 
     #[tracing::instrument(name = "sea-decoder", skip_all)]
-    fn step(&mut self, xs: &StreamTensor<T, B>, m: &StreamMask) -> Result<StreamTensor<T, B>> {
-        let mut xs = self.init_conv.step(xs, m)?;
-        for layer in &mut self.layers {
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut DecoderState<T, B>,
+        m: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
+        let mut xs = self.init_conv.step(xs, &mut state.init_conv, m)?;
+        for (layer, layer_state) in self.layers.iter().zip(state.layers.iter_mut()) {
             if let Some(x) = xs.as_option() {
                 let x = self.activation.apply(x)?;
-                xs = layer.upsample.step(&StreamTensor::from_tensor(x), m)?;
+                xs = layer.upsample.step(
+                    &StreamTensor::from_tensor(x),
+                    &mut layer_state.upsample,
+                    m,
+                )?;
             }
-            for residual in &mut layer.residuals {
-                xs = residual.step(&xs, m)?;
+            for (residual, res_state) in
+                layer.residuals.iter().zip(layer_state.residuals.iter_mut())
+            {
+                xs = residual.step(&xs, res_state, m)?;
             }
         }
         if let Some(x) = xs.as_option() {
             let mut x = self.activation.apply(x)?;
-            let result = self
-                .final_conv
-                .step(&StreamTensor::from_tensor(x.clone()), m)?;
+            let result = self.final_conv.step(
+                &StreamTensor::from_tensor(x.clone()),
+                &mut state.final_conv,
+                m,
+            )?;
             if let (Some(r), Some(act)) = (result.as_option(), &self.final_activation) {
                 x = act.apply(r)?;
                 return Ok(StreamTensor::from_tensor(x));

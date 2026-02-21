@@ -1,4 +1,4 @@
-use crate::streaming::{StreamMask, StreamTensor, StreamingModule};
+use crate::streaming::{StreamMask, StreamTensor};
 use crate::{conv, quantization, seanet, transformer};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
@@ -82,6 +82,26 @@ impl Config {
     }
 }
 
+// ============================================================================
+// Streaming State Types
+// ============================================================================
+
+pub struct MimiEncodeState<T: WithDTypeF, B: Backend> {
+    pub encoder: seanet::EncoderState<T, B>,
+    pub encoder_transformer: transformer::TransformerState<T, B>,
+    pub downsample: conv::Conv1dState<T, B>,
+}
+
+pub struct MimiDecodeState<T: WithDTypeF, B: Backend> {
+    pub upsample: conv::ConvTr1dState<T, B>,
+    pub decoder_transformer: transformer::TransformerState<T, B>,
+    pub decoder: seanet::DecoderState<T, B>,
+}
+
+// ============================================================================
+// Mimi
+// ============================================================================
+
 pub struct Mimi<T: WithDTypeF, B: Backend> {
     encoder: seanet::SeaNetEncoder<T, B>,
     decoder: seanet::SeaNetDecoder<T, B>,
@@ -157,34 +177,53 @@ impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
         &self.config
     }
 
+    pub fn init_encode_state(&self) -> MimiEncodeState<T, B> {
+        MimiEncodeState {
+            encoder: self.encoder.init_state(),
+            encoder_transformer: self.encoder_transformer.init_state(),
+            downsample: self.downsample.init_state(),
+        }
+    }
+
+    pub fn init_decode_state(&self) -> MimiDecodeState<T, B> {
+        MimiDecodeState {
+            upsample: self.upsample.init_state(),
+            decoder_transformer: self.decoder_transformer.init_state(),
+            decoder: self.decoder.init_state(),
+        }
+    }
+
     /// Encode audio to codes (non-streaming).
-    pub fn encode(&mut self, xs: &Tensor<T, B>) -> Result<Tensor<i64, B>> {
+    pub fn encode(&self, xs: &Tensor<T, B>) -> Result<Tensor<i64, B>> {
         let xs = self.encoder.forward(xs)?;
-        self.encoder_transformer.reset_state();
-        let xs = self.encoder_transformer.forward(&xs)?;
+        let mut tf_state = self.encoder_transformer.init_state();
+        let xs = self.encoder_transformer.forward(&xs, &mut tf_state)?;
         let xs = &xs[0];
         let xs = self.downsample.forward(xs)?;
         self.quantizer.encode(&xs)
     }
 
     /// Decode codes to audio (non-streaming).
-    pub fn decode(&mut self, codes: &Tensor<i64, B>) -> Result<Tensor<T, B>> {
+    pub fn decode(&self, codes: &Tensor<i64, B>) -> Result<Tensor<T, B>> {
         let emb = self.quantizer.decode(codes)?;
         let emb = self.upsample.forward(&emb)?;
-        self.decoder_transformer.reset_state();
-        let outs = self.decoder_transformer.forward(&emb)?;
+        let mut tf_state = self.decoder_transformer.init_state();
+        let outs = self.decoder_transformer.forward(&emb, &mut tf_state)?;
         self.decoder.forward(&outs[0])
     }
 
     /// Encode audio step (streaming).
     pub fn encode_step(
-        &mut self,
+        &self,
         xs: &StreamTensor<T, B>,
+        state: &mut MimiEncodeState<T, B>,
         mask: &StreamMask,
     ) -> Result<StreamTensor<i64, B>> {
-        let xs = self.encoder.step(xs, mask)?;
-        let xs = self.encoder_transformer.step(&xs, mask)?;
-        let xs = self.downsample.step(&xs, mask)?;
+        let xs = self.encoder.step(xs, &mut state.encoder, mask)?;
+        let xs = self
+            .encoder_transformer
+            .step(&xs, &mut state.encoder_transformer, mask)?;
+        let xs = self.downsample.step(&xs, &mut state.downsample, mask)?;
         match xs.as_option() {
             None => Ok(StreamTensor::empty()),
             Some(xs) => Ok(StreamTensor::from_tensor(self.quantizer.encode(xs)?)),
@@ -193,26 +232,19 @@ impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
 
     /// Decode codes step (streaming).
     pub fn decode_step(
-        &mut self,
+        &self,
         codes: &StreamTensor<i64, B>,
+        state: &mut MimiDecodeState<T, B>,
         mask: &StreamMask,
     ) -> Result<StreamTensor<T, B>> {
         let emb: StreamTensor<T, B> = match codes.as_option() {
             Some(codes) => StreamTensor::from_tensor(self.quantizer.decode(codes)?),
             None => StreamTensor::empty(),
         };
-        let emb = self.upsample.step(&emb, mask)?;
-        let out = self.decoder_transformer.step(&emb, mask)?;
-        self.decoder.step(&out, mask)
-    }
-
-    /// Reset all streaming state.
-    pub fn reset_state(&mut self) {
-        self.encoder.reset_state();
-        self.decoder.reset_state();
-        self.encoder_transformer.reset_state();
-        self.decoder_transformer.reset_state();
-        self.downsample.reset_state();
-        self.upsample.reset_state();
+        let emb = self.upsample.step(&emb, &mut state.upsample, mask)?;
+        let out = self
+            .decoder_transformer
+            .step(&emb, &mut state.decoder_transformer, mask)?;
+        self.decoder.step(&out, &mut state.decoder, mask)
     }
 }

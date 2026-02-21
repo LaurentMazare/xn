@@ -1,4 +1,4 @@
-use crate::streaming::{StreamMask, StreamTensor, StreamingModule};
+use crate::streaming::{StreamMask, StreamTensor};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -38,65 +38,34 @@ pub enum PositionalEmbedding {
 }
 
 // ============================================================================
-// KV Cache
+// Streaming State Types
 // ============================================================================
 
-struct KvCache<T: WithDTypeF, B: Backend> {
-    k: Option<Tensor<T, B>>,
-    v: Option<Tensor<T, B>>,
-    max_seq_len: usize,
+pub struct KvCacheState<T: WithDTypeF, B: Backend> {
+    pub k: Option<Tensor<T, B>>,
+    pub v: Option<Tensor<T, B>>,
 }
 
-impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
-    fn new(max_seq_len: usize) -> Self {
-        Self {
-            k: None,
-            v: None,
-            max_seq_len,
-        }
+pub struct TransformerState<T: WithDTypeF, B: Backend> {
+    pub layers: Vec<KvCacheState<T, B>>,
+}
+
+impl<T: WithDTypeF, B: Backend> KvCacheState<T, B> {
+    pub fn new() -> Self {
+        Self { k: None, v: None }
     }
 
-    fn reset(&mut self) {
-        self.k = None;
-        self.v = None;
-    }
-
-    fn current_seq_len(&self) -> usize {
+    pub fn current_seq_len(&self) -> usize {
         match &self.k {
             Some(k) => k.dims()[2], // [b, h, seq, d]
             None => 0,
         }
     }
+}
 
-    #[tracing::instrument(name = "kv-append", skip_all)]
-    fn append(
-        &mut self,
-        new_k: &Tensor<T, B>,
-        new_v: &Tensor<T, B>,
-    ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
-        let (k, v) = match (&self.k, &self.v) {
-            (Some(prev_k), Some(prev_v)) => {
-                let k = Tensor::cat(&[prev_k, new_k], 2)?;
-                let v = Tensor::cat(&[prev_v, new_v], 2)?;
-                (k, v)
-            }
-            _ => (new_k.clone(), new_v.clone()),
-        };
-
-        let seq_len = k.dims()[2];
-        let (k, v) = if seq_len > self.max_seq_len {
-            let trim = seq_len - self.max_seq_len;
-            (
-                k.narrow(2, trim..trim + self.max_seq_len)?.contiguous()?,
-                v.narrow(2, trim..trim + self.max_seq_len)?.contiguous()?,
-            )
-        } else {
-            (k, v)
-        };
-
-        self.k = Some(k.clone());
-        self.v = Some(v.clone());
-        Ok((k, v))
+impl<T: WithDTypeF, B: Backend> Default for KvCacheState<T, B> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -110,6 +79,10 @@ struct RotaryEmbedding<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
+    // TODO: This precomputes cos/sin for all positions up to max_seq_len on the CPU.
+    // The reference implementation computes them on-the-fly per forward call using
+    // Tensor::arange() + matmul with inv_freq, which avoids the upfront allocation and
+    // works for arbitrary sequence lengths. Would require xn Tensor::arange() support.
     fn new(head_dim: usize, max_seq_len: usize, theta: f32, device: &B) -> Result<Self> {
         let half_dim = head_dim / 2;
         let mut inv_freq = Vec::with_capacity(half_dim);
@@ -335,7 +308,7 @@ struct StreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
     out_proj_bias: Option<Tensor<T, B>>,
     num_heads: usize,
     head_dim: usize,
-    kv_cache: KvCache<T, B>,
+    max_seq_len: usize,
 }
 
 impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
@@ -369,15 +342,16 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
             out_proj_bias,
             num_heads,
             head_dim,
-            kv_cache: KvCache::new(cfg.context),
+            max_seq_len: cfg.context,
         })
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor<T, B>,
         rope: Option<&RotaryEmbedding<T, B>>,
         offset: usize,
+        kv_cache: &mut KvCacheState<T, B>,
     ) -> Result<Tensor<T, B>> {
         let (b, t, _hd) = xs.dims3()?;
 
@@ -412,10 +386,15 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
             (q, k)
         };
 
-        // KV cache
-        let (k, v) = self.kv_cache.append(&k, &v)?;
+        // KV cache append
+        let (k, v) = self.kv_cache_append(kv_cache, &k, &v)?;
 
         // Attention
+        // TODO: This uses apply_causality_mask which is a simple causal mask based on a global
+        // offset. The reference implementation builds per-batch streaming masks using
+        // last_reset_pos, expand(), arange(), and where_cond() to support per-batch streaming
+        // resets (different sequences in a batch can reset at different positions). This would
+        // require xn expand(), Tensor::arange(), and where_cond() support.
         let scale = T::from_f32(1.0 / (self.head_dim as f32).sqrt());
         let attn_weights = q.matmul_t(&k)?.scale(scale)?;
         let attn_weights = attn_weights.apply_causality_mask(offset)?;
@@ -434,8 +413,36 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         Ok(out)
     }
 
-    fn reset_kv_cache(&mut self) {
-        self.kv_cache.reset();
+    #[tracing::instrument(name = "kv-append", skip_all)]
+    fn kv_cache_append(
+        &self,
+        cache: &mut KvCacheState<T, B>,
+        new_k: &Tensor<T, B>,
+        new_v: &Tensor<T, B>,
+    ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
+        let (k, v) = match (&cache.k, &cache.v) {
+            (Some(prev_k), Some(prev_v)) => {
+                let k = Tensor::cat(&[prev_k, new_k], 2)?;
+                let v = Tensor::cat(&[prev_v, new_v], 2)?;
+                (k, v)
+            }
+            _ => (new_k.clone(), new_v.clone()),
+        };
+
+        let seq_len = k.dims()[2];
+        let (k, v) = if seq_len > self.max_seq_len {
+            let trim = seq_len - self.max_seq_len;
+            (
+                k.narrow(2, trim..trim + self.max_seq_len)?.contiguous()?,
+                v.narrow(2, trim..trim + self.max_seq_len)?.contiguous()?,
+            )
+        } else {
+            (k, v)
+        };
+
+        cache.k = Some(k.clone());
+        cache.v = Some(v.clone());
+        Ok((k, v))
     }
 }
 
@@ -484,30 +491,25 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor<T, B>,
         rope: Option<&RotaryEmbedding<T, B>>,
         offset: usize,
+        kv_cache: &mut KvCacheState<T, B>,
     ) -> Result<Tensor<T, B>> {
-        // Pre-norm: xs + layer_scale_1(self_attn(norm1(xs)))
         let norm1_out = self.norm1.forward(xs)?;
-        let mut attn_out = self.self_attn.forward(&norm1_out, rope, offset)?;
+        let mut attn_out = self.self_attn.forward(&norm1_out, rope, offset, kv_cache)?;
         if let Some(ls) = &self.layer_scale_1 {
             attn_out = ls.forward(&attn_out)?;
         }
         let xs = xs.add(&attn_out)?;
 
-        // xs + layer_scale_2(mlp(norm2(xs)))
         let norm2_out = self.norm2.forward(&xs)?;
         let mut mlp_out = self.mlp.forward(&norm2_out)?;
         if let Some(ls) = &self.layer_scale_2 {
             mlp_out = ls.forward(&mlp_out)?;
         }
         xs.add(&mlp_out)
-    }
-
-    fn reset_kv_cache(&mut self) {
-        self.self_attn.reset_kv_cache();
     }
 }
 
@@ -543,27 +545,23 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
         Ok(Self { layers, rope })
     }
 
-    fn forward(&mut self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        let offset = self.current_seq_len();
+    fn init_state(&self) -> TransformerState<T, B> {
+        TransformerState {
+            layers: self.layers.iter().map(|_| KvCacheState::new()).collect(),
+        }
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor<T, B>,
+        state: &mut TransformerState<T, B>,
+    ) -> Result<Tensor<T, B>> {
+        let offset = state.layers[0].current_seq_len();
         let mut xs = xs.clone();
-        for layer in &mut self.layers {
-            xs = layer.forward(&xs, self.rope.as_ref(), offset)?;
+        for (layer, kv_cache) in self.layers.iter().zip(state.layers.iter_mut()) {
+            xs = layer.forward(&xs, self.rope.as_ref(), offset, kv_cache)?;
         }
         Ok(xs)
-    }
-
-    fn current_seq_len(&self) -> usize {
-        if self.layers.is_empty() {
-            0
-        } else {
-            self.layers[0].self_attn.kv_cache.current_seq_len()
-        }
-    }
-
-    fn reset_state(&mut self) {
-        for layer in &mut self.layers {
-            layer.reset_kv_cache();
-        }
     }
 }
 
@@ -609,7 +607,15 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
         })
     }
 
-    pub fn forward(&mut self, xs: &Tensor<T, B>) -> Result<Vec<Tensor<T, B>>> {
+    pub fn init_state(&self) -> TransformerState<T, B> {
+        self.transformer.init_state()
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor<T, B>,
+        state: &mut TransformerState<T, B>,
+    ) -> Result<Vec<Tensor<T, B>>> {
         let xs = if self.conv_layout {
             xs.transpose(1, 2)?.contiguous()?
         } else {
@@ -619,7 +625,7 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
             Some(proj) => xs.matmul_t(proj)?,
             None => xs,
         };
-        let xs = self.transformer.forward(&xs)?;
+        let xs = self.transformer.forward(&xs, state)?;
         let ys = match &self.output_proj {
             Some(proj) => xs.matmul_t(proj)?,
             None => xs,
@@ -632,22 +638,17 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
         Ok(vec![ys])
     }
 
-    pub fn reset_state(&mut self) {
-        self.transformer.reset_state();
-    }
-}
-
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for ProjectedTransformer<T, B> {
-    fn reset_state(&mut self) {
-        ProjectedTransformer::reset_state(self);
-    }
-
     #[tracing::instrument(name = "transformer", skip_all)]
-    fn step(&mut self, xs: &StreamTensor<T, B>, _mask: &StreamMask) -> Result<StreamTensor<T, B>> {
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut TransformerState<T, B>,
+        _mask: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
         match xs.as_option() {
             None => Ok(StreamTensor::empty()),
             Some(xs) => {
-                let results = self.forward(xs)?;
+                let results = self.forward(xs, state)?;
                 Ok(StreamTensor::from_tensor(
                     results.into_iter().next().unwrap(),
                 ))

@@ -37,6 +37,9 @@ impl<T: WithDTypeF, B: Backend> EuclideanCodebook<T, B> {
         Ok(Self { embedding, c2, dim })
     }
 
+    // TODO: This uses the matmul-based "encode_slow" path. The reference implementation
+    // has a custom op (CodebookEncode) that computes pairwise distances with rayon parallelism,
+    // avoiding the N*codebook_size intermediate tensor. Would require xn CustomOp2 support.
     #[tracing::instrument(name = "ec-encode", skip_all)]
     pub fn encode(&self, xs: &Tensor<T, B>) -> Result<Tensor<i64, B>> {
         let mut target_shape: Vec<usize> = xs.dims().to_vec();

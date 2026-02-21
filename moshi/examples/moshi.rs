@@ -139,12 +139,10 @@ fn audio_to_audio<Dev: Backend>(
         "  sample_rate={}, frame_rate={}, codebooks={}",
         config.sample_rate, config.frame_rate, codebooks
     );
-    let mut model: Mimi<f32, Dev> = Mimi::load(&vb.root(), config, &dev)?;
+    let model: Mimi<f32, Dev> = Mimi::load(&vb.root(), config, &dev)?;
     println!("  Model loaded");
 
     // --- Streaming encode ---
-    // Process in chunks of 1920 samples (= one frame at 12.5 Hz with product of ratios 8*6*5*4 = 960
-    // and downsample stride 2, so 1920 audio samples -> 1 code frame).
     let chunk_size = 1920;
     let num_chunks = pcm_data.len().div_ceil(chunk_size);
 
@@ -152,7 +150,7 @@ fn audio_to_audio<Dev: Backend>(
         "\nEncoding ({} chunks of {} samples)...",
         num_chunks, chunk_size
     );
-    model.reset_state();
+    let mut enc_state = model.init_encode_state();
     let mask = StreamMask::empty();
 
     let encode_start = std::time::Instant::now();
@@ -167,7 +165,8 @@ fn audio_to_audio<Dev: Backend>(
         }
 
         let audio: Tensor<f32, Dev> = Tensor::from_vec(chunk, (1, 1, chunk_size), &dev)?;
-        let codes_out = model.encode_step(&StreamTensor::from_tensor(audio), &mask)?;
+        let codes_out =
+            model.encode_step(&StreamTensor::from_tensor(audio), &mut enc_state, &mask)?;
 
         if let Some(codes) = codes_out.as_option() {
             let mut codes = codes.copy()?;
@@ -202,7 +201,7 @@ fn audio_to_audio<Dev: Backend>(
 
     // --- Streaming decode ---
     println!("\nDecoding ({} frames)...", total_frames);
-    model.reset_state();
+    let mut dec_state = model.init_decode_state();
     let decode_start = std::time::Instant::now();
     let mut all_decoded: Vec<Tensor<f32, Dev>> = Vec::with_capacity(total_frames);
 
@@ -210,7 +209,11 @@ fn audio_to_audio<Dev: Backend>(
         let codes_frame = all_codes
             .narrow(2, frame_idx..frame_idx + 1)?
             .contiguous()?;
-        let decoded = model.decode_step(&StreamTensor::from_tensor(codes_frame), &mask)?;
+        let decoded = model.decode_step(
+            &StreamTensor::from_tensor(codes_frame),
+            &mut dec_state,
+            &mask,
+        )?;
 
         if let Some(pcm) = decoded.as_option() {
             all_decoded.push(pcm.copy()?);

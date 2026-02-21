@@ -1,4 +1,4 @@
-use crate::streaming::{StreamMask, StreamTensor, StreamingModule};
+use crate::streaming::{StreamMask, StreamTensor};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -17,6 +17,19 @@ pub enum PadMode {
 }
 
 // ============================================================================
+// Streaming State Types
+// ============================================================================
+
+pub struct Conv1dState<T: WithDTypeF, B: Backend> {
+    pub prev_xs: Option<Tensor<T, B>>,
+    pub left_pad_applied: bool,
+}
+
+pub struct ConvTr1dState<T: WithDTypeF, B: Backend> {
+    pub prev_ys: Option<Tensor<T, B>>,
+}
+
+// ============================================================================
 // NormConv1d
 // ============================================================================
 
@@ -26,7 +39,6 @@ pub struct NormConv1d<T: WithDTypeF, B: Backend> {
     stride: usize,
     dilation: usize,
     groups: usize,
-    // Note: GroupNorm (TimeGroupNorm) is not supported in xn.
 }
 
 impl<T: WithDTypeF, B: Backend> NormConv1d<T, B> {
@@ -224,8 +236,6 @@ pub struct StreamableConv1d<T: WithDTypeF, B: Backend> {
     conv: NormConv1d<T, B>,
     causal: bool,
     pad_mode: PadMode,
-    state_prev_xs: Option<Tensor<T, B>>,
-    left_pad_applied: bool,
     kernel_size: usize,
 }
 
@@ -254,19 +264,22 @@ impl<T: WithDTypeF, B: Backend> StreamableConv1d<T, B> {
             conv,
             causal,
             pad_mode,
-            state_prev_xs: None,
-            left_pad_applied: false,
             kernel_size: k_size,
         })
+    }
+
+    pub fn init_state(&self) -> Conv1dState<T, B> {
+        Conv1dState {
+            prev_xs: None,
+            left_pad_applied: false,
+        }
     }
 
     fn padding_total(&self) -> usize {
         let k_size = (self.kernel_size - 1) * self.conv.dilation() + 1;
         k_size - self.conv.stride()
     }
-}
 
-impl<T: WithDTypeF, B: Backend> StreamableConv1d<T, B> {
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let k_size = self.conv.kernel_size();
         let stride = self.conv.stride();
@@ -288,24 +301,22 @@ impl<T: WithDTypeF, B: Backend> StreamableConv1d<T, B> {
         };
         self.conv.forward(&xs)
     }
-}
-
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for StreamableConv1d<T, B> {
-    fn reset_state(&mut self) {
-        self.state_prev_xs = None;
-        self.left_pad_applied = false;
-    }
 
     #[tracing::instrument(name = "streamable-conv1d", skip_all)]
-    fn step(&mut self, xs: &StreamTensor<T, B>, _mask: &StreamMask) -> Result<StreamTensor<T, B>> {
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut Conv1dState<T, B>,
+        _mask: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
         let xs = match xs.as_option() {
             None => return Ok(StreamTensor::empty()),
             Some(xs) => xs.clone(),
         };
-        let xs = if self.left_pad_applied {
+        let xs = if state.left_pad_applied {
             xs
         } else {
-            self.left_pad_applied = true;
+            state.left_pad_applied = true;
             pad1d(&xs, self.padding_total(), 0, self.pad_mode)?
         };
 
@@ -313,8 +324,7 @@ impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for StreamableConv1d<T, B>
         let dilation = self.conv.dilation();
         let kernel = (self.kernel_size - 1) * dilation + 1;
 
-        // Concatenate with previous state
-        let xs = match &self.state_prev_xs {
+        let xs = match &state.prev_xs {
             None => xs,
             Some(prev) => Tensor::cat(&[prev, &xs], 2)?,
         };
@@ -325,15 +335,15 @@ impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for StreamableConv1d<T, B>
         if num_frames > 0 {
             let offset = num_frames * stride;
             if seq_len > offset {
-                self.state_prev_xs = Some(xs.narrow(2, offset..seq_len)?.contiguous()?);
+                state.prev_xs = Some(xs.narrow(2, offset..seq_len)?.contiguous()?);
             } else {
-                self.state_prev_xs = None;
+                state.prev_xs = None;
             }
             let in_l = (num_frames - 1) * stride + kernel;
             let xs = xs.narrow(2, ..in_l)?.contiguous()?;
             Ok(StreamTensor::from_tensor(self.conv.forward(&xs)?))
         } else {
-            self.state_prev_xs = Some(xs);
+            state.prev_xs = Some(xs);
             Ok(StreamTensor::empty())
         }
     }
@@ -346,7 +356,6 @@ impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for StreamableConv1d<T, B>
 pub struct StreamableConvTranspose1d<T: WithDTypeF, B: Backend> {
     pub(crate) convtr: NormConvTranspose1d<T, B>,
     causal: bool,
-    state_prev_ys: Option<Tensor<T, B>>,
     kernel_size: usize,
 }
 
@@ -369,12 +378,13 @@ impl<T: WithDTypeF, B: Backend> StreamableConvTranspose1d<T, B> {
             convtr,
             causal,
             kernel_size: k_size,
-            state_prev_ys: None,
         })
     }
-}
 
-impl<T: WithDTypeF, B: Backend> StreamableConvTranspose1d<T, B> {
+    pub fn init_state(&self) -> ConvTr1dState<T, B> {
+        ConvTr1dState { prev_ys: None }
+    }
+
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let padding_total = self.convtr.k_size.saturating_sub(self.convtr.stride);
         let xs = self.convtr.forward(xs)?;
@@ -386,31 +396,27 @@ impl<T: WithDTypeF, B: Backend> StreamableConvTranspose1d<T, B> {
             unpad1d(&xs, padding_left, padding_right)
         }
     }
-}
-
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for StreamableConvTranspose1d<T, B> {
-    fn reset_state(&mut self) {
-        self.state_prev_ys = None;
-    }
 
     #[tracing::instrument(name = "streamable-convtr1d", skip_all)]
-    fn step(&mut self, xs: &StreamTensor<T, B>, _mask: &StreamMask) -> Result<StreamTensor<T, B>> {
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut ConvTr1dState<T, B>,
+        _mask: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
         let xs = match xs.as_option() {
             Some(xs) => xs,
             None => return Ok(StreamTensor::empty()),
         };
         let stride = self.convtr.stride;
 
-        // Apply the underlying convtr (the Module forward handles unpadding, so call convtr directly)
         let ys = self.convtr.forward(xs)?;
         let ot = ys.dim(2usize)?;
 
-        // Add overlap from previous step
-        let ys = match &self.state_prev_ys {
+        let ys = match &state.prev_ys {
             None => ys,
             Some(prev_ys) => {
                 let pt = prev_ys.dim(2usize)?;
-                // Subtract bias from prev (as it will be applied again)
                 let prev_ys = match &self.convtr.bias {
                     None => prev_ys.clone(),
                     Some(bias) => {
@@ -424,19 +430,18 @@ impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for StreamableConvTranspos
             }
         };
 
-        // Split into valid output and overlap for next step
         let invalid_steps = self.kernel_size - stride;
         let valid_len = ot.saturating_sub(invalid_steps);
         if valid_len > 0 {
             let valid = ys.narrow(2, ..valid_len)?.contiguous()?;
             if ot > valid_len {
-                self.state_prev_ys = Some(ys.narrow(2, valid_len..ot)?.contiguous()?);
+                state.prev_ys = Some(ys.narrow(2, valid_len..ot)?.contiguous()?);
             } else {
-                self.state_prev_ys = None;
+                state.prev_ys = None;
             }
             Ok(StreamTensor::from_tensor(valid))
         } else {
-            self.state_prev_ys = Some(ys);
+            state.prev_ys = Some(ys);
             Ok(StreamTensor::empty())
         }
     }
@@ -473,21 +478,22 @@ impl<T: WithDTypeF, B: Backend> ConvDownsample1d<T, B> {
         )?;
         Ok(Self { conv })
     }
-}
 
-impl<T: WithDTypeF, B: Backend> ConvDownsample1d<T, B> {
+    pub fn init_state(&self) -> Conv1dState<T, B> {
+        self.conv.init_state()
+    }
+
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         self.conv.forward(xs)
     }
-}
 
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for ConvDownsample1d<T, B> {
-    fn reset_state(&mut self) {
-        self.conv.reset_state();
-    }
-
-    fn step(&mut self, xs: &StreamTensor<T, B>, m: &StreamMask) -> Result<StreamTensor<T, B>> {
-        self.conv.step(xs, m)
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut Conv1dState<T, B>,
+        m: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
+        self.conv.step(xs, state, m)
     }
 }
 
@@ -516,20 +522,21 @@ impl<T: WithDTypeF, B: Backend> ConvTrUpsample1d<T, B> {
         )?;
         Ok(Self { convtr })
     }
-}
 
-impl<T: WithDTypeF, B: Backend> ConvTrUpsample1d<T, B> {
+    pub fn init_state(&self) -> ConvTr1dState<T, B> {
+        self.convtr.init_state()
+    }
+
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         self.convtr.forward(xs)
     }
-}
 
-impl<T: WithDTypeF, B: Backend> StreamingModule<T, B> for ConvTrUpsample1d<T, B> {
-    fn reset_state(&mut self) {
-        self.convtr.reset_state();
-    }
-
-    fn step(&mut self, xs: &StreamTensor<T, B>, m: &StreamMask) -> Result<StreamTensor<T, B>> {
-        self.convtr.step(xs, m)
+    pub fn step(
+        &self,
+        xs: &StreamTensor<T, B>,
+        state: &mut ConvTr1dState<T, B>,
+        m: &StreamMask,
+    ) -> Result<StreamTensor<T, B>> {
+        self.convtr.step(xs, state, m)
     }
 }
