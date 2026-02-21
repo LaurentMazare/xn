@@ -39,7 +39,7 @@ enum Command {
 }
 
 fn download_model() -> Result<std::path::PathBuf> {
-    use hf_hub::{api::sync::Api, Repo, RepoType};
+    use hf_hub::{Repo, RepoType, api::sync::Api};
     let repo_id = "kyutai/moshiko-candle-q8";
     println!("Downloading model from {repo_id}...");
     let api = Api::new()?;
