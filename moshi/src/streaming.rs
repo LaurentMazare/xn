@@ -123,10 +123,57 @@ impl StreamMask {
     pub fn is_active(&self, batch_idx: usize) -> bool {
         self.0.as_ref().is_none_or(|v| v[batch_idx])
     }
+
+    pub fn cpu(&self) -> Option<&[bool]> {
+        self.0.as_deref()
+    }
 }
 
 impl From<()> for StreamMask {
     fn from(_: ()) -> Self {
         Self::empty()
+    }
+}
+
+/// Apply a stream mask to select between new and old state tensors.
+/// Active batch elements (mask = true) use the new state.
+/// Inactive batch elements (mask = false) preserve the old state.
+/// Uses arithmetic masking: `old + (new - old) * mask_float`.
+pub fn apply_state_mask<T: WithDTypeF, B: Backend>(
+    new_state: &Option<Tensor<T, B>>,
+    old_state: &Option<Tensor<T, B>>,
+    mask: &StreamMask,
+) -> Result<Option<Tensor<T, B>>> {
+    let cpu = match mask.cpu() {
+        None => return Ok(new_state.clone()),
+        Some(m) => m,
+    };
+    match (new_state, old_state) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => {
+            xn::bail!("streaming module should only be used with constant steps")
+        }
+        (Some(new_s), old_opt) => {
+            let mask_data: Vec<T> = cpu
+                .iter()
+                .map(|&b| {
+                    if b {
+                        T::from_f32(1.0)
+                    } else {
+                        T::from_f32(0.0)
+                    }
+                })
+                .collect();
+            let mask_t = Tensor::from_vec(mask_data, (cpu.len(), 1, 1), new_s.device())?;
+            let result = match old_opt {
+                None => new_s.broadcast_mul(&mask_t)?,
+                Some(old_s) => {
+                    let diff = new_s.sub(old_s)?;
+                    let masked_diff = diff.broadcast_mul(&mask_t)?;
+                    old_s.add(&masked_diff)?
+                }
+            };
+            Ok(Some(result))
+        }
     }
 }

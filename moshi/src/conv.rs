@@ -1,4 +1,4 @@
-use crate::streaming::{StreamMask, StreamTensor};
+use crate::streaming::{StreamMask, StreamTensor, apply_state_mask};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -307,12 +307,14 @@ impl<T: WithDTypeF, B: Backend> StreamableConv1d<T, B> {
         &self,
         xs: &StreamTensor<T, B>,
         state: &mut Conv1dState<T, B>,
-        _mask: &StreamMask,
+        mask: &StreamMask,
     ) -> Result<StreamTensor<T, B>> {
         let xs = match xs.as_option() {
             None => return Ok(StreamTensor::empty()),
             Some(xs) => xs.clone(),
         };
+        let old_prev_xs = state.prev_xs.clone();
+
         let xs = if state.left_pad_applied {
             xs
         } else {
@@ -334,16 +336,18 @@ impl<T: WithDTypeF, B: Backend> StreamableConv1d<T, B> {
 
         if num_frames > 0 {
             let offset = num_frames * stride;
-            if seq_len > offset {
-                state.prev_xs = Some(xs.narrow(2, offset..seq_len)?.contiguous()?);
+            let new_prev_xs = if seq_len > offset {
+                Some(xs.narrow(2, offset..seq_len)?.contiguous()?)
             } else {
-                state.prev_xs = None;
-            }
+                None
+            };
+            state.prev_xs = apply_state_mask(&new_prev_xs, &old_prev_xs, mask)?;
             let in_l = (num_frames - 1) * stride + kernel;
             let xs = xs.narrow(2, ..in_l)?.contiguous()?;
             Ok(StreamTensor::from_tensor(self.conv.forward(&xs)?))
         } else {
-            state.prev_xs = Some(xs);
+            let new_prev_xs = Some(xs);
+            state.prev_xs = apply_state_mask(&new_prev_xs, &old_prev_xs, mask)?;
             Ok(StreamTensor::empty())
         }
     }
@@ -402,12 +406,13 @@ impl<T: WithDTypeF, B: Backend> StreamableConvTranspose1d<T, B> {
         &self,
         xs: &StreamTensor<T, B>,
         state: &mut ConvTr1dState<T, B>,
-        _mask: &StreamMask,
+        mask: &StreamMask,
     ) -> Result<StreamTensor<T, B>> {
         let xs = match xs.as_option() {
             Some(xs) => xs,
             None => return Ok(StreamTensor::empty()),
         };
+        let old_prev_ys = state.prev_ys.clone();
         let stride = self.convtr.stride;
 
         let ys = self.convtr.forward(xs)?;
@@ -434,14 +439,16 @@ impl<T: WithDTypeF, B: Backend> StreamableConvTranspose1d<T, B> {
         let valid_len = ot.saturating_sub(invalid_steps);
         if valid_len > 0 {
             let valid = ys.narrow(2, ..valid_len)?.contiguous()?;
-            if ot > valid_len {
-                state.prev_ys = Some(ys.narrow(2, valid_len..ot)?.contiguous()?);
+            let new_prev_ys = if ot > valid_len {
+                Some(ys.narrow(2, valid_len..ot)?.contiguous()?)
             } else {
-                state.prev_ys = None;
-            }
+                None
+            };
+            state.prev_ys = apply_state_mask(&new_prev_ys, &old_prev_ys, mask)?;
             Ok(StreamTensor::from_tensor(valid))
         } else {
-            state.prev_ys = Some(ys);
+            let new_prev_ys = Some(ys);
+            state.prev_ys = apply_state_mask(&new_prev_ys, &old_prev_ys, mask)?;
             Ok(StreamTensor::empty())
         }
     }
