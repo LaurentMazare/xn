@@ -5,6 +5,33 @@ use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
+// State Types
+// ============================================================================
+
+pub struct BatchedTransformerState<T: WithDTypeF, B: Backend> {
+    pub builder: ScatteredCacheBuilder<B>,
+    pub kv_caches: Vec<ScatteredKvCache<T, B>>,
+}
+
+impl<T: WithDTypeF, B: Backend> BatchedTransformerState<T, B> {
+    pub fn batch_size(&self) -> usize {
+        self.builder.batch_size()
+    }
+
+    pub fn reset(&mut self) {
+        self.builder.reset();
+    }
+
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        if batch_idx >= self.batch_size() {
+            xn::bail!("batch_idx {batch_idx} is out of bounds")
+        }
+        self.builder.reset_batch_index(batch_idx);
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Rotary Embeddings (per-batch positions)
 // ============================================================================
 
@@ -181,7 +208,6 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
         let scale = T::from_f32(1.0 / (self.head_dim as f32).sqrt());
         let attn_weights = q.matmul_t(&k)?.scale(scale)?; // (b, h, t, k)
 
-        // Convert f32 mask to T via CPU roundtrip
         let mask = iam.mask(); // &Tensor<T, B>, shape (b, 1, t, context)
         let mask_dims = mask.dims();
         // Trim mask to match k/v length if needed
@@ -284,14 +310,15 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
 
 pub struct BatchedTransformer<T: WithDTypeF, B: Backend> {
     layers: Vec<BatchedTransformerLayer<T, B>>,
-    kv_caches: Vec<ScatteredKvCache<T, B>>,
-    builder: ScatteredCacheBuilder<B>,
     rope: Option<RotaryEmbedding<T, B>>,
     positional_embedding: PositionalEmbedding,
+    num_kv: usize,
+    head_dim: usize,
+    context: usize,
 }
 
 impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
-    pub fn load(vb: &Path<B>, batch_size: usize, cfg: &Config, device: &B) -> Result<Self> {
+    pub fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
         if !cfg.causal {
             xn::bail!("only causal mode is supported")
         }
@@ -313,38 +340,48 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
             Some(RotaryEmbedding::new(
                 head_dim,
                 cfg.max_period as f32,
-                device,
+                vb.device(),
             )?)
         } else {
             None
         };
 
-        let builder = ScatteredCacheBuilder::new(batch_size, cfg.context, device)?;
         let num_kv = cfg.num_heads / cfg.kv_repeat;
         let head_dim = cfg.d_model / cfg.num_heads;
-        let mut kv_caches = Vec::with_capacity(cfg.num_layers);
-        for _ in 0..cfg.num_layers {
-            kv_caches.push(builder.make_cache(num_kv, head_dim)?);
-        }
 
         Ok(Self {
             layers,
-            kv_caches,
-            builder,
             rope,
             positional_embedding: cfg.positional_embedding,
+            num_kv,
+            head_dim,
+            context: cfg.context,
         })
     }
 
-    pub fn batch_size(&self) -> usize {
-        self.builder.batch_size()
+    pub fn init_state(
+        &self,
+        batch_size: usize,
+        device: &B,
+    ) -> Result<BatchedTransformerState<T, B>> {
+        let builder = ScatteredCacheBuilder::new(batch_size, self.context, device)?;
+        let mut kv_caches = Vec::with_capacity(self.layers.len());
+        for _ in &self.layers {
+            kv_caches.push(builder.make_cache(self.num_kv, self.head_dim)?);
+        }
+        Ok(BatchedTransformerState { builder, kv_caches })
     }
 
-    pub fn forward(&mut self, xs: &Tensor<T, B>, mask: &StreamMask) -> Result<Tensor<T, B>> {
+    pub fn forward(
+        &self,
+        xs: &Tensor<T, B>,
+        state: &mut BatchedTransformerState<T, B>,
+        mask: &StreamMask,
+    ) -> Result<Tensor<T, B>> {
         let dims = xs.dims();
         let (b, t) = (dims[0], dims[1]);
-        if b != self.batch_size() {
-            xn::bail!("unexpected batch size {b} != {}", self.batch_size())
+        if b != state.batch_size() {
+            xn::bail!("unexpected batch size {b} != {}", state.batch_size())
         }
 
         let batch_mask = match mask.cpu() {
@@ -353,14 +390,14 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
         };
 
         // Save positions BEFORE indices_and_mask updates them (fixes off-by-t bug in reference).
-        let positions: Vec<Vec<T>> = self
+        let positions: Vec<Vec<T>> = state
             .builder
             .positions()
             .iter()
             .map(|&v| (0..t).map(|i| T::from_f32((v + i) as f32)).collect())
             .collect();
 
-        let iam = self.builder.indices_and_mask(t, batch_mask)?;
+        let iam = state.builder.indices_and_mask(t, batch_mask)?;
 
         let rope = match &self.rope {
             Some(rope) => {
@@ -376,22 +413,10 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
             PositionalEmbedding::Sin => xn::bail!("sin positional embedding is not supported"),
         };
 
-        for (layer, kv_cache) in self.layers.iter().zip(self.kv_caches.iter_mut()) {
+        for (layer, kv_cache) in self.layers.iter().zip(state.kv_caches.iter_mut()) {
             xs = layer.forward(&xs, rope.as_ref(), kv_cache, &iam)?;
         }
         Ok(xs)
-    }
-
-    pub fn reset(&mut self) {
-        self.builder.reset();
-    }
-
-    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
-        if batch_idx >= self.batch_size() {
-            xn::bail!("batch_idx {batch_idx} is out of bounds")
-        }
-        self.builder.reset_batch_index(batch_idx);
-        Ok(())
     }
 }
 
@@ -407,13 +432,7 @@ pub struct BatchedProjectedTransformer<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
-    pub fn load(
-        vb: &Path<B>,
-        input_dim: usize,
-        batch_size: usize,
-        cfg: &Config,
-        device: &B,
-    ) -> Result<Self> {
+    pub fn load(vb: &Path<B>, input_dim: usize, cfg: &Config) -> Result<Self> {
         let input_proj = if input_dim != cfg.d_model {
             Some(
                 vb.pp("input_proj")
@@ -433,7 +452,7 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
             None
         };
 
-        let transformer = BatchedTransformer::load(&vb.pp("transformer"), batch_size, cfg, device)?;
+        let transformer = BatchedTransformer::load(&vb.pp("transformer"), cfg)?;
 
         Ok(Self {
             input_proj,
@@ -443,7 +462,20 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
         })
     }
 
-    pub fn forward(&mut self, xs: &Tensor<T, B>, mask: &StreamMask) -> Result<Vec<Tensor<T, B>>> {
+    pub fn init_state(
+        &self,
+        batch_size: usize,
+        device: &B,
+    ) -> Result<BatchedTransformerState<T, B>> {
+        self.transformer.init_state(batch_size, device)
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor<T, B>,
+        state: &mut BatchedTransformerState<T, B>,
+        mask: &StreamMask,
+    ) -> Result<Vec<Tensor<T, B>>> {
         let xs = if self.conv_layout {
             xs.transpose(1, 2)?.contiguous()?
         } else {
@@ -453,7 +485,7 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
             Some(proj) => xs.matmul_t(proj)?,
             None => xs,
         };
-        let xs = self.transformer.forward(&xs, mask)?;
+        let xs = self.transformer.forward(&xs, state, mask)?;
         let ys = match &self.output_proj {
             Some(proj) => xs.matmul_t(proj)?,
             None => xs,
@@ -464,13 +496,5 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
             ys
         };
         Ok(vec![ys])
-    }
-
-    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
-        self.transformer.reset_batch_idx(batch_idx)
-    }
-
-    pub fn reset(&mut self) {
-        self.transformer.reset();
     }
 }
