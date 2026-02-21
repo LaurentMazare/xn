@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use xn::nn::VB;
-use xn::{Backend, Tensor};
+use xn::{Backend, Tensor, WithDTypeF};
 use xn_moshi::asr::{Asr, AsrMsg};
 use xn_moshi::lm::{self, LmModel};
 use xn_moshi::mimi::{self, Mimi};
@@ -51,6 +51,10 @@ enum Command {
         /// Use CPU even if CUDA is available.
         #[arg(long, default_value_t = false)]
         cpu: bool,
+
+        /// Use f32 for the LM instead of bf16 (bf16 is the default on CUDA).
+        #[arg(long, default_value_t = false)]
+        f32: bool,
 
         /// Write a chrome tracing profile.
         #[arg(long)]
@@ -153,6 +157,7 @@ fn main() -> Result<()> {
             input,
             temperature,
             cpu,
+            f32: use_f32,
             chrome_tracing,
         } => {
             let _guard = if chrome_tracing {
@@ -165,21 +170,27 @@ fn main() -> Result<()> {
             {
                 if cpu {
                     println!("Using CPU");
-                    run_asr(input, temperature, xn::CPU)?;
+                    run_asr::<f32, _>(input, temperature, xn::CPU)?;
                 } else {
-                    println!("Using CUDA");
                     let dev = xn::cuda_backend::Device::new(0)?;
                     unsafe {
                         dev.disable_event_tracking();
                     }
-                    run_asr(input, temperature, dev)?;
+                    if use_f32 {
+                        println!("Using CUDA (f32)");
+                        run_asr::<f32, _>(input, temperature, dev)?;
+                    } else {
+                        println!("Using CUDA (bf16)");
+                        run_asr::<half::bf16, _>(input, temperature, dev)?;
+                    }
                 }
             }
             #[cfg(not(feature = "cuda"))]
             {
                 let _ = cpu;
+                let _ = use_f32;
                 println!("Using CPU");
-                run_asr(input, temperature, xn::CPU)?;
+                run_asr::<f32, _>(input, temperature, xn::CPU)?;
             }
         }
     }
@@ -345,7 +356,11 @@ fn audio_to_audio<Dev: Backend>(
     Ok(())
 }
 
-fn run_asr<Dev: Backend>(input: std::path::PathBuf, temperature: f64, dev: Dev) -> Result<()> {
+fn run_asr<LmT: WithDTypeF, Dev: Backend>(
+    input: std::path::PathBuf,
+    temperature: f64,
+    dev: Dev,
+) -> Result<()> {
     use std::io::Write;
 
     let target_sample_rate: usize = 24000;
@@ -390,7 +405,7 @@ fn run_asr<Dev: Backend>(input: std::path::PathBuf, temperature: f64, dev: Dev) 
     println!("Loading LM weights...");
     let lm_vb = VB::load(&[files.lm], dev.clone())?;
     let lm_config = lm::Config::stt_2_6b();
-    let lm: LmModel<f32, Dev> = LmModel::load(&lm_vb.root(), &lm_config)?;
+    let lm: LmModel<LmT, Dev> = LmModel::load(&lm_vb.root(), &lm_config)?;
     println!("  LM loaded");
 
     // --- Create ASR ---

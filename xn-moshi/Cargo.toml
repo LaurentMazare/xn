@@ -12,6 +12,7 @@ kaudio = { version = "0.2.1", optional = true }
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+half = "2"
 hf-hub = "0.4"
 sentencepiece = "0.13.1"
 tracing-chrome = "0.7"

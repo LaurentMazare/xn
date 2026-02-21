@@ -72,26 +72,26 @@ impl ItemState {
 // ASR State
 // ============================================================================
 
-pub struct AsrState<T: WithDTypeF, B: Backend> {
-    pub lm: LmState<T, B>,
-    pub audio_tokenizer: MimiEncodeState<T, B>,
+pub struct AsrState<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
+    pub lm: LmState<LmT, B>,
+    pub audio_tokenizer: MimiEncodeState<MimiT, B>,
     pub batch: Vec<ItemState>,
     model_step_idx: usize,
 }
 
-pub struct Asr<T: WithDTypeF, B: Backend> {
+pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
     asr_delay_in_tokens: usize,
     temperature: f64,
-    lm: LmModel<T, B>,
-    audio_tokenizer: Mimi<T, B>,
+    lm: LmModel<LmT, B>,
+    audio_tokenizer: Mimi<MimiT, B>,
 }
 
-impl<T: WithDTypeF, B: Backend> Asr<T, B> {
+impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
     pub fn new(
         asr_delay_in_tokens: usize,
         temperature: f64,
-        audio_tokenizer: Mimi<T, B>,
-        lm: LmModel<T, B>,
+        audio_tokenizer: Mimi<MimiT, B>,
+        lm: LmModel<LmT, B>,
     ) -> Self {
         Self {
             asr_delay_in_tokens,
@@ -101,7 +101,7 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
         }
     }
 
-    pub fn init_state(&self, batch_size: usize) -> Result<AsrState<T, B>> {
+    pub fn init_state(&self, batch_size: usize) -> Result<AsrState<MimiT, LmT, B>> {
         let text_start_token = self.lm.text_start_token();
         let audio_pad_token = self.lm.audio_pad_token();
         let in_audio_codebooks = self.lm.in_audio_codebooks();
@@ -132,11 +132,11 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
         self.asr_delay_in_tokens
     }
 
-    pub fn model_step_idx(&self, state: &AsrState<T, B>) -> usize {
+    pub fn model_step_idx(&self, state: &AsrState<MimiT, LmT, B>) -> usize {
         state.model_step_idx
     }
 
-    pub fn reset_state(&self, state: &mut AsrState<T, B>) -> Result<()> {
+    pub fn reset_state(&self, state: &mut AsrState<MimiT, LmT, B>) -> Result<()> {
         state.batch.iter_mut().for_each(|s| s.reset());
         state.model_step_idx = 0;
         let batch_size = state.batch.len();
@@ -147,8 +147,8 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
 
     pub fn step_pcm<F>(
         &self,
-        pcm: &StreamTensor<T, B>,
-        state: &mut AsrState<T, B>,
+        pcm: &StreamTensor<MimiT, B>,
+        state: &mut AsrState<MimiT, LmT, B>,
         mask: &StreamMask,
         f: F,
     ) -> Result<Vec<AsrMsg>>
@@ -165,7 +165,7 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
         }
     }
 
-    fn text_tokens(&self, state: &AsrState<T, B>) -> Vec<u32> {
+    fn text_tokens(&self, state: &AsrState<MimiT, LmT, B>) -> Vec<u32> {
         let text_start_token = self.lm.text_start_token();
         state
             .batch
@@ -184,7 +184,7 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
     pub fn step_tokens<F>(
         &self,
         audio_tokens: &Tensor<i64, B>,
-        state: &mut AsrState<T, B>,
+        state: &mut AsrState<MimiT, LmT, B>,
         mask: &StreamMask,
         f: F,
     ) -> Result<Vec<AsrMsg>>
@@ -252,12 +252,12 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
             for extra_head in extra_heads.iter() {
                 // softmax on last dim, shape (batch, 1, dim) -> take (:, 0, 0)
                 let eh = extra_head.softmax()?;
-                let eh_data: Vec<T> = eh.to_vec()?;
+                let eh_data: Vec<LmT> = eh.to_vec()?;
                 let eh_dims = eh.dims();
                 let dim = eh_dims[2];
                 // Extract first element per batch (index 0 of seq=0)
                 let prs_: Vec<f32> = (0..batch_size)
-                    .map(|b| <T as WithDTypeF>::to_f32(eh_data[b * dim]))
+                    .map(|b| <LmT as WithDTypeF>::to_f32(eh_data[b * dim]))
                     .collect();
                 prs.push(prs_);
             }
@@ -273,7 +273,7 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
             let logits_dims = text_logits.dims();
             let vocab_size = logits_dims[2];
             let logits_2d = text_logits.reshape((logits_dims[0], vocab_size))?;
-            let logits_data: Vec<T> = logits_2d.to_vec()?;
+            let logits_data: Vec<LmT> = logits_2d.to_vec()?;
 
             let sampled_tokens = if self.temperature <= 0.0 {
                 // Greedy: argmax over last dim on CPU
@@ -337,7 +337,11 @@ impl<T: WithDTypeF, B: Backend> Asr<T, B> {
         Ok(words)
     }
 
-    pub fn reset_batch_idx(&self, state: &mut AsrState<T, B>, batch_idx: usize) -> Result<()> {
+    pub fn reset_batch_idx(
+        &self,
+        state: &mut AsrState<MimiT, LmT, B>,
+        batch_idx: usize,
+    ) -> Result<()> {
         if batch_idx >= state.batch.len() {
             xn::bail!(
                 "batch index out of range: {batch_idx} >= {}",
