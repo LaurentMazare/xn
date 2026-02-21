@@ -1,5 +1,5 @@
 use crate::streaming::StreamTensor;
-use xn::nn::var_builder::Path;
+use xn::nn::{Linear, var_builder::Path};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
@@ -178,16 +178,12 @@ impl<T: WithDTypeF, B: Backend> Norm<T, B> {
 
 pub(crate) enum Mlp<T: WithDTypeF, B: Backend> {
     NoGating {
-        linear1_weight: Tensor<T, B>,
-        linear1_bias: Option<Tensor<T, B>>,
-        linear2_weight: Tensor<T, B>,
-        linear2_bias: Option<Tensor<T, B>>,
+        linear1: Linear<T, B>,
+        linear2: Linear<T, B>,
     },
     Gating {
-        linear_in_weight: Tensor<T, B>,
-        linear_in_bias: Option<Tensor<T, B>>,
-        linear_out_weight: Tensor<T, B>,
-        linear_out_bias: Option<Tensor<T, B>>,
+        linear_in: Linear<T, B>,
+        linear_out: Linear<T, B>,
         activation: crate::seanet::Activation,
     },
 }
@@ -197,28 +193,11 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
         let d_model = cfg.d_model;
         match cfg.gating {
             None => {
-                let linear1_weight = vb
-                    .pp("linear1")
-                    .tensor("weight", (cfg.dim_feedforward, d_model))?;
-                let linear1_bias = if cfg.bias_ff {
-                    Some(vb.pp("linear1").tensor("bias", (cfg.dim_feedforward,))?)
-                } else {
-                    None
-                };
-                let linear2_weight = vb
-                    .pp("linear2")
-                    .tensor("weight", (d_model, cfg.dim_feedforward))?;
-                let linear2_bias = if cfg.bias_ff {
-                    Some(vb.pp("linear2").tensor("bias", (d_model,))?)
-                } else {
-                    None
-                };
-                Ok(Self::NoGating {
-                    linear1_weight,
-                    linear1_bias,
-                    linear2_weight,
-                    linear2_bias,
-                })
+                let linear1 =
+                    Linear::load_o(&vb.pp("linear1"), d_model, cfg.dim_feedforward, cfg.bias_ff)?;
+                let linear2 =
+                    Linear::load_o(&vb.pp("linear2"), cfg.dim_feedforward, d_model, cfg.bias_ff)?;
+                Ok(Self::NoGating { linear1, linear2 })
             }
             Some(activation) => {
                 let hidden = if cfg.dim_feedforward == 4 * d_model {
@@ -227,24 +206,13 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
                     2 * cfg.dim_feedforward / 3
                 };
                 let vb = vb.pp("gating");
-                let linear_in_weight =
-                    vb.pp("linear_in").tensor("weight", (2 * hidden, d_model))?;
-                let linear_in_bias = if cfg.bias_ff {
-                    Some(vb.pp("linear_in").tensor("bias", (2 * hidden,))?)
-                } else {
-                    None
-                };
-                let linear_out_weight = vb.pp("linear_out").tensor("weight", (d_model, hidden))?;
-                let linear_out_bias = if cfg.bias_ff {
-                    Some(vb.pp("linear_out").tensor("bias", (d_model,))?)
-                } else {
-                    None
-                };
+                let linear_in =
+                    Linear::load_o(&vb.pp("linear_in"), d_model, 2 * hidden, cfg.bias_ff)?;
+                let linear_out =
+                    Linear::load_o(&vb.pp("linear_out"), hidden, d_model, cfg.bias_ff)?;
                 Ok(Self::Gating {
-                    linear_in_weight,
-                    linear_in_bias,
-                    linear_out_weight,
-                    linear_out_bias,
+                    linear_in,
+                    linear_out,
                     activation,
                 })
             }
@@ -254,43 +222,23 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
     #[tracing::instrument(name = "mlp-forward", skip_all)]
     pub(crate) fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         match self {
-            Self::NoGating {
-                linear1_weight,
-                linear1_bias,
-                linear2_weight,
-                linear2_bias,
-            } => {
-                let mut xs = xs.matmul_t(linear1_weight)?;
-                if let Some(bias) = linear1_bias {
-                    xs = xs.broadcast_add(bias)?;
-                }
-                xs = xs.gelu_erf()?;
-                xs = xs.matmul_t(linear2_weight)?;
-                if let Some(bias) = linear2_bias {
-                    xs = xs.broadcast_add(bias)?;
-                }
+            Self::NoGating { linear1, linear2 } => {
+                let xs = linear1.forward(xs)?.gelu_erf()?;
+                let xs = linear2.forward(&xs)?;
                 Ok(xs)
             }
             Self::Gating {
-                linear_in_weight,
-                linear_in_bias,
-                linear_out_weight,
-                linear_out_bias,
+                linear_in,
+                linear_out,
                 activation,
             } => {
-                let mut xs = xs.matmul_t(linear_in_weight)?;
-                if let Some(bias) = linear_in_bias {
-                    xs = xs.broadcast_add(bias)?;
-                }
                 let (b, t, _) = xs.dims3()?;
+                let xs = linear_in.forward(xs)?;
                 let xs = xs.reshape((b, t, 2, ()))?;
                 let x1 = xs.narrow(2, ..1)?.contiguous()?.reshape((b, t, ()))?;
                 let x2 = xs.narrow(2, 1..2)?.contiguous()?.reshape((b, t, ()))?;
                 let xs = activation.apply(&x1)?.mul(&x2)?;
-                let mut xs = xs.matmul_t(linear_out_weight)?;
-                if let Some(bias) = linear_out_bias {
-                    xs = xs.broadcast_add(bias)?;
-                }
+                let xs = linear_out.forward(&xs)?;
                 Ok(xs)
             }
         }

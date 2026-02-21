@@ -85,6 +85,22 @@ impl<T: WithDTypeF, B: Backend> Linear<T, B> {
         Ok(Self::new(weight).with_bias(bias))
     }
 
+    pub fn load_o(
+        vb: &Path<B>,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Self> {
+        let weight = vb.tensor("weight", (out_features, in_features))?;
+        let slf = Self::new(weight);
+        if bias {
+            let bias = vb.tensor("bias", (out_features,))?;
+            Ok(slf.with_bias(bias))
+        } else {
+            Ok(slf)
+        }
+    }
+
     pub fn forward<X: crate::TensorOrView<T, B>>(&self, x: &X) -> Result<Tensor<T, B>> {
         // weight: (out_features, in_features)
         // x: (..., in_features)

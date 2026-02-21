@@ -797,7 +797,7 @@ impl crate::Backend for Device {
                     dst_strides,
                     lhs_strides,
                     rhs_strides,
-                )
+                )?
             }
             DType::F16 => {
                 let dst = unsafe { &mut *(dst as *mut Storage<T> as *mut Storage<f16>) };
@@ -816,7 +816,7 @@ impl crate::Backend for Device {
                     dst_strides,
                     lhs_strides,
                     rhs_strides,
-                )
+                )?
             }
             DType::BF16 => {
                 let dst = unsafe { &mut *(dst as *mut Storage<T> as *mut Storage<bf16>) };
@@ -835,10 +835,11 @@ impl crate::Backend for Device {
                     dst_strides,
                     lhs_strides,
                     rhs_strides,
-                )
+                )?
             }
             _ => crate::bail!("GEMM not supported for dtype {:?}", T::DTYPE),
         }
+        Ok(())
     }
 
     fn copy_strided<T: WithDType>(
