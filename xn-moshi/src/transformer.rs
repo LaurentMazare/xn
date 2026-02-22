@@ -73,12 +73,12 @@ impl<T: WithDTypeF, B: Backend> Default for KvCacheState<T, B> {
 // Rotary Embeddings
 // ============================================================================
 
-struct RotaryEmbedding<T: WithDTypeF, B: Backend> {
-    cos: Tensor<T, B>,
-    sin: Tensor<T, B>,
+struct RotaryEmbedding<B: Backend> {
+    cos: Tensor<f32, B>,
+    sin: Tensor<f32, B>,
 }
 
-impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
+impl<B: Backend> RotaryEmbedding<B> {
     // TODO: This precomputes cos/sin for all positions up to max_seq_len on the CPU.
     // The reference implementation computes them on-the-fly per forward call using
     // Tensor::arange() + matmul with inv_freq, which avoids the upfront allocation and
@@ -95,8 +95,8 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
         for pos in 0..max_seq_len {
             for &freq in &inv_freq {
                 let angle = pos as f32 * freq;
-                cos_data.push(T::from_f32(angle.cos()));
-                sin_data.push(T::from_f32(angle.sin()));
+                cos_data.push(angle.cos());
+                sin_data.push(angle.sin());
             }
         }
 
@@ -292,7 +292,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
     fn forward(
         &self,
         xs: &Tensor<T, B>,
-        rope: Option<&RotaryEmbedding<T, B>>,
+        rope: Option<&RotaryEmbedding<B>>,
         offset: usize,
         kv_cache: &mut KvCacheState<T, B>,
     ) -> Result<Tensor<T, B>> {
@@ -322,8 +322,8 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
 
         // Apply rotary embeddings
         let (q, k) = if let Some(rope) = rope {
-            let q = q.rope_i(&rope.cos, &rope.sin, offset)?;
-            let k = k.rope_i(&rope.cos, &rope.sin, offset)?;
+            let q = q.to()?.rope_i(&rope.cos, &rope.sin, offset)?.to()?;
+            let k = k.to()?.rope_i(&rope.cos, &rope.sin, offset)?.to()?;
             (q, k)
         } else {
             (q, k)
@@ -433,7 +433,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
     fn forward(
         &self,
         xs: &Tensor<T, B>,
-        rope: Option<&RotaryEmbedding<T, B>>,
+        rope: Option<&RotaryEmbedding<B>>,
         offset: usize,
         kv_cache: &mut KvCacheState<T, B>,
     ) -> Result<Tensor<T, B>> {
@@ -459,7 +459,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
 
 struct StreamingTransformer<T: WithDTypeF, B: Backend> {
     layers: Vec<StreamingTransformerLayer<T, B>>,
-    rope: Option<RotaryEmbedding<T, B>>,
+    rope: Option<RotaryEmbedding<B>>,
 }
 
 impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
