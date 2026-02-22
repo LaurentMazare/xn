@@ -601,7 +601,7 @@ fn test_index_select_1d() -> Result<()> {
     // Shape [5]
     let a: Tensor<f32, Device> =
         Tensor::from_vec(vec![10.0, 20.0, 30.0, 40.0, 50.0], vec![5], &device)?;
-    let indices = vec![0u32, 2, 4];
+    let indices = Tensor::from_vec(vec![0i64, 2, 4], 3, &device)?;
     let selected = a.index_select(&indices, 0)?;
     assert_eq!(selected.dims(), &[3]);
     assert_eq!(selected.to_vec()?, vec![10.0, 30.0, 50.0]);
@@ -617,7 +617,7 @@ fn test_index_select_2d_dim0() -> Result<()> {
         vec![4, 3],
         &device,
     )?;
-    let indices = vec![0u32, 2, 3];
+    let indices = Tensor::from_vec(vec![0i64, 2, 3], 3, &device)?;
     let selected = a.index_select(&indices, 0)?;
     assert_eq!(selected.dims(), &[3, 3]);
     // Rows 0, 2, 3
@@ -634,7 +634,7 @@ fn test_index_select_2d_dim1() -> Result<()> {
         vec![3, 4],
         &device,
     )?;
-    let indices = vec![1u32, 3];
+    let indices = Tensor::from_vec(vec![1i64, 3], 2, &device)?;
     let selected = a.index_select(&indices, 1)?;
     assert_eq!(selected.dims(), &[3, 2]);
     // Columns 1, 3 from each row
@@ -649,7 +649,7 @@ fn test_index_select_3d() -> Result<()> {
     let data: Vec<f32> = (1..=24).map(|x| x as f32).collect();
     let a: Tensor<f32, Device> = Tensor::from_vec(data, vec![2, 3, 4], &device)?;
 
-    let indices = vec![0u32, 2];
+    let indices = Tensor::from_vec(vec![0i64, 2], 2, &device)?;
     let selected = a.index_select(&indices, 1)?;
     assert_eq!(selected.dims(), &[2, 2, 4]);
     // From first batch [1-12]: rows 0 and 2 -> [1,2,3,4] and [9,10,11,12]

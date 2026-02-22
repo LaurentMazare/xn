@@ -142,7 +142,7 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
     fn index_select<T: crate::WithDType>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,
-        ids: &[u32],
+        ids: &Self::Storage<i64>,
         dim: usize,
         dims: &[usize],
     ) -> Result<()>;

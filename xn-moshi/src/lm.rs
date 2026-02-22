@@ -224,7 +224,14 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
     ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
         // Text embedding: index_select gives (batch, d_model), unsqueeze to (batch, 1, d_model)
         let mut emb = match text_ids {
-            Some(ids) => self.text_emb.index_select(ids, 0)?.unsqueeze(1)?,
+            Some(ids) => {
+                let ids_t = Tensor::from_vec(
+                    ids.iter().map(|&x| x as i64).collect(),
+                    ids.len(),
+                    self.device(),
+                )?;
+                self.text_emb.index_select(&ids_t, 0)?.unsqueeze(1)?
+            }
             None => {
                 let d_model = self.text_emb.dims()[1];
                 let batch_size = state.transformer.batch_size();
@@ -235,7 +242,12 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         // Audio embeddings
         for (audio_emb, audio_ids) in self.audio_embs.iter().zip(audio_ids.iter()) {
             if let Some(ids) = audio_ids {
-                let e = audio_emb.index_select(ids, 0)?.unsqueeze(1)?;
+                let ids_t = Tensor::from_vec(
+                    ids.iter().map(|&x| x as i64).collect(),
+                    ids.len(),
+                    self.device(),
+                )?;
+                let e = audio_emb.index_select(&ids_t, 0)?.unsqueeze(1)?;
                 emb = emb.add(&e)?;
             }
         }

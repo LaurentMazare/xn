@@ -912,22 +912,18 @@ impl crate::Backend for Device {
     fn index_select<T: WithDType>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,
-        ids: &[u32],
+        ids: &Self::Storage<i64>,
         dim: usize,
         dims: &[usize],
     ) -> Result<()> {
         let left_size: usize = dims[..dim].iter().product();
         let right_size: usize = dims[dim + 1..].iter().product::<usize>().max(1);
 
-        // The kernel handles selection along the first dimension.
-        // For dim > 0, we loop over left positions.
-        let ids_dev = dst.device.stream.clone_htod(ids)?;
-
-        let kname = kernel_name::<T>("is_u32");
+        let kname = kernel_name::<T>("is_i64");
         let func = dst.device.get_func(&kname, PTXModule::Indexing)?;
 
         const NUM_THREADS: u32 = 1024;
-        let ids_len = ids.len() as u32;
+        let ids_len = ids.data.len() as u32;
         let right_size_u32 = right_size as u32;
         let threads_x = u32::min(NUM_THREADS, ids_len);
         let threads_y = u32::min(NUM_THREADS / threads_x, right_size_u32).max(1);
@@ -946,14 +942,14 @@ impl crate::Backend for Device {
 
         for left in 0..left_size {
             let src_offset = left * src_dim_size * right_size;
-            let dst_offset = left * ids.len() * right_size;
+            let dst_offset = left * ids.data.len() * right_size;
             let src_slice = src.data.slice(src_offset..);
             let mut dst_slice = dst.data.slice_mut(dst_offset..);
 
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&ids_len_i32);
             launch_args.arg(&right_size_i32);
-            launch_args.arg(&ids_dev);
+            launch_args.arg(&ids.data);
             launch_args.arg(&src_slice);
             launch_args.arg(&mut dst_slice);
             unsafe { launch_args.launch(cfg) }?;

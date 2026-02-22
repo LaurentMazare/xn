@@ -624,7 +624,7 @@ impl crate::Backend for crate::CpuDevice {
     fn index_select<T: WithDType>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,
-        ids: &[u32],
+        ids: &Self::Storage<i64>,
         dim: usize,
         dims: &[usize],
     ) -> Result<()> {

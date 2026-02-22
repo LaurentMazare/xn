@@ -124,12 +124,14 @@ fn test_index_select_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
         Tensor::from_vec(vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.], (4, 3), dev)?;
 
     // Select rows 0, 2, 3
-    let b = a.index_select(&[0, 2, 3], 0)?;
+    let idx = Tensor::from_vec(vec![0i64, 2, 3], 3, dev)?;
+    let b = a.index_select(&idx, 0)?;
     assert_eq!(b.dims(), &[3, 3]);
     assert_eq!(b.to_vec()?, vec![1., 2., 3., 7., 8., 9., 10., 11., 12.]);
 
     // Select with repetition
-    let c = a.index_select(&[1, 1, 0], 0)?;
+    let idx = Tensor::from_vec(vec![1i64, 1, 0], 3, dev)?;
+    let c = a.index_select(&idx, 0)?;
     assert_eq!(c.dims(), &[3, 3]);
     assert_eq!(c.to_vec()?, vec![4., 5., 6., 4., 5., 6., 1., 2., 3.]);
     Ok(())
@@ -141,7 +143,8 @@ fn test_index_select_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<f32, B> = Tensor::from_vec(vec![1., 2., 3., 4., 5., 6., 7., 8.], (2, 4), dev)?;
 
     // Select columns 0, 2
-    let b = a.index_select(&[0, 2], 1)?;
+    let idx = Tensor::from_vec(vec![0i64, 2], 2, dev)?;
+    let b = a.index_select(&idx, 1)?;
     assert_eq!(b.dims(), &[2, 2]);
     // Row 0: [1, 3], Row 1: [5, 7]
     assert_eq!(b.to_vec()?, vec![1., 3., 5., 7.]);
@@ -157,7 +160,8 @@ fn test_index_select_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // Batch 1: [[7,8], [9,10], [11,12]]
 
     // Select along dim 1 (middle dimension)
-    let b = a.index_select(&[0, 2], 1)?;
+    let idx = Tensor::from_vec(vec![0i64, 2], 2, dev)?;
+    let b = a.index_select(&idx, 1)?;
     assert_eq!(b.dims(), &[2, 2, 2]);
     // Batch 0: [[1,2], [5,6]]
     // Batch 1: [[7,8], [11,12]]

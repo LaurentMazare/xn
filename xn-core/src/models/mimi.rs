@@ -1633,10 +1633,7 @@ impl<T: WithDTypeF, B: Backend> EuclideanCodebook<T, B> {
         // Flatten indices
         let flat_indices = indices.flatten(0, indices.rank().saturating_sub(1))?;
 
-        // Convert i64 indices to u32 and index into embedding
-        let indices_vec = flat_indices.to_vec()?;
-        let indices_u32: Vec<u32> = indices_vec.iter().map(|&x| x as u32).collect();
-        let values = self.embedding.index_select(&indices_u32, 0)?;
+        let values = self.embedding.index_select(&flat_indices, 0)?;
 
         // Reshape to final_dims
         values.reshape(final_dims)

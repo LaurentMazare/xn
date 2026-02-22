@@ -66,9 +66,7 @@ impl<T: WithDTypeF, B: Backend> EuclideanCodebook<T, B> {
         final_dims.push(self.dim);
 
         let flat_indices = indices.flatten(0, indices.rank().saturating_sub(1))?;
-        let indices_vec = flat_indices.to_vec()?;
-        let indices_u32: Vec<u32> = indices_vec.iter().map(|&x| x as u32).collect();
-        let values = self.embedding.index_select(&indices_u32, 0)?;
+        let values = self.embedding.index_select(&flat_indices, 0)?;
         values.reshape(final_dims)
     }
 }

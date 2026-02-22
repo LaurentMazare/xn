@@ -186,20 +186,12 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn index_select(&self, indices: &[u32], dim: impl Dim) -> Result<Self> {
+    pub fn index_select(&self, indices: &Tensor<i64, B>, dim: impl Dim) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "index_select dim")?;
-        let dim_size = self.dim(dim)?;
-        for (i, &idx) in indices.iter().enumerate() {
-            if idx as usize >= dim_size {
-                crate::bail!(
-                    "index_select: index {idx} at position {i} is out of bounds for dimension {dim} with size {dim_size}"
-                );
-            }
-        }
 
         // Calculate output shape
         let mut out_dims: Vec<usize> = self.dims().to_vec();
-        out_dims[dim] = indices.len();
+        out_dims[dim] = indices.elem_count();
         let out_shape = Shape::from(out_dims);
 
         // Allocate output
@@ -208,7 +200,8 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
         {
             let src_data = self.storage()?;
             let mut dst_data = out.storage_mut()?;
-            B::index_select(&mut dst_data, &*src_data, indices, dim, self.dims())?;
+            let ids_data = indices.storage()?;
+            B::index_select(&mut dst_data, &*src_data, &*ids_data, dim, self.dims())?;
         }
         Ok(out)
     }

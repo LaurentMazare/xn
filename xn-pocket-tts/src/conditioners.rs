@@ -32,7 +32,12 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
             let dev = self.embed.device();
             return Tensor::zeros((1, 0, self.dim), dev);
         }
-        let emb = self.embed.index_select(token_ids, 0)?;
+        let ids_t = Tensor::from_vec(
+            token_ids.iter().map(|&x| x as i64).collect(),
+            token_ids.len(),
+            self.embed.device(),
+        )?;
+        let emb = self.embed.index_select(&ids_t, 0)?;
         emb.reshape((1, token_ids.len(), self.dim))
     }
 }

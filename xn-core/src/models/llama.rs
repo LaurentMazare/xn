@@ -223,9 +223,11 @@ impl<T: WithDTypeF, B: Backend> Attention<T, B> {
         // output shape: (batch, num_heads, seq_len, head_dim)
         // Repeat each KV head num_kv_groups times using index_select
         // indices: [0, 0, ..., 1, 1, ..., 2, 2, ...] with num_kv_groups repetitions each
-        let indices: Vec<u32> = (0..self.num_kv_heads as u32)
+        let indices: Vec<i64> = (0..self.num_kv_heads as i64)
             .flat_map(|i| std::iter::repeat_n(i, self.num_kv_groups))
             .collect();
+        let indices =
+            Tensor::from_vec(indices, self.num_kv_heads * self.num_kv_groups, x.device())?;
         x.index_select(&indices, 1)
     }
 }
@@ -380,7 +382,12 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
         kv_caches: Option<&KvCache<T, B>>,
     ) -> Result<(Tensor<T, B>, KvCache<T, B>)> {
         // Token embedding: (seq_len,) -> (1, seq_len, hidden_size)
-        let mut x = self.embed_tokens.index_select(tokens, 0)?;
+        let token_ids = Tensor::from_vec(
+            tokens.iter().map(|&t| t as i64).collect(),
+            tokens.len(),
+            self.embed_tokens.device(),
+        )?;
+        let mut x = self.embed_tokens.index_select(&token_ids, 0)?;
         x = x.reshape((1, tokens.len(), ()))?;
 
         // Run through transformer layers

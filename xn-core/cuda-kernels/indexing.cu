@@ -28,13 +28,13 @@ extern "C" __global__ void FN_NAME(  \
 ) { index_select(numel, dim, ids, src, dst); } \
 
 #if __CUDA_ARCH__ >= 800
-IS_OP(__nv_bfloat16, uint32_t, is_u32_bf16);
+IS_OP(__nv_bfloat16, int64_t, is_i64_bf16);
 #endif
 #if __CUDA_ARCH__ >= 530
-IS_OP(__half, uint32_t, is_u32_f16);
+IS_OP(__half, int64_t, is_i64_f16);
 #endif
 
-IS_OP(float, uint32_t, is_u32_f32);
+IS_OP(float, int64_t, is_i64_f32);
 
 // Causality mask kernel
 // Sets dst[idx_b * t1 * t2 + idx1 * t2 + idx2] = -inf where idx2 > offset + idx1
