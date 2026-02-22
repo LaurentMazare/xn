@@ -439,7 +439,8 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         check_same_shape(&self.shape, &src.shape, "rope_ src")?;
         check_same_shape(&cos.shape, &sin.shape, "rope_ cos/sin")?;
         let (b, h, t, d) = self.dims4()?;
-        let (max_pos, d_over_2) = cos.dims2()?;
+        let (max_pos, d_over_2) = rope_check_cs(cos.dims(), b)?;
+        let unbatched_rope = cos.rank() == 3;
         if d_over_2 * 2 != d {
             crate::bail!(
                 "rope_ requires even d dimension, got d={d}, {:?} {:?}",
@@ -458,7 +459,7 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let src_data = src.storage()?;
         let cos_data = cos.storage()?;
         let sin_data = sin.storage()?;
-        B::rope(&mut *dst, &*src_data, &*cos_data, &*sin_data, b, h, t, d, pos)?;
+        B::rope(&mut *dst, &*src_data, &*cos_data, &*sin_data, b, h, t, d, pos, unbatched_rope)?;
         Ok(())
     }
 
@@ -466,7 +467,8 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         check_same_shape(&self.shape, &src.shape, "rope_i_ src")?;
         check_same_shape(&cos.shape, &sin.shape, "rope_i_ cos/sin")?;
         let (b, h, t, d) = self.dims4()?;
-        let (max_pos, d_over_2) = cos.dims2()?;
+        let (max_pos, d_over_2) = rope_check_cs(cos.dims(), b)?;
+        let unbatched_rope = cos.rank() == 3;
         if d_over_2 * 2 != d {
             crate::bail!(
                 "rope_i_ requires even d dimension, got d={d}, {:?} {:?}",
@@ -485,7 +487,7 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let src_data = src.storage()?;
         let cos_data = cos.storage()?;
         let sin_data = sin.storage()?;
-        B::rope_i(&mut *dst, &*src_data, &*cos_data, &*sin_data, b, h, t, d, pos)?;
+        B::rope_i(&mut *dst, &*src_data, &*cos_data, &*sin_data, b, h, t, d, pos, unbatched_rope)?;
         Ok(())
     }
 
@@ -742,4 +744,17 @@ fn compute_broadcast_strides(
     }
     let out_shape = compact_lro.iter().map(|(_, dim)| *dim).collect();
     Ok((out_shape, lhs_strides, rhs_strides))
+}
+
+fn rope_check_cs(cs_dims: &[usize], b_sz: usize) -> Result<(usize, usize)> {
+    match *cs_dims {
+        [t, d] => Ok((t, d)),
+        [b, t, d] => {
+            if b != b_sz {
+                crate::bail!("inconsistent batch size in rope {b_sz} {cs_dims:?}",)
+            }
+            Ok((t, d))
+        }
+        _ => crate::bail!("cos/sin has to be 2D or 3D in rope {b_sz} {cs_dims:?}"),
+    }
 }

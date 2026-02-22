@@ -114,6 +114,7 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         t: usize,
         d: usize,
         pos: usize,
+        unbatched_rope: bool,
     ) -> Result<()>;
 
     #[allow(clippy::too_many_arguments)]
@@ -127,6 +128,7 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         t: usize,
         d: usize,
         pos: usize,
+        unbatched_rope: bool,
     ) -> Result<()>;
 
     #[allow(clippy::too_many_arguments)]

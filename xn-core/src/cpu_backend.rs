@@ -426,6 +426,7 @@ impl crate::Backend for crate::CpuDevice {
         t: usize,
         d: usize,
         pos: usize,
+        unbatched_rope: bool,
     ) -> Result<()> {
         if dst.len() != b * h * t * d {
             crate::bail!("rope unexpected size for dst {} {b} {h} {t} {d}", dst.len())
@@ -435,19 +436,25 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        dst.par_chunks_mut(t * d).zip(src.par_chunks(t * d)).for_each(|(dst, src)| {
-            for i_t in 0..t {
-                for i_d in 0..d / 2 {
-                    let i1 = i_t * d + i_d;
-                    let i2 = i1 + d / 2;
-                    let i_cs = i_t * (d / 2) + i_d;
-                    let (src_i1, src_i2) = (src[i1], src[i2]);
-                    dst[i1] = src_i1 * cos[i_cs] - src_i2 * sin[i_cs];
-                    dst[i2] = src_i1 * sin[i_cs] + src_i2 * cos[i_cs];
+        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
+            |(bh_i, (src, dst))| {
+                for i_t in 0..t {
+                    for i_d in 0..d / 2 {
+                        let i1 = i_t * d + i_d;
+                        let i2 = i1 + d / 2;
+                        let i_cs = i_t * (d / 2) + i_d;
+                        let i_cs = if unbatched_rope {
+                            let b_i = bh_i / h;
+                            i_cs + b_i * t * d / 2
+                        } else {
+                            i_cs
+                        };
+                        dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                        dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
+                    }
                 }
-            }
-        });
-
+            },
+        );
         Ok(())
     }
 
@@ -461,6 +468,7 @@ impl crate::Backend for crate::CpuDevice {
         t: usize,
         d: usize,
         pos: usize,
+        unbatched_rope: bool,
     ) -> Result<()> {
         if dst.len() != b * h * t * d {
             crate::bail!("rope-i unexpected size for dst {} {b} {h} {t} {d}", dst.len())
@@ -470,14 +478,21 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        dst.par_chunks_mut(t * d).zip(src.par_chunks(t * d)).for_each(|(dst, src)| {
-            for i_over_2 in 0..t * d / 2 {
-                let i = 2 * i_over_2;
-                let (s_i, s_ip) = (src[i], src[i + 1]);
-                dst[i] = s_i * cos[i_over_2] - s_ip * sin[i_over_2];
-                dst[i + 1] = s_i * sin[i_over_2] + s_ip * cos[i_over_2];
-            }
-        });
+        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
+            |(bh_i, (src, dst))| {
+                for i_over_2 in 0..t * d / 2 {
+                    let i = 2 * i_over_2;
+                    let rope_i = if unbatched_rope {
+                        let b_i = bh_i / h;
+                        i_over_2 + b_i * t * d / 2
+                    } else {
+                        i_over_2
+                    };
+                    dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
+                    dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+                }
+            },
+        );
         Ok(())
     }
 

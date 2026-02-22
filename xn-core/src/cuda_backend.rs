@@ -716,13 +716,14 @@ impl crate::Backend for Device {
         t: usize,
         d: usize,
         pos: usize,
+        unbatched_rope: bool,
     ) -> Result<()> {
         let kname = kernel_name::<T>("rope");
         let func = dst.device.get_func(&kname, PTXModule::Rope)?;
         let bh = (b * h) as u32;
         let td = (t * d) as u32;
         let d_u32 = d as u32;
-        let stride_b = 0u32;
+        let stride_b = if unbatched_rope { (h * t * d) as u32 } else { 0u32 };
         // The kernel processes bh * td / 2 elements (each thread handles 2 elements)
         let cfg = LaunchConfig::for_num_elems(bh * td / 2);
 
@@ -755,12 +756,13 @@ impl crate::Backend for Device {
         t: usize,
         d: usize,
         pos: usize,
+        unbatched_rope: bool,
     ) -> Result<()> {
         let kname = kernel_name::<T>("rope_i");
         let func = dst.device.get_func(&kname, PTXModule::Rope)?;
         let bh = (b * h) as u32;
         let td = (t * d) as u32;
-        let stride_b = 0u32;
+        let stride_b = if unbatched_rope { (h * t * d) as u32 } else { 0u32 };
         // The kernel processes bh * td / 2 elements (each thread handles 2 elements)
         let cfg = LaunchConfig::for_num_elems(bh * td / 2);
 
