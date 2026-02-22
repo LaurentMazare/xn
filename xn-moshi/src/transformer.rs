@@ -1,5 +1,5 @@
 use crate::streaming::StreamTensor;
-use xn::nn::{Linear, var_builder::Path};
+use xn::nn::{var_builder::Path, Linear};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
@@ -292,7 +292,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
     fn forward(
         &self,
         xs: &Tensor<T, B>,
-        rope: Option<&RotaryEmbedding<T, B>>,
+        rope: Option<&RotaryEmbedding<f32, B>>,
         offset: usize,
         kv_cache: &mut KvCacheState<T, B>,
     ) -> Result<Tensor<T, B>> {
@@ -322,8 +322,22 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
 
         // Apply rotary embeddings
         let (q, k) = if let Some(rope) = rope {
+            let q_shape = q.shape();
+            let q_data = q.to_vec()?;
+            let q_data = q_data.iter().map(|&x| x.to_f32()).collect();
+            let q = Tensor::from_vec(q_data, q.shape(), q.device())?;
+            let k_shape = k.shape();
+            let k_data = k.to_vec()?;
+            let k_data = k_data.iter().map(|&x| x.to_f32()).collect();
+            let k = Tensor::from_vec(k_data, k.shape(), k.device())?;
             let q = q.rope_i(&rope.cos, &rope.sin, offset)?;
             let k = k.rope_i(&rope.cos, &rope.sin, offset)?;
+            let q_data = q.to_vec()?;
+            let q_data = q_data.iter().map(|&x| T::from_f32(x)).collect();
+            let q = Tensor::from_vec(q_data, q_shape, q.device())?;
+            let k_data = k.to_vec()?;
+            let k_data = k_data.iter().map(|&x| T::from_f32(x)).collect();
+            let k = Tensor::from_vec(k_data, k_shape, k.device())?;
             (q, k)
         } else {
             (q, k)
@@ -433,7 +447,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
     fn forward(
         &self,
         xs: &Tensor<T, B>,
-        rope: Option<&RotaryEmbedding<T, B>>,
+        rope: Option<&RotaryEmbedding<f32, B>>,
         offset: usize,
         kv_cache: &mut KvCacheState<T, B>,
     ) -> Result<Tensor<T, B>> {
@@ -459,7 +473,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
 
 struct StreamingTransformer<T: WithDTypeF, B: Backend> {
     layers: Vec<StreamingTransformerLayer<T, B>>,
-    rope: Option<RotaryEmbedding<T, B>>,
+    rope: Option<RotaryEmbedding<f32, B>>,
 }
 
 impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {

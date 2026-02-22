@@ -1,7 +1,7 @@
 use crate::batched_transformer::{self as bt, BatchedTransformerState};
 use crate::streaming::StreamMask;
 use crate::transformer::{self, Config as TransformerConfig, Norm};
-use xn::nn::{Embedding, Linear, var_builder::Path};
+use xn::nn::{var_builder::Path, Embedding, Linear};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
@@ -219,6 +219,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         mask: &StreamMask,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
         // Text embedding: forward gives (batch, d_model), unsqueeze to (batch, 1, d_model)
+        let mut all_toks = vec![];
         let mut emb = match text_ids {
             Some(ids) => {
                 let ids_t = Tensor::from_vec(
@@ -226,6 +227,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
                     ids.len(),
                     self.device(),
                 )?;
+                all_toks.push(ids[0]);
                 self.text_emb.forward(&ids_t)?.unsqueeze(1)?
             }
             None => {
@@ -244,9 +246,11 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
                     self.device(),
                 )?;
                 let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
+                all_toks.push(ids[0]);
                 emb = emb.add(&e)?;
             }
         }
+        println!("{:?}", all_toks);
 
         // Transformer
         let ys = self
@@ -254,6 +258,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
             .forward(&emb, &mut state.transformer, mask)?;
         let ys = self.out_norm.forward(&ys)?;
         let logits = self.text_linear.forward(&ys)?;
+        println!("TL\n{logits}");
         Ok((logits, ys))
     }
 

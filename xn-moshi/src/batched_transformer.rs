@@ -1,7 +1,7 @@
 use crate::streaming::{StreamMask, StreamTensor};
 use crate::transformer::{Config, LayerScale, Mlp, Norm, PositionalEmbedding};
 use xn::models::kv_cache::{IndicesAndMask, ScatteredCacheBuilder, ScatteredKvCache};
-use xn::nn::{Linear, var_builder::Path};
+use xn::nn::{var_builder::Path, Linear};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
@@ -35,28 +35,28 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerState<T, B> {
 // Rotary Embeddings (per-batch positions)
 // ============================================================================
 
-struct RotaryEmbedding<T: WithDTypeF, B: Backend> {
-    inv_freq: Tensor<T, B>, // (1, 1, half_dim)
+struct RotaryEmbedding<B: Backend> {
+    inv_freq: Tensor<f32, B>, // (1, 1, half_dim)
 }
 
 /// Precomputed cos/sin for a specific forward pass.
-struct Rope<T: WithDTypeF, B: Backend> {
-    cos: Tensor<T, B>, // (batch, t, half_dim)
-    sin: Tensor<T, B>, // (batch, t, half_dim)
+struct Rope<B: Backend> {
+    cos: Tensor<f32, B>, // (batch, t, half_dim)
+    sin: Tensor<f32, B>, // (batch, t, half_dim)
 }
 
-impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
+impl<B: Backend> RotaryEmbedding<B> {
     fn new(head_dim: usize, max_period: f32, device: &B) -> Result<Self> {
         let half_dim = head_dim / 2;
-        let inv_freq: Vec<T> = (0..half_dim)
-            .map(|i| T::from_f32(1.0 / max_period.powf(i as f32 / half_dim as f32)))
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| 1.0 / max_period.powf(i as f32 / half_dim as f32))
             .collect();
         let inv_freq = Tensor::from_vec(inv_freq, (1, 1, half_dim), device)?;
         Ok(Self { inv_freq })
     }
 
     /// Compute per-batch rope from a positions tensor of shape (batch, t).
-    fn rope(&self, pos: &Tensor<T, B>) -> Result<Rope<T, B>> {
+    fn rope(&self, pos: &Tensor<f32, B>) -> Result<Rope<B>> {
         // pos: (batch, t) -> unsqueeze to (batch, t, 1)
         let pos = pos.unsqueeze(2)?;
         // inv_freq: (1, 1, half_dim)
@@ -69,12 +69,16 @@ impl<T: WithDTypeF, B: Backend> RotaryEmbedding<T, B> {
     }
 }
 
-impl<T: WithDTypeF, B: Backend> Rope<T, B> {
+impl<B: Backend> Rope<B> {
     /// Apply rotary embeddings to x of shape (b, h, t, d) using interleaved pairs.
-    fn apply_rotary_emb(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    fn apply_rotary_emb<T: WithDTypeF>(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let dims = x.dims();
         let (b, h, t, d) = (dims[0], dims[1], dims[2], dims[3]);
         let half_d = d / 2;
+
+        let x_data = x.to_vec()?;
+        let x_data = x_data.iter().map(|&v| v.to_f32()).collect::<Vec<f32>>();
+        let x = Tensor::from_vec(x_data, (b, h, t, d), x.device())?;
 
         // Reshape to (b, h, t, half_d, 2)
         let x = x.clone().reshape((b, h, t, half_d, 2))?;
@@ -95,7 +99,11 @@ impl<T: WithDTypeF, B: Backend> Rope<T, B> {
 
         // Stack on dim 4 to get (b, h, t, half_d, 2), then reshape to (b, h, t, d)
         let rope = Tensor::stack(&[&y0, &y1], 4)?;
-        rope.reshape((b, h, t, d))
+        let res = rope.reshape((b, h, t, d))?;
+        let res_data = res.to_vec()?;
+        let res_data = res_data.iter().map(|&v| T::from_f32(v)).collect::<Vec<T>>();
+        let res = Tensor::from_vec(res_data, (b, h, t, d), res.device())?;
+        Ok(res)
     }
 }
 
@@ -143,7 +151,7 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
     fn forward(
         &self,
         xs: &Tensor<T, B>,
-        rope: Option<&Rope<T, B>>,
+        rope: Option<&Rope<B>>,
         kv_cache: &mut ScatteredKvCache<T, B>,
         iam: &IndicesAndMask<T, B>,
     ) -> Result<Tensor<T, B>> {
@@ -269,7 +277,7 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
     fn forward(
         &self,
         xs: &Tensor<T, B>,
-        rope: Option<&Rope<T, B>>,
+        rope: Option<&Rope<B>>,
         kv_cache: &mut ScatteredKvCache<T, B>,
         iam: &IndicesAndMask<T, B>,
     ) -> Result<Tensor<T, B>> {
@@ -296,7 +304,7 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
 
 pub struct BatchedTransformer<T: WithDTypeF, B: Backend> {
     layers: Vec<BatchedTransformerLayer<T, B>>,
-    rope: Option<RotaryEmbedding<T, B>>,
+    rope: Option<RotaryEmbedding<B>>,
     positional_embedding: PositionalEmbedding,
     num_kv: usize,
     head_dim: usize,
@@ -374,18 +382,18 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
         };
 
         // Save positions BEFORE indices_and_mask updates them (fixes off-by-t bug in reference).
-        let positions: Vec<Vec<T>> = state
+        let positions: Vec<Vec<f32>> = state
             .builder
             .positions()
             .iter()
-            .map(|&v| (0..t).map(|i| T::from_f32((v + i) as f32)).collect())
+            .map(|&v| (0..t).map(|i| f32::from_f32((v + i) as f32)).collect())
             .collect();
 
         let iam = state.builder.indices_and_mask(t, batch_mask)?;
 
         let rope = match &self.rope {
             Some(rope) => {
-                let pos_flat: Vec<T> = positions.into_iter().flatten().collect();
+                let pos_flat: Vec<f32> = positions.into_iter().flatten().collect();
                 let pos = Tensor::from_vec(pos_flat, (b, t), xs.device())?;
                 Some(rope.rope(&pos)?)
             }
