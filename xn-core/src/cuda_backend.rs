@@ -722,6 +722,7 @@ impl crate::Backend for Device {
         let bh = (b * h) as u32;
         let td = (t * d) as u32;
         let d_u32 = d as u32;
+        let stride_b = 0u32;
         // The kernel processes bh * td / 2 elements (each thread handles 2 elements)
         let cfg = LaunchConfig::for_num_elems(bh * td / 2);
 
@@ -739,6 +740,7 @@ impl crate::Backend for Device {
         launch_args.arg(&bh);
         launch_args.arg(&td);
         launch_args.arg(&d_u32);
+        launch_args.arg(&stride_b);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -758,6 +760,7 @@ impl crate::Backend for Device {
         let func = dst.device.get_func(&kname, PTXModule::Rope)?;
         let bh = (b * h) as u32;
         let td = (t * d) as u32;
+        let stride_b = 0u32;
         // The kernel processes bh * td / 2 elements (each thread handles 2 elements)
         let cfg = LaunchConfig::for_num_elems(bh * td / 2);
 
@@ -774,6 +777,7 @@ impl crate::Backend for Device {
         launch_args.arg(&mut dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&td);
+        launch_args.arg(&stride_b);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
