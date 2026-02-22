@@ -6,6 +6,7 @@ template<typename T, typename I>
 __device__ void index_select(
     const int32_t numel,
     const int32_t dim,
+    const int32_t src_dim_size,
     const I *ids,
     const T *src,
     T *dst
@@ -15,6 +16,7 @@ __device__ void index_select(
     if (i >= numel || j >= dim) {
       return;
     }
+    assert(ids[i] >= 0 && ids[i] < src_dim_size);
     dst[i * dim + j] = src[ids[i] * dim + j];
 }
 
@@ -22,10 +24,11 @@ __device__ void index_select(
 extern "C" __global__ void FN_NAME(  \
     const int32_t numel,  \
     const int32_t dim, \
+    const int32_t src_dim_size, \
     const INDEX_TYPENAME *ids, \
     const TYPENAME *src, \
     TYPENAME *dst \
-) { index_select(numel, dim, ids, src, dst); } \
+) { index_select(numel, dim, src_dim_size, ids, src, dst); } \
 
 #if __CUDA_ARCH__ >= 800
 IS_OP(__nv_bfloat16, int64_t, is_i64_bf16);

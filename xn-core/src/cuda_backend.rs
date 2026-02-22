@@ -955,6 +955,7 @@ impl crate::Backend for Device {
         let ids_len_i32 = ids.len() as i32;
         let right_size_i32 = right_size as i32;
         let src_dim_size = dims[dim];
+        let src_dim_size_i32 = src_dim_size as i32;
 
         for left in 0..left_size {
             let src_offset = left * src_dim_size * right_size;
@@ -965,6 +966,7 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&ids_len_i32);
             launch_args.arg(&right_size_i32);
+            launch_args.arg(&src_dim_size_i32);
             launch_args.arg(&ids.data);
             launch_args.arg(&src_slice);
             launch_args.arg(&mut dst_slice);
