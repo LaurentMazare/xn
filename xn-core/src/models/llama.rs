@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
 use crate::nn::var_builder::Path;
-use crate::nn::{Linear, RmsNorm};
+use crate::nn::{Embedding, Linear, RmsNorm};
 use crate::{Backend, Result, Tensor, WithDTypeF};
 
 #[derive(Debug, Clone)]
@@ -321,7 +321,7 @@ impl<T: WithDTypeF, B: Backend> TransformerBlock<T, B> {
 }
 
 pub struct Llama<T: WithDTypeF, B: Backend> {
-    embed_tokens: Tensor<T, B>,
+    embed_tokens: Embedding<T, B>,
     layers: Vec<TransformerBlock<T, B>>,
     norm: RmsNorm<T, B>,
     lm_head: Linear<T, B>,
@@ -335,7 +335,7 @@ pub struct KvCache<T: WithDTypeF, B: Backend> {
 
 impl<T: WithDTypeF, B: Backend> Llama<T, B> {
     pub fn new(
-        embed_tokens: Tensor<T, B>,
+        embed_tokens: Embedding<T, B>,
         layers: Vec<TransformerBlock<T, B>>,
         norm: RmsNorm<T, B>,
         lm_head: Linear<T, B>,
@@ -349,7 +349,7 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
         let model = vb.pp("model");
 
         let embed_tokens =
-            model.tensor("embed_tokens.weight", (config.vocab_size, config.hidden_size))?;
+            Embedding::load(model.pp("embed_tokens"), config.vocab_size, config.hidden_size)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -361,7 +361,7 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
         // lm_head might be tied to embed_tokens in some models
         let lm_head = match vb.get_tensor("lm_head.weight") {
             Some(_) => Linear::load(vb.pp("lm_head"), config.hidden_size, config.vocab_size)?,
-            None => Linear::new(embed_tokens.clone()),
+            None => Linear::new(embed_tokens.embeddings().clone()),
         };
 
         let (cos_cache, sin_cache) = precompute_freqs_cis(
@@ -387,7 +387,7 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
             tokens.len(),
             self.embed_tokens.device(),
         )?;
-        let mut x = self.embed_tokens.index_select(&token_ids, 0)?;
+        let mut x = self.embed_tokens.forward(&token_ids)?;
         x = x.reshape((1, tokens.len(), ()))?;
 
         // Run through transformer layers
