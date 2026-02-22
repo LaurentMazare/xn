@@ -978,3 +978,118 @@ fn test_matmul_transposed_view_impl<B: Backend>(dev: &B) -> Result<()> {
     Ok(())
 }
 test_both_backends!(test_matmul_transposed_view, test_matmul_transposed_view_impl);
+
+// =============================================================================
+// to (dtype cast) tests
+// =============================================================================
+
+fn test_to_f32_to_f16_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<f32, B> = Tensor::from_vec(vec![1.0, 2.5, -3.0, 0.0], (2, 2), dev)?;
+    let b: Tensor<half::f16, B> = a.to()?;
+    assert_eq!(b.dims(), &[2, 2]);
+    let result: Vec<f32> = b.to_vec()?.iter().map(|v| v.to_f32()).collect();
+    assert_eq!(result, vec![1.0, 2.5, -3.0, 0.0]);
+    Ok(())
+}
+test_both_backends!(test_to_f32_to_f16, test_to_f32_to_f16_impl);
+
+fn test_to_f16_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
+    let data: Vec<half::f16> =
+        vec![1.0, 2.5, -3.0, 0.0].into_iter().map(half::f16::from_f32).collect();
+    let a: Tensor<half::f16, B> = Tensor::from_vec(data, (4,), dev)?;
+    let b: Tensor<f32, B> = a.to()?;
+    assert_eq!(b.dims(), &[4]);
+    assert_eq!(b.to_vec()?, vec![1.0, 2.5, -3.0, 0.0]);
+    Ok(())
+}
+test_both_backends!(test_to_f16_to_f32, test_to_f16_to_f32_impl);
+
+fn test_to_f32_to_bf16_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<f32, B> = Tensor::from_vec(vec![1.0, -0.5, 100.0], (3,), dev)?;
+    let b: Tensor<half::bf16, B> = a.to()?;
+    let result: Vec<f32> = b.to_vec()?.iter().map(|v| v.to_f32()).collect();
+    assert_eq!(result, vec![1.0, -0.5, 100.0]);
+    Ok(())
+}
+test_both_backends!(test_to_f32_to_bf16, test_to_f32_to_bf16_impl);
+
+fn test_to_bf16_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
+    let data: Vec<half::bf16> =
+        vec![1.0, -0.5, 100.0].into_iter().map(half::bf16::from_f32).collect();
+    let a: Tensor<half::bf16, B> = Tensor::from_vec(data, (3,), dev)?;
+    let b: Tensor<f32, B> = a.to()?;
+    assert_eq!(b.to_vec()?, vec![1.0, -0.5, 100.0]);
+    Ok(())
+}
+test_both_backends!(test_to_bf16_to_f32, test_to_bf16_to_f32_impl);
+
+fn test_to_f16_to_bf16_impl<B: Backend>(dev: &B) -> Result<()> {
+    let data: Vec<half::f16> = vec![1.0, 2.0, -3.0].into_iter().map(half::f16::from_f32).collect();
+    let a: Tensor<half::f16, B> = Tensor::from_vec(data, (3,), dev)?;
+    let b: Tensor<half::bf16, B> = a.to()?;
+    let result: Vec<f32> = b.to_vec()?.iter().map(|v| v.to_f32()).collect();
+    assert_eq!(result, vec![1.0, 2.0, -3.0]);
+    Ok(())
+}
+test_both_backends!(test_to_f16_to_bf16, test_to_f16_to_bf16_impl);
+
+fn test_to_f32_to_i64_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<f32, B> = Tensor::from_vec(vec![1.9, -2.1, 0.0, 42.0], (4,), dev)?;
+    let b: Tensor<i64, B> = a.to()?;
+    assert_eq!(b.to_vec()?, vec![1i64, -2, 0, 42]);
+    Ok(())
+}
+test_both_backends!(test_to_f32_to_i64, test_to_f32_to_i64_impl);
+
+fn test_to_i64_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<i64, B> = Tensor::from_vec(vec![1, -2, 0, 42], (4,), dev)?;
+    let b: Tensor<f32, B> = a.to()?;
+    assert_eq!(b.to_vec()?, vec![1.0, -2.0, 0.0, 42.0]);
+    Ok(())
+}
+test_both_backends!(test_to_i64_to_f32, test_to_i64_to_f32_impl);
+
+fn test_to_f32_to_u8_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<f32, B> = Tensor::from_vec(vec![0.0, 1.0, 127.0, 255.0], (4,), dev)?;
+    let b: Tensor<u8, B> = a.to()?;
+    assert_eq!(b.to_vec()?, vec![0u8, 1, 127, 255]);
+    Ok(())
+}
+test_both_backends!(test_to_f32_to_u8, test_to_f32_to_u8_impl);
+
+fn test_to_u8_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<u8, B> = Tensor::from_vec(vec![0, 1, 127, 255], (4,), dev)?;
+    let b: Tensor<f32, B> = a.to()?;
+    assert_eq!(b.to_vec()?, vec![0.0, 1.0, 127.0, 255.0]);
+    Ok(())
+}
+test_both_backends!(test_to_u8_to_f32, test_to_u8_to_f32_impl);
+
+fn test_to_i64_to_u8_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<i64, B> = Tensor::from_vec(vec![0, 1, 127, 255], (4,), dev)?;
+    let b: Tensor<u8, B> = a.to()?;
+    assert_eq!(b.to_vec()?, vec![0u8, 1, 127, 255]);
+    Ok(())
+}
+test_both_backends!(test_to_i64_to_u8, test_to_i64_to_u8_impl);
+
+fn test_to_same_dtype_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<f32, B> = Tensor::from_vec(vec![1.0, 2.0, 3.0], (3,), dev)?;
+    let b: Tensor<f32, B> = a.to()?;
+    assert_eq!(b.to_vec()?, vec![1.0, 2.0, 3.0]);
+    Ok(())
+}
+test_both_backends!(test_to_same_dtype, test_to_same_dtype_impl);
+
+fn test_to_preserves_shape_impl<B: Backend>(dev: &B) -> Result<()> {
+    let a: Tensor<f32, B> = Tensor::from_vec((1..=24).map(|v| v as f32).collect(), (2, 3, 4), dev)?;
+    let b: Tensor<half::f16, B> = a.to()?;
+    assert_eq!(b.dims(), &[2, 3, 4]);
+    assert_eq!(b.elem_count(), 24);
+    // Verify first and last values roundtrip.
+    let result: Vec<f32> = b.to_vec()?.iter().map(|v| v.to_f32()).collect();
+    assert_eq!(result[0], 1.0);
+    assert_eq!(result[23], 24.0);
+    Ok(())
+}
+test_both_backends!(test_to_preserves_shape, test_to_preserves_shape_impl);

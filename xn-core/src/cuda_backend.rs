@@ -469,6 +469,22 @@ impl crate::Backend for Device {
         Ok(())
     }
 
+    fn to_dtype<T: WithDType, U: WithDType>(
+        dst: &mut Self::Storage<U>,
+        src: &Self::Storage<T>,
+        len: usize,
+    ) -> Result<()> {
+        let kname = format!("cast_{}_{}", T::DTYPE.cuda_name(), U::DTYPE.cuda_name());
+        let func = dst.device.get_func(&kname, PTXModule::Arithmetic)?;
+        let cfg = LaunchConfig::for_num_elems(len as u32);
+        let mut launch_args = dst.device.stream.launch_builder(&func);
+        launch_args.arg(&len);
+        launch_args.arg(&src.data);
+        launch_args.arg(&mut dst.data);
+        unsafe { launch_args.launch(cfg) }?;
+        Ok(())
+    }
+
     fn data<T: WithDType>(src: &Self::Storage<T>, len: usize) -> Result<std::borrow::Cow<'_, [T]>> {
         let data = src.device.stream.clone_dtoh(&src.data.slice(..len))?;
         Ok(std::borrow::Cow::Owned(data))

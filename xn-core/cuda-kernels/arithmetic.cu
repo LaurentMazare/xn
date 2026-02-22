@@ -510,3 +510,77 @@ ALL_OPS(__half, f16)
 ALL_OPS(float, f32)
 ALL_OPS(double, f64)
 
+// ============================================================================
+// Cast operations (dtype conversion: dst = convert(src))
+// ============================================================================
+
+// Extend to_float/from_float for integer types.
+template<> __device__ __forceinline__ float to_float(int64_t v) { return (float)v; }
+template<> __device__ __forceinline__ float to_float(uint8_t v) { return (float)v; }
+template<> __device__ __forceinline__ int64_t from_float<int64_t>(float v) { return (int64_t)v; }
+template<> __device__ __forceinline__ uint8_t from_float<uint8_t>(float v) { return (uint8_t)v; }
+
+template<typename S, typename D>
+__device__ void cast_op(const size_t numel, const S* src, D* dst) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    dst[idx] = from_float<D>(to_float(src[idx]));
+}
+
+// Same-type cast (direct copy).
+template<typename T>
+__device__ void cast_copy(const size_t numel, const T* src, T* dst) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    dst[idx] = src[idx];
+}
+
+#define CAST_OP(SRC_TYPE, SRC_NAME, DST_TYPE, DST_NAME) \
+  extern "C" __global__ void cast_##SRC_NAME##_##DST_NAME( \
+      const size_t numel, const SRC_TYPE *src, DST_TYPE *dst) { \
+    cast_op<SRC_TYPE, DST_TYPE>(numel, src, dst); \
+  }
+
+#define CAST_SAME(TYPE, NAME) \
+  extern "C" __global__ void cast_##NAME##_##NAME( \
+      const size_t numel, const TYPE *src, TYPE *dst) { \
+    cast_copy<TYPE>(numel, src, dst); \
+  }
+
+// Same-type casts (identity copy).
+CAST_SAME(float, f32)
+CAST_SAME(int64_t, i64)
+CAST_SAME(uint8_t, u8)
+
+// Casts between f32, i64, u8 (no arch requirements).
+CAST_OP(float, f32, int64_t, i64)
+CAST_OP(float, f32, uint8_t, u8)
+CAST_OP(int64_t, i64, float, f32)
+CAST_OP(int64_t, i64, uint8_t, u8)
+CAST_OP(uint8_t, u8, float, f32)
+CAST_OP(uint8_t, u8, int64_t, i64)
+
+#if __CUDA_ARCH__ >= 530
+// f16 casts.
+CAST_SAME(__half, f16)
+CAST_OP(__half, f16, float, f32)
+CAST_OP(__half, f16, int64_t, i64)
+CAST_OP(__half, f16, uint8_t, u8)
+CAST_OP(float, f32, __half, f16)
+CAST_OP(int64_t, i64, __half, f16)
+CAST_OP(uint8_t, u8, __half, f16)
+#endif
+
+#if __CUDA_ARCH__ >= 800
+// bf16 casts.
+CAST_SAME(__nv_bfloat16, bf16)
+CAST_OP(__nv_bfloat16, bf16, float, f32)
+CAST_OP(__nv_bfloat16, bf16, __half, f16)
+CAST_OP(__nv_bfloat16, bf16, int64_t, i64)
+CAST_OP(__nv_bfloat16, bf16, uint8_t, u8)
+CAST_OP(float, f32, __nv_bfloat16, bf16)
+CAST_OP(__half, f16, __nv_bfloat16, bf16)
+CAST_OP(int64_t, i64, __nv_bfloat16, bf16)
+CAST_OP(uint8_t, u8, __nv_bfloat16, bf16)
+#endif
+

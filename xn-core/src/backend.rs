@@ -36,6 +36,12 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         len: usize,
     ) -> Result<()>;
 
+    fn to_dtype<T: crate::WithDType, U: crate::WithDType>(
+        dst: &mut Self::Storage<U>,
+        src: &Self::Storage<T>,
+        len: usize,
+    ) -> Result<()>;
+
     fn data<T: crate::WithDType>(
         src: &Self::Storage<T>,
         len: usize,

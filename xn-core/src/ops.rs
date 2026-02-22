@@ -116,6 +116,13 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
         Ok(result)
     }
 
+    /// Cast tensor to a different dtype.
+    pub fn to<U: WithDType>(&self) -> Result<Tensor<U, B>> {
+        let result = unsafe { Tensor::alloc_uninit(self.shape.clone(), self.device()) }?;
+        result.to_dtype_(self)?;
+        Ok(result)
+    }
+
     /// Flatten all dimensions into a single dimension.
     pub fn flatten_all(&self) -> Result<Self> {
         self.reshape(vec![self.elem_count()])

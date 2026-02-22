@@ -122,6 +122,15 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
     binary_op!(inplace_maximum, maximum_, broadcast_maximum_, Maximum);
     binary_op!(inplace_minimum, minimum_, broadcast_minimum_, Minimum);
 
+    pub fn to_dtype_<U: WithDType>(&self, src: &Tensor<U, B>) -> Result<()> {
+        check_same_shape(&self.shape, &src.shape, "to_dtype")?;
+        let len = self.elem_count();
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        B::to_dtype(&mut *dst, &*src_data, len)?;
+        Ok(())
+    }
+
     pub fn transpose_(&self, src: &Self, dim1: usize, dim2: usize) -> Result<()> {
         let dims = src.dims();
         let len = self.elem_count();

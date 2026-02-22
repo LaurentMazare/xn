@@ -1,5 +1,8 @@
-use crate::{BinaryOp, Result, UnaryOp, WithDType, WithDTypeF};
+use crate::error::Context;
+use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
+use half::{bf16, f16};
 use rayon::prelude::*;
+use std::any::Any;
 
 const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
@@ -348,6 +351,63 @@ impl crate::Backend for crate::CpuDevice {
         l: usize,
     ) -> Result<()> {
         dst[..l].copy_from_slice(&src[..l]);
+        Ok(())
+    }
+
+    fn to_dtype<T: WithDType, U: WithDType>(
+        dst: &mut Self::Storage<U>,
+        src: &Self::Storage<T>,
+        len: usize,
+    ) -> Result<()> {
+        let src_any: &dyn Any = src;
+        let dst_any: &mut dyn Any = dst;
+        macro_rules! cast {
+            ($src_ty:ty, $dst_ty:ty, |$v:ident| $conv:expr) => {{
+                let src = src_any
+                    .downcast_ref::<Vec<$src_ty>>()
+                    .context("to_dtype src downcast failed")?;
+                let dst = dst_any
+                    .downcast_mut::<Vec<$dst_ty>>()
+                    .context("to_dtype dst downcast failed")?;
+                for (d, s) in dst[..len].iter_mut().zip(src[..len].iter()) {
+                    let $v = *s;
+                    *d = $conv;
+                }
+            }};
+        }
+        use DType::*;
+        match (T::DTYPE, U::DTYPE) {
+            // same type
+            (F16, F16) => cast!(f16, f16, |v| v),
+            (BF16, BF16) => cast!(bf16, bf16, |v| v),
+            (F32, F32) => cast!(f32, f32, |v| v),
+            (I64, I64) => cast!(i64, i64, |v| v),
+            (U8, U8) => cast!(u8, u8, |v| v),
+            // float <-> float
+            (F32, F16) => cast!(f32, f16, |v| f16::from_f32(v)),
+            (F32, BF16) => cast!(f32, bf16, |v| bf16::from_f32(v)),
+            (F16, F32) => cast!(f16, f32, |v| v.to_f32()),
+            (BF16, F32) => cast!(bf16, f32, |v| v.to_f32()),
+            (F16, BF16) => cast!(f16, bf16, |v| bf16::from_f32(v.to_f32())),
+            (BF16, F16) => cast!(bf16, f16, |v| f16::from_f32(v.to_f32())),
+            // float -> int
+            (F32, I64) => cast!(f32, i64, |v| v as i64),
+            (F32, U8) => cast!(f32, u8, |v| v as u8),
+            (F16, I64) => cast!(f16, i64, |v| v.to_f32() as i64),
+            (F16, U8) => cast!(f16, u8, |v| v.to_f32() as u8),
+            (BF16, I64) => cast!(bf16, i64, |v| v.to_f32() as i64),
+            (BF16, U8) => cast!(bf16, u8, |v| v.to_f32() as u8),
+            // int -> float
+            (I64, F32) => cast!(i64, f32, |v| v as f32),
+            (I64, F16) => cast!(i64, f16, |v| f16::from_f32(v as f32)),
+            (I64, BF16) => cast!(i64, bf16, |v| bf16::from_f32(v as f32)),
+            (U8, F32) => cast!(u8, f32, |v| v as f32),
+            (U8, F16) => cast!(u8, f16, |v| f16::from_f32(v as f32)),
+            (U8, BF16) => cast!(u8, bf16, |v| bf16::from_f32(v as f32)),
+            // int <-> int
+            (I64, U8) => cast!(i64, u8, |v| v as u8),
+            (U8, I64) => cast!(u8, i64, |v| v as i64),
+        }
         Ok(())
     }
 
