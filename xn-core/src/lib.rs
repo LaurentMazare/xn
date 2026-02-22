@@ -60,3 +60,16 @@ pub fn with_simd128() -> bool {
 pub fn with_f16c() -> bool {
     cfg!(target_feature = "f16c")
 }
+
+pub trait Module {
+    fn forward<T: WithDType, B: Backend>(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>>;
+}
+
+impl<M: Module> Module for Option<&M> {
+    fn forward<T: WithDType, B: Backend>(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        match self {
+            None => Ok(xs.clone()),
+            Some(m) => m.forward(xs),
+        }
+    }
+}

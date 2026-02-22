@@ -510,4 +510,8 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
         B::scatter_set(&mut dst_data, &*src_data, &*ids_data, dim, self.dims(), source.dims())?;
         Ok(())
     }
+
+    pub fn apply<M: crate::Module>(&self, m: &M) -> Result<Self> {
+        m.forward(self)
+    }
 }

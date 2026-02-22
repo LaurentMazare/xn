@@ -1,7 +1,7 @@
 use crate::batched_transformer::{self as bt, BatchedTransformerState};
 use crate::streaming::StreamMask;
 use crate::transformer::{self, Config as TransformerConfig, Norm};
-use xn::nn::{Linear, var_builder::Path};
+use xn::nn::{var_builder::Path, Embedding, Linear};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
@@ -139,9 +139,9 @@ pub struct LmState<T: WithDTypeF, B: Backend> {
 
 pub struct LmModel<T: WithDTypeF, B: Backend> {
     transformer: bt::BatchedTransformer<T, B>,
-    text_emb: Tensor<T, B>,        // (text_in_vocab_size, d_model)
-    audio_embs: Vec<Tensor<T, B>>, // each (audio_vocab_size, d_model)
-    text_linear: Linear<T, B>,     // (text_out_vocab_size, d_model)
+    text_emb: Embedding<T, B>,        // (text_in_vocab_size, d_model)
+    audio_embs: Vec<Embedding<T, B>>, // each (audio_vocab_size, d_model)
+    text_linear: Linear<T, B>,        // (text_out_vocab_size, d_model)
     out_norm: Norm<T, B>,
     extra_heads: Vec<Linear<T, B>>, // each (dim, d_model)
     audio_vocab_size: usize,
@@ -152,9 +152,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
     pub fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
         let d_model = cfg.transformer.d_model;
 
-        let text_emb = vb
-            .pp("text_emb")
-            .tensor("weight", (cfg.text_in_vocab_size, d_model))?;
+        let text_emb = Embedding::load(vb.pp("text_emb"), cfg.text_in_vocab_size, d_model)?;
         let out_norm = Norm::load(vb.pp("out_norm"), d_model, cfg.transformer.norm)?;
         let text_linear = Linear::load(vb.pp("text_linear"), d_model, cfg.text_out_vocab_size)?;
 
@@ -163,9 +161,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         let vb_e = vb.pp("emb");
         let mut audio_embs = Vec::with_capacity(cfg.audio_codebooks);
         for i in 0..cfg.audio_codebooks {
-            let emb = vb_e
-                .pp(i)
-                .tensor("weight", (cfg.audio_vocab_size, d_model))?;
+            let emb = Embedding::load(vb_e.pp(i), cfg.audio_vocab_size, d_model)?;
             audio_embs.push(emb);
         }
 
@@ -222,7 +218,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         state: &mut LmState<T, B>,
         mask: &StreamMask,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
-        // Text embedding: index_select gives (batch, d_model), unsqueeze to (batch, 1, d_model)
+        // Text embedding: forward gives (batch, d_model), unsqueeze to (batch, 1, d_model)
         let mut emb = match text_ids {
             Some(ids) => {
                 let ids_t = Tensor::from_vec(
@@ -230,10 +226,10 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
                     ids.len(),
                     self.device(),
                 )?;
-                self.text_emb.index_select(&ids_t, 0)?.unsqueeze(1)?
+                self.text_emb.forward(&ids_t)?.unsqueeze(1)?
             }
             None => {
-                let d_model = self.text_emb.dims()[1];
+                let d_model = self.text_emb.hidden_size();
                 let batch_size = state.transformer.batch_size();
                 Tensor::zeros((batch_size, 1, d_model), self.device())?
             }
@@ -247,7 +243,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
                     ids.len(),
                     self.device(),
                 )?;
-                let e = audio_emb.index_select(&ids_t, 0)?.unsqueeze(1)?;
+                let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
                 emb = emb.add(&e)?;
             }
         }
