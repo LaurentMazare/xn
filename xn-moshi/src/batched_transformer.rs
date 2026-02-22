@@ -128,7 +128,7 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
             None
         };
 
-        let out_proj = Linear::load_o(&vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
+        let out_proj = Linear::load_o(vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
         Ok(Self {
             in_proj_weight,
             in_proj_bias,
@@ -242,8 +242,8 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
         }
         let self_attn = BatchedMultiheadAttention::load(vb, cfg)?;
         let mlp = Mlp::load(vb, cfg)?;
-        let norm1 = Norm::load(&vb.pp("norm1"), cfg.d_model, cfg.norm)?;
-        let norm2 = Norm::load(&vb.pp("norm2"), cfg.d_model, cfg.norm)?;
+        let norm1 = Norm::load(vb.pp("norm1"), cfg.d_model, cfg.norm)?;
+        let norm2 = Norm::load(vb.pp("norm2"), cfg.d_model, cfg.norm)?;
 
         let layer_scale_1 = if cfg.layer_scale.is_some() {
             Some(LayerScale::load(&vb.pp("layer_scale_1"), cfg.d_model)?)
@@ -418,13 +418,13 @@ pub struct BatchedProjectedTransformer<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
     pub fn load(vb: &Path<B>, input_dim: usize, cfg: &Config) -> Result<Self> {
         let input_proj = if input_dim != cfg.d_model {
-            Some(Linear::load(&vb.pp("input_proj"), input_dim, cfg.d_model)?)
+            Some(Linear::load(vb.pp("input_proj"), input_dim, cfg.d_model)?)
         } else {
             None
         };
         let output_proj = if input_dim != cfg.d_model {
             Some(Linear::load(
-                &vb.pp("output_proj").pp(0),
+                vb.pp("output_proj").pp(0),
                 cfg.d_model,
                 input_dim,
             )?)

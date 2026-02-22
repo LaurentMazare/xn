@@ -109,10 +109,10 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
         let emb_std = vb.tensor("emb_std", (cfg.ldim,))?;
         let emb_mean = vb.tensor("emb_mean", (cfg.ldim,))?;
         let bos_emb = vb.tensor("bos_emb", (cfg.ldim,))?;
-        let input_linear = Linear::load(&vb.pp("input_linear"), cfg.ldim, cfg.d_model)?;
+        let input_linear = Linear::load(vb.pp("input_linear"), cfg.ldim, cfg.d_model)?;
         let out_norm_weight = vb.pp("out_norm").tensor("weight", (cfg.d_model,))?;
         let out_norm_bias = vb.pp("out_norm").tensor("bias", (cfg.d_model,))?;
-        let out_eos = Linear::load_b(&vb.pp("out_eos"), cfg.d_model, 1)?;
+        let out_eos = Linear::load_b(vb.pp("out_eos"), cfg.d_model, 1)?;
 
         Ok(Self {
             conditioner,

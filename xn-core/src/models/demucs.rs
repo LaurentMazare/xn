@@ -451,7 +451,7 @@ impl<T: WithDTypeF, B: Backend> Blstm<T, B> {
     pub fn load(vb: &Path<B>, dim: usize, layers: usize, bidirectional: bool) -> Result<Self> {
         let inner = if bidirectional {
             let lstm = BiLstm::load(&vb.pp("lstm"), dim, dim, layers)?;
-            let linear = crate::nn::Linear::load(&vb.pp("linear"), 2 * dim, dim)?;
+            let linear = crate::nn::Linear::load(vb.pp("linear"), 2 * dim, dim)?;
             BlstmInner::Bidirectional { lstm, linear }
         } else {
             let lstm = Lstm::load(&vb.pp("lstm"), dim, dim, layers)?;

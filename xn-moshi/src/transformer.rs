@@ -142,7 +142,12 @@ pub(crate) enum Norm<T: WithDTypeF, B: Backend> {
 }
 
 impl<T: WithDTypeF, B: Backend> Norm<T, B> {
-    pub(crate) fn load(vb: &Path<B>, d_model: usize, norm_type: crate::NormType) -> Result<Self> {
+    pub(crate) fn load<V: std::borrow::Borrow<Path<B>>>(
+        vb: V,
+        d_model: usize,
+        norm_type: crate::NormType,
+    ) -> Result<Self> {
+        let vb = vb.borrow();
         match norm_type {
             crate::NormType::LayerNorm => {
                 let weight = if vb.contains("alpha") {
@@ -194,9 +199,9 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
         match cfg.gating {
             None => {
                 let linear1 =
-                    Linear::load_o(&vb.pp("linear1"), d_model, cfg.dim_feedforward, cfg.bias_ff)?;
+                    Linear::load_o(vb.pp("linear1"), d_model, cfg.dim_feedforward, cfg.bias_ff)?;
                 let linear2 =
-                    Linear::load_o(&vb.pp("linear2"), cfg.dim_feedforward, d_model, cfg.bias_ff)?;
+                    Linear::load_o(vb.pp("linear2"), cfg.dim_feedforward, d_model, cfg.bias_ff)?;
                 Ok(Self::NoGating { linear1, linear2 })
             }
             Some(activation) => {
@@ -207,9 +212,8 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
                 };
                 let vb = vb.pp("gating");
                 let linear_in =
-                    Linear::load_o(&vb.pp("linear_in"), d_model, 2 * hidden, cfg.bias_ff)?;
-                let linear_out =
-                    Linear::load_o(&vb.pp("linear_out"), hidden, d_model, cfg.bias_ff)?;
+                    Linear::load_o(vb.pp("linear_in"), d_model, 2 * hidden, cfg.bias_ff)?;
+                let linear_out = Linear::load_o(vb.pp("linear_out"), hidden, d_model, cfg.bias_ff)?;
                 Ok(Self::Gating {
                     linear_in,
                     linear_out,
@@ -274,7 +278,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
             None
         };
 
-        let out_proj = Linear::load_o(&vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
+        let out_proj = Linear::load_o(vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
         Ok(Self {
             in_proj_weight,
             in_proj_bias,
@@ -402,8 +406,8 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
         }
         let self_attn = StreamingMultiheadAttention::load(vb, cfg)?;
         let mlp = Mlp::load(vb, cfg)?;
-        let norm1 = Norm::load(&vb.pp("norm1"), cfg.d_model, cfg.norm)?;
-        let norm2 = Norm::load(&vb.pp("norm2"), cfg.d_model, cfg.norm)?;
+        let norm1 = Norm::load(vb.pp("norm1"), cfg.d_model, cfg.norm)?;
+        let norm2 = Norm::load(vb.pp("norm2"), cfg.d_model, cfg.norm)?;
 
         let layer_scale_1 = if cfg.layer_scale.is_some() {
             Some(LayerScale::load(&vb.pp("layer_scale_1"), cfg.d_model)?)
@@ -515,14 +519,14 @@ pub struct ProjectedTransformer<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
     pub fn load(vb: &Path<B>, input_dim: usize, cfg: &Config, device: &B) -> Result<Self> {
         let input_proj = if input_dim != cfg.d_model {
-            Some(Linear::load(&vb.pp("input_proj"), input_dim, cfg.d_model)?)
+            Some(Linear::load(vb.pp("input_proj"), input_dim, cfg.d_model)?)
         } else {
             None
         };
 
         let output_proj = if input_dim != cfg.d_model {
             Some(Linear::load(
-                &vb.pp("output_proj").pp(0),
+                vb.pp("output_proj").pp(0),
                 cfg.d_model,
                 input_dim,
             )?)

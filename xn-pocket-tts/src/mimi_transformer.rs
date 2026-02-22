@@ -103,8 +103,8 @@ pub struct MimiStreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
     pub fn load(vb: &Path<B>, embed_dim: usize, num_heads: usize, context: usize) -> Result<Self> {
         let out_dim = 3 * embed_dim;
-        let in_proj = Linear::load(&vb.pp("in_proj"), embed_dim, out_dim)?;
-        let out_proj = Linear::load(&vb.pp("out_proj"), embed_dim, embed_dim)?;
+        let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
+        let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
         Ok(Self { in_proj, out_proj, embed_dim, num_heads, context })
     }
 
@@ -198,10 +198,10 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
             )?),
         };
 
-        let norm1 = LayerNorm::load(&vb.pp("norm1"), d_model, 1e-5)?;
-        let norm2 = LayerNorm::load(&vb.pp("norm2"), d_model, 1e-5)?;
-        let linear1 = Linear::load(&vb.pp("linear1"), d_model, dim_feedforward)?;
-        let linear2 = Linear::load(&vb.pp("linear2"), dim_feedforward, d_model)?;
+        let norm1 = LayerNorm::load(vb.pp("norm1"), d_model, 1e-5)?;
+        let norm2 = LayerNorm::load(vb.pp("norm2"), d_model, 1e-5)?;
+        let linear1 = Linear::load(vb.pp("linear1"), d_model, dim_feedforward)?;
+        let linear2 = Linear::load(vb.pp("linear2"), dim_feedforward, d_model)?;
 
         let layer_scale_1 = if layer_scale.is_some() {
             Some(LayerScale::load(&vb.pp("layer_scale_1"), d_model)?)
@@ -367,7 +367,7 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
         )?;
 
         let input_proj = if d_model != input_dimension {
-            Some(Linear::load(&vb.pp("input_proj"), input_dimension, d_model)?)
+            Some(Linear::load(vb.pp("input_proj"), input_dimension, d_model)?)
         } else {
             None
         };
@@ -377,7 +377,7 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
             if d_model == out_dim {
                 output_projs.push(None);
             } else {
-                let proj = Linear::load(&vb.pp("output_proj").pp(i), d_model, out_dim)?;
+                let proj = Linear::load(vb.pp("output_proj").pp(i), d_model, out_dim)?;
                 output_projs.push(Some(proj));
             }
         }

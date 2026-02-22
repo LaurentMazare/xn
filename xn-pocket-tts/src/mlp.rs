@@ -22,8 +22,8 @@ pub struct TimestepEmbedder<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> TimestepEmbedder<T, B> {
     pub fn load(vb: &Path<B>, hidden_size: usize, frequency_embedding_size: usize) -> Result<Self> {
         let mlp = vb.pp("mlp");
-        let linear1 = Linear::load_b(&mlp.pp("0"), frequency_embedding_size, hidden_size)?;
-        let linear2 = Linear::load_b(&mlp.pp("2"), hidden_size, hidden_size)?;
+        let linear1 = Linear::load_b(mlp.pp("0"), frequency_embedding_size, hidden_size)?;
+        let linear2 = Linear::load_b(mlp.pp("2"), hidden_size, hidden_size)?;
 
         // This is slightly different from the python implementation which uses an unbiased
         // variance estimate whereas the op in mimi-rs uses a biased one.
@@ -70,12 +70,12 @@ pub struct ResBlock<T: WithDTypeF, B: Backend> {
 
 impl<T: WithDTypeF, B: Backend> ResBlock<T, B> {
     pub fn load(vb: &Path<B>, channels: usize) -> Result<Self> {
-        let in_ln = LayerNorm::load(&vb.pp("in_ln"), channels, 1e-6)?;
+        let in_ln = LayerNorm::load(vb.pp("in_ln"), channels, 1e-6)?;
         let mlp = vb.pp("mlp");
-        let mlp_linear1 = Linear::load_b(&mlp.pp("0"), channels, channels)?;
-        let mlp_linear2 = Linear::load_b(&mlp.pp("2"), channels, channels)?;
+        let mlp_linear1 = Linear::load_b(mlp.pp("0"), channels, channels)?;
+        let mlp_linear2 = Linear::load_b(mlp.pp("2"), channels, channels)?;
         let ada = vb.pp("adaLN_modulation");
-        let ada_ln_silu_linear = Linear::load_b(&ada.pp("1"), channels, 3 * channels)?;
+        let ada_ln_silu_linear = Linear::load_b(ada.pp("1"), channels, 3 * channels)?;
         Ok(Self { in_ln, mlp_linear1, mlp_linear2, ada_ln_silu_linear })
     }
 
@@ -112,9 +112,9 @@ impl<T: WithDTypeF, B: Backend> FinalLayer<T, B> {
         let zeros = Tensor::zeros(model_channels, vb.device())?;
         let ones = zeros.add_scalar(T::from_f32(1.0))?;
         let norm_final = LayerNorm::new(ones, zeros, 1e-6);
-        let linear = Linear::load_b(&vb.pp("linear"), model_channels, out_channels)?;
+        let linear = Linear::load_b(vb.pp("linear"), model_channels, out_channels)?;
         let ada = vb.pp("adaLN_modulation");
-        let ada_ln_silu_linear = Linear::load_b(&ada.pp("1"), model_channels, 2 * model_channels)?;
+        let ada_ln_silu_linear = Linear::load_b(ada.pp("1"), model_channels, 2 * model_channels)?;
         Ok(Self { norm_final, linear, ada_ln_silu_linear })
     }
 
@@ -160,8 +160,8 @@ impl<T: WithDTypeF, B: Backend> SimpleMLPAdaLN<T, B> {
             )?);
         }
 
-        let cond_embed = Linear::load_b(&vb.pp("cond_embed"), cond_channels, model_channels)?;
-        let input_proj = Linear::load_b(&vb.pp("input_proj"), in_channels, model_channels)?;
+        let cond_embed = Linear::load_b(vb.pp("cond_embed"), cond_channels, model_channels)?;
+        let input_proj = Linear::load_b(vb.pp("input_proj"), in_channels, model_channels)?;
 
         let mut res_blocks = Vec::new();
         for i in 0..num_res_blocks {

@@ -1,7 +1,7 @@
 use crate::batched_transformer::{self as bt, BatchedTransformerState};
 use crate::streaming::StreamMask;
 use crate::transformer::{self, Config as TransformerConfig, Norm};
-use xn::nn::var_builder::Path;
+use xn::nn::{Linear, var_builder::Path};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================
@@ -141,9 +141,9 @@ pub struct LmModel<T: WithDTypeF, B: Backend> {
     transformer: bt::BatchedTransformer<T, B>,
     text_emb: Tensor<T, B>,        // (text_in_vocab_size, d_model)
     audio_embs: Vec<Tensor<T, B>>, // each (audio_vocab_size, d_model)
-    text_linear: Tensor<T, B>,     // (text_out_vocab_size, d_model)
+    text_linear: Linear<T, B>,     // (text_out_vocab_size, d_model)
     out_norm: Norm<T, B>,
-    extra_heads: Vec<Tensor<T, B>>, // each (dim, d_model)
+    extra_heads: Vec<Linear<T, B>>, // each (dim, d_model)
     audio_vocab_size: usize,
     text_in_vocab_size: usize,
 }
@@ -155,10 +155,8 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         let text_emb = vb
             .pp("text_emb")
             .tensor("weight", (cfg.text_in_vocab_size, d_model))?;
-        let out_norm = Norm::load(&vb.pp("out_norm"), d_model, cfg.transformer.norm)?;
-        let text_linear = vb
-            .pp("text_linear")
-            .tensor("weight", (cfg.text_out_vocab_size, d_model))?;
+        let out_norm = Norm::load(vb.pp("out_norm"), d_model, cfg.transformer.norm)?;
+        let text_linear = Linear::load(vb.pp("text_linear"), d_model, cfg.text_out_vocab_size)?;
 
         let transformer = bt::BatchedTransformer::load(&vb.pp("transformer"), &cfg.transformer)?;
 
@@ -174,10 +172,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         let mut extra_heads = vec![];
         if let Some(ExtraHeadsConfig { num_heads, dim }) = &cfg.extra_heads {
             for i in 0..*num_heads {
-                let head = vb
-                    .pp("extra_heads")
-                    .pp(i)
-                    .tensor("weight", (*dim, d_model))?;
+                let head = Linear::load(vb.pp("extra_heads").pp(i), d_model, *dim)?;
                 extra_heads.push(head);
             }
         }
@@ -250,15 +245,15 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
             .transformer
             .forward(&emb, &mut state.transformer, mask)?;
         let ys = self.out_norm.forward(&ys)?;
-        let logits = ys.matmul_t(&self.text_linear)?;
+        let logits = self.text_linear.forward(&ys)?;
         Ok((logits, ys))
     }
 
     /// Compute extra head outputs from transformer output.
     pub fn extra_heads(&self, ys: &Tensor<T, B>) -> Result<Vec<Tensor<T, B>>> {
         let mut results = Vec::with_capacity(self.extra_heads.len());
-        for head_weight in &self.extra_heads {
-            results.push(ys.matmul_t(head_weight)?);
+        for head in &self.extra_heads {
+            results.push(head.forward(ys)?);
         }
         Ok(results)
     }

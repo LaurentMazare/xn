@@ -133,10 +133,10 @@ impl<T: WithDTypeF, B: Backend> Attention<T, B> {
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
 
-        let q_proj = Linear::load(&vb.pp("q_proj"), hidden_size, num_heads * head_dim)?;
-        let k_proj = Linear::load(&vb.pp("k_proj"), hidden_size, num_kv_heads * head_dim)?;
-        let v_proj = Linear::load(&vb.pp("v_proj"), hidden_size, num_kv_heads * head_dim)?;
-        let o_proj = Linear::load(&vb.pp("o_proj"), num_heads * head_dim, hidden_size)?;
+        let q_proj = Linear::load(vb.pp("q_proj"), hidden_size, num_heads * head_dim)?;
+        let k_proj = Linear::load(vb.pp("k_proj"), hidden_size, num_kv_heads * head_dim)?;
+        let v_proj = Linear::load(vb.pp("v_proj"), hidden_size, num_kv_heads * head_dim)?;
+        let o_proj = Linear::load(vb.pp("o_proj"), num_heads * head_dim, hidden_size)?;
 
         Ok(Self::new(q_proj, k_proj, v_proj, o_proj, num_heads, num_kv_heads, head_dim))
     }
@@ -245,9 +245,9 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
         let hidden_size = config.hidden_size;
         let intermediate_size = config.intermediate_size;
 
-        let gate_proj = Linear::load(&vb.pp("gate_proj"), hidden_size, intermediate_size)?;
-        let up_proj = Linear::load(&vb.pp("up_proj"), hidden_size, intermediate_size)?;
-        let down_proj = Linear::load(&vb.pp("down_proj"), intermediate_size, hidden_size)?;
+        let gate_proj = Linear::load(vb.pp("gate_proj"), hidden_size, intermediate_size)?;
+        let up_proj = Linear::load(vb.pp("up_proj"), hidden_size, intermediate_size)?;
+        let down_proj = Linear::load(vb.pp("down_proj"), intermediate_size, hidden_size)?;
 
         Ok(Self::new(gate_proj, up_proj, down_proj))
     }
@@ -284,9 +284,9 @@ impl<T: WithDTypeF, B: Backend> TransformerBlock<T, B> {
         let attn = Attention::load(&vb.pp("self_attn"), config)?;
         let mlp = Mlp::load(&vb.pp("mlp"), config)?;
         let input_layernorm =
-            RmsNorm::load(&vb.pp("input_layernorm"), config.hidden_size, config.rms_norm_eps)?;
+            RmsNorm::load(vb.pp("input_layernorm"), config.hidden_size, config.rms_norm_eps)?;
         let post_attention_layernorm = RmsNorm::load(
-            &vb.pp("post_attention_layernorm"),
+            vb.pp("post_attention_layernorm"),
             config.hidden_size,
             config.rms_norm_eps,
         )?;
@@ -354,11 +354,11 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
             layers.push(TransformerBlock::load(&model.pp(format!("layers.{i}")), config)?);
         }
 
-        let norm = RmsNorm::load(&model.pp("norm"), config.hidden_size, config.rms_norm_eps)?;
+        let norm = RmsNorm::load(model.pp("norm"), config.hidden_size, config.rms_norm_eps)?;
 
         // lm_head might be tied to embed_tokens in some models
         let lm_head = match vb.get_tensor("lm_head.weight") {
-            Some(_) => Linear::load(&vb.pp("lm_head"), config.hidden_size, config.vocab_size)?,
+            Some(_) => Linear::load(vb.pp("lm_head"), config.hidden_size, config.vocab_size)?,
             None => Linear::new(embed_tokens.clone()),
         };
 

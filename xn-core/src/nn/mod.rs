@@ -14,7 +14,8 @@ impl<T: WithDTypeF, B: Backend> RmsNorm<T, B> {
         Self { weight, eps }
     }
 
-    pub fn load(vb: &Path<B>, dim: usize, eps: f32) -> Result<Self> {
+    pub fn load<V: std::borrow::Borrow<Path<B>>>(vb: V, dim: usize, eps: f32) -> Result<Self> {
+        let vb = vb.borrow();
         let weight = vb.tensor("weight", (dim,))?;
         Ok(Self::new(weight, eps))
     }
@@ -45,7 +46,8 @@ impl<T: WithDTypeF, B: Backend> LayerNorm<T, B> {
         self
     }
 
-    pub fn load(vb: &Path<B>, dim: usize, eps: f32) -> Result<Self> {
+    pub fn load<V: std::borrow::Borrow<Path<B>>>(vb: V, dim: usize, eps: f32) -> Result<Self> {
+        let vb = vb.borrow();
         let weight = vb.tensor("weight", (dim,))?;
         let bias = vb.tensor("bias", (dim,))?;
         Ok(Self::new(weight, bias, eps))
@@ -74,23 +76,34 @@ impl<T: WithDTypeF, B: Backend> Linear<T, B> {
         Self { bias: Some(bias), ..self }
     }
 
-    pub fn load(vb: &Path<B>, in_features: usize, out_features: usize) -> Result<Self> {
+    pub fn load<V: std::borrow::Borrow<Path<B>>>(
+        vb: V,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Self> {
+        let vb = vb.borrow();
         let weight = vb.tensor("weight", (out_features, in_features))?;
         Ok(Self::new(weight))
     }
 
-    pub fn load_b(vb: &Path<B>, in_features: usize, out_features: usize) -> Result<Self> {
+    pub fn load_b<V: std::borrow::Borrow<Path<B>>>(
+        vb: V,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Self> {
+        let vb = vb.borrow();
         let weight = vb.tensor("weight", (out_features, in_features))?;
         let bias = vb.tensor("bias", (out_features,))?;
         Ok(Self::new(weight).with_bias(bias))
     }
 
-    pub fn load_o(
-        vb: &Path<B>,
+    pub fn load_o<V: std::borrow::Borrow<Path<B>>>(
+        vb: V,
         in_features: usize,
         out_features: usize,
         bias: bool,
     ) -> Result<Self> {
+        let vb = vb.borrow();
         let weight = vb.tensor("weight", (out_features, in_features))?;
         let slf = Self::new(weight);
         if bias {

@@ -64,8 +64,8 @@ pub struct StreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
 impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
     pub fn load(vb: &Path<B>, embed_dim: usize, num_heads: usize) -> Result<Self> {
         let out_dim = 3 * embed_dim;
-        let in_proj = Linear::load(&vb.pp("in_proj"), embed_dim, out_dim)?;
-        let out_proj = Linear::load(&vb.pp("out_proj"), embed_dim, embed_dim)?;
+        let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
+        let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
         let name = vb.prefix();
         Ok(Self { in_proj, out_proj, embed_dim, num_heads, name })
     }
