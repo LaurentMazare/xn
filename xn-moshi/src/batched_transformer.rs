@@ -71,33 +71,8 @@ impl<B: Backend> RotaryEmbedding<B> {
 }
 
 impl<B: Backend> Rope<B> {
-    /// Apply rotary embeddings to x of shape (b, h, t, d) using interleaved pairs.
     fn apply_rotary_emb<T: WithDTypeF>(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        let dims = x.dims();
-        let x = x.to::<f32>()?;
-        let (b, h, t, d) = (dims[0], dims[1], dims[2], dims[3]);
-        let half_d = d / 2;
-
-        // Reshape to (b, h, t, half_d, 2)
-        let x = x.clone().reshape((b, h, t, half_d, 2))?;
-        let x0 = x.narrow(4, ..1)?.contiguous()?.reshape((b, h, t, half_d))?;
-        let x1 = x
-            .narrow(4, 1..2)?
-            .contiguous()?
-            .reshape((b, h, t, half_d))?;
-
-        // cos, sin: (b, t, half_d) -> unsqueeze(1) -> (b, 1, t, half_d)
-        let cos = self.cos.unsqueeze(1)?;
-        let sin = self.sin.unsqueeze(1)?;
-
-        // y0 = x0 * cos - x1 * sin
-        // y1 = x0 * sin + x1 * cos
-        let y0 = x0.broadcast_mul(&cos)?.sub(&x1.broadcast_mul(&sin)?)?;
-        let y1 = x0.broadcast_mul(&sin)?.add(&x1.broadcast_mul(&cos)?)?;
-
-        // Stack on dim 4 to get (b, h, t, half_d, 2), then reshape to (b, h, t, d)
-        let rope = Tensor::stack(&[&y0, &y1], 4)?;
-        rope.reshape((b, h, t, d))?.to::<T>()
+        x.to::<f32>()?.rope_i(&self.cos, &self.sin, 0)?.to::<T>()
     }
 }
 
