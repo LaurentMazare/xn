@@ -1,0 +1,13 @@
+[package]
+name = "pocket-tts-pyo3"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ptts"
+crate-type = ["cdylib"]
+
+[dependencies]
+pocket_tts = { workspace = true }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+numpy = "0.28"

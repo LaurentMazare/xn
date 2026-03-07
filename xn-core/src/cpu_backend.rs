@@ -85,7 +85,7 @@ fn gemm_<T: WithDType>(
                 /* conj_dst: bool = */ false,
                 /* conj_lhs: bool = */ false,
                 /* conj_rhs: bool = */ false,
-                gemm::Parallelism::Rayon(get_num_threads()),
+                gemm::Parallelism::Rayon(crate::get_num_threads()),
             )
         }
     }
@@ -1567,13 +1567,4 @@ fn broadcast_binary_op<T: WithDType>(
     }
 
     Ok(())
-}
-
-pub(crate) fn get_num_threads() -> usize {
-    use std::str::FromStr;
-    // Respond to the same environment variable as rayon.
-    match std::env::var("RAYON_NUM_THREADS").ok().and_then(|s| usize::from_str(&s).ok()) {
-        Some(x) if x > 0 => x,
-        Some(_) | None => num_cpus::get(),
-    }
 }

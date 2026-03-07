@@ -1,5 +1,11 @@
 [workspace]
-members = ["xn-core", "pocket-tts", "pocket-tts-wasm", "xn-moshi"]
+members = [
+  "xn-core",
+  "pocket-tts",
+  "pocket-tts-pyo3",
+  "pocket-tts-wasm",
+  "xn-moshi",
+]
 exclude = ["xn-flash-attn"]
 resolver = "3"
 

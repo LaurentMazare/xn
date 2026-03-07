@@ -22,6 +22,7 @@ pub use error::{Error, Result};
 pub use shape::{D, Dim, Shape};
 pub use tensor::{Tensor, TypedTensor};
 pub use tensor_view::{TensorOrView, TensorView};
+pub use utils::{get_num_cpus, get_num_threads, set_num_threads};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CpuDevice;
@@ -35,15 +36,6 @@ pub(crate) use inplace_ops::{BinaryOp, UnaryOp};
 pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_kernels;
-
-pub fn get_num_threads() -> usize {
-    use std::str::FromStr;
-    // Respond to the same environment variable as rayon.
-    match std::env::var("RAYON_NUM_THREADS").ok().and_then(|s| usize::from_str(&s).ok()) {
-        Some(x) if x > 0 => x,
-        Some(_) | None => num_cpus::get(),
-    }
-}
 
 pub fn with_avx() -> bool {
     cfg!(target_feature = "avx")
