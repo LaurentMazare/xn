@@ -27,12 +27,12 @@ def main():
 
     if args.config is None:
         print("Loading model...")
-        model = ptts.load_model(temperature=args.temperature)
+        model = ptts.load_model()
         print(
             f"Model loaded, sample_rate={model.sample_rate()}, voices={model.voices()}"
         )
     else:
-        model = ptts.load_model_from_config(args.config)
+        model = ptts.load_model(config=args.config)
 
     if Path(args.voice).exists():
         print(f"Loading audio from {args.voice}...")
