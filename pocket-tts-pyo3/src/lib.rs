@@ -254,74 +254,116 @@ fn remap_key(name: &str) -> Option<String> {
     Some(name)
 }
 
+fn load_voice_embedding(
+    voice_path: &std::path::Path,
+) -> Result<Tensor<f32, xn::CpuDevice>, xn::Error> {
+    let voice_vb = VB::load(&[voice_path], xn::CpuDevice)?;
+    let voice_names = voice_vb.tensor_names();
+    let voice_key = voice_names
+        .first()
+        .ok_or_else(|| xn::Error::Msg("no tensors found in voice embedding file".into()))?;
+    let voice_td = voice_vb
+        .get_tensor(voice_key)
+        .ok_or_else(|| xn::Error::Msg("voice tensor not found".into()))?;
+    let voice_shape = &voice_td.shape;
+    let voice_dims = voice_shape.dims();
+    let voice_emb: Tensor<f32, xn::CpuDevice> = voice_vb.tensor(voice_key, voice_shape.clone())?;
+    if voice_dims.len() == 2 {
+        Ok(voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?)
+    } else {
+        Ok(voice_emb)
+    }
+}
+
+fn load_model_(
+    temperature: f32,
+    repo_id: String,
+    model_file: String,
+    config: Option<String>,
+) -> xn::Result<Model> {
+    let (model_path, tokenizer_path, cfg, voices) = match config {
+        Some(config_path) => {
+            let config_path =
+                std::fs::canonicalize(&config_path).map_err(|e| xn::Error::Msg(e.to_string()))?;
+            let parent = config_path
+                .parent()
+                .ok_or_else(|| xn::Error::Msg("config path has no parent".into()))?;
+            let model_path = parent.join("model.safetensors");
+            let tokenizer_path = parent.join("tokenizer.model");
+            let config_str =
+                std::fs::read_to_string(&config_path).map_err(|e| xn::Error::Msg(e.to_string()))?;
+            let cfg: TTSConfig =
+                serde_json::from_str(&config_str).map_err(|e| xn::Error::Msg(e.to_string()))?;
+            (
+                model_path,
+                tokenizer_path,
+                cfg,
+                std::collections::HashMap::new(),
+            )
+        }
+        None => {
+            use hf_hub::{Repo, RepoType, api::sync::Api};
+
+            let api = Api::new().map_err(|e| xn::Error::Msg(e.to_string()))?;
+            let repo = api.repo(Repo::new(repo_id, RepoType::Model));
+
+            let model_path = repo
+                .get(&model_file)
+                .map_err(|e| xn::Error::Msg(e.to_string()))?;
+            let tokenizer_path = repo
+                .get("tokenizer.model")
+                .map_err(|e| xn::Error::Msg(e.to_string()))?;
+
+            let mut voices = std::collections::HashMap::new();
+            for &voice in VOICES {
+                let voice_file = format!("embeddings/{voice}.safetensors");
+                if let Ok(voice_path) = repo.get(&voice_file)
+                    && let Ok(voice_emb) = load_voice_embedding(&voice_path)
+                {
+                    voices.insert(voice.to_string(), voice_emb);
+                }
+            }
+
+            let cfg = TTSConfig::v202601(temperature);
+            (model_path, tokenizer_path, cfg, voices)
+        }
+    };
+
+    let tokenizer_path = tokenizer_path
+        .to_str()
+        .ok_or_else(|| xn::Error::Msg("invalid tokenizer path".into()))?;
+    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
+        .map_err(|e| xn::Error::Msg(e.to_string()))?;
+    let tokenizer = SpTokenizer(sp);
+
+    let dev = xn::CpuDevice;
+    let vb = VB::load_with_key_map(&[&model_path], dev, remap_key)?.root();
+    let model: TTSModel<f32, xn::CpuDevice> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
+    vb.check_all_used_with_ignore(|v| {
+        v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
+            || v.starts_with("mimi.quantizer")
+    })?;
+
+    Ok(Model {
+        inner: Arc::new(model),
+        voices,
+    })
+}
+
 #[pyfunction]
-#[pyo3(signature = (temperature=0.7, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors"))]
+#[pyo3(signature = (temperature=0.7, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None))]
 fn load_model(
     py: Python<'_>,
     temperature: f32,
     repo_id: &str,
     model_file: &str,
+    config: Option<&str>,
 ) -> PyResult<Model> {
     let repo_id = repo_id.to_string();
     let model_file = model_file.to_string();
-    py.detach(move || -> Result<Model, xn::Error> {
-        use hf_hub::{Repo, RepoType, api::sync::Api};
-
-        let api = Api::new().map_err(|e| xn::Error::Msg(e.to_string()))?;
-        let repo = api.repo(Repo::new(repo_id, RepoType::Model));
-
-        let model_path = repo
-            .get(&model_file)
-            .map_err(|e| xn::Error::Msg(e.to_string()))?;
-        let tokenizer_path = repo
-            .get("tokenizer.model")
-            .map_err(|e| xn::Error::Msg(e.to_string()))?;
-
-        let tokenizer_path = tokenizer_path
-            .to_str()
-            .ok_or_else(|| xn::Error::Msg("invalid tokenizer path".to_string()))?;
-        let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
-            .map_err(|e| xn::Error::Msg(e.to_string()))?;
-        let tokenizer = SpTokenizer(sp);
-
-        let cfg = TTSConfig::v202601(temperature);
-        let dev = xn::CpuDevice;
-        let vb = VB::load_with_key_map(&[&model_path], dev, remap_key)?.root();
-        let model: TTSModel<f32, xn::CpuDevice> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
-        vb.check_all_used_with_ignore(|v| {
-            v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
-                || v.starts_with("mimi.quantizer")
-        })?;
-
-        let mut voices = std::collections::HashMap::new();
-        for &voice in VOICES {
-            let voice_file = format!("embeddings/{voice}.safetensors");
-            if let Ok(voice_path) = repo.get(&voice_file) {
-                let voice_vb = VB::load(&[&voice_path], xn::CpuDevice)?;
-                let voice_names = voice_vb.tensor_names();
-                if let Some(voice_key) = voice_names.first()
-                    && let Some(voice_td) = voice_vb.get_tensor(voice_key)
-                {
-                    let voice_shape = &voice_td.shape;
-                    let voice_dims = voice_shape.dims();
-                    let voice_emb: Tensor<f32, xn::CpuDevice> =
-                        voice_vb.tensor(voice_key, voice_shape.clone())?;
-                    let voice_emb = if voice_dims.len() == 2 {
-                        voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?
-                    } else {
-                        voice_emb
-                    };
-                    voices.insert(voice.to_string(), voice_emb);
-                }
-            }
-        }
-
-        Ok(Model {
-            inner: Arc::new(model),
-            voices,
-        })
-    })
-    .w()
+    let config = config.map(|s| s.to_string());
+    py.detach(move || load_model_(temperature, repo_id, model_file, config))
+        .w()
 }
 
 #[pyfunction]

@@ -1760,6 +1760,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "sentencepiece",
+ "serde_json",
  "xn",
 ]
 
