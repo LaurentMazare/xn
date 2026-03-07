@@ -35,7 +35,7 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
             Some(learnt_padding) => {
                 let learnt_padding = learnt_padding.squeeze(0)?;
                 let embed = Tensor::cat(&[&embed, &learnt_padding], 0)?;
-                (embed, Some(n_bins as u32))
+                (embed, Some(n_bins as u32 + 1))
             }
             None => (embed, None),
         };
