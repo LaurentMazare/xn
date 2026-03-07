@@ -6,7 +6,7 @@ pub struct LUTConditioner<T: WithDTypeF, B: Backend> {
     pub tokenizer: Option<Box<dyn Tokenizer + Send + Sync>>,
     embed: Tensor<T, B>,
     learnt_padding: Option<Tensor<T, B>>,
-    output_proj: Option<Linear<T, B>>,
+    learnt_padding_id: Option<u32>,
     pub dim: usize,
     pub output_dim: usize,
 }
@@ -25,12 +25,25 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
         } else {
             None
         };
-        let output_proj = if vb.contains("output_proj.weight") {
-            Some(Linear::load(vb.pp("output_proj"), dim, output_dim)?)
+        let embed = if vb.contains("output_proj.weight") {
+            let proj = Linear::load(vb.pp("output_proj"), dim, output_dim)?;
+            proj.forward(&embed)?
         } else {
-            None
+            embed
         };
-        Ok(Self { tokenizer, embed, dim, output_dim, learnt_padding, output_proj })
+        let (embed, learnt_padding_id) = match learnt_padding.as_ref() {
+            Some(learnt_padding) => {
+                let learnt_padding = learnt_padding.squeeze(0)?;
+                let embed = Tensor::cat(&[&embed, &learnt_padding], 0)?;
+                (embed, Some(n_bins as u32))
+            }
+            None => (embed, None),
+        };
+        Ok(Self { tokenizer, embed, dim, output_dim, learnt_padding, learnt_padding_id })
+    }
+
+    pub fn learnt_padding_id(&self) -> Option<u32> {
+        self.learnt_padding_id
     }
 
     /// Tokenize text and return token ids.
@@ -53,11 +66,8 @@ impl<T: WithDTypeF, B: Backend> LUTConditioner<T, B> {
             self.embed.device(),
         )?;
         let emb = self.embed.index_select(&ids_t, 0)?;
-        let emb = emb.reshape((1, token_ids.len(), self.dim))?;
-        match self.output_proj.as_ref() {
-            Some(proj) => proj.forward(&emb),
-            None => Ok(emb),
-        }
+        let emb = emb.reshape((1, token_ids.len(), self.output_dim))?;
+        Ok(emb)
     }
 
     pub fn learnt_padding(&self) -> Option<&Tensor<T, B>> {

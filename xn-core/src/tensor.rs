@@ -163,6 +163,25 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
         })
     }
 
+    pub fn squeeze(&self, dim: impl Dim) -> Result<Self> {
+        let dim = dim.to_index(self.shape(), "squeeze dim")?;
+        let dims = self.dims();
+        if dims[dim] != 1 {
+            crate::bail!(
+                "squeeze: cannot squeeze dimension {dim} with size {} (expected size 1)",
+                dims[dim]
+            );
+        }
+        let mut new_dims = dims.to_vec();
+        new_dims.remove(dim);
+        Ok(Tensor {
+            data: Arc::clone(&self.data),
+            shape: new_dims.into(),
+            device: self.device.clone(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+
     /// Extract a slice of the tensor along a given dimension.
     /// Returns a `TensorView` (zero-copy). Call `.contiguous()?` on the result
     /// if you need a contiguous `Tensor`.

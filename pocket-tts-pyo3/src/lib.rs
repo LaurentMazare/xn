@@ -1,5 +1,5 @@
 use numpy::{PyArray1, PyReadonlyArray1};
-use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt};
+use pocket_tts::tts_model::{TTSConfig, TTSModel};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use xn::Tensor;
@@ -130,6 +130,69 @@ struct ModelState {
     state: pocket_tts::tts_model::TTSState<f32, xn::CpuDevice>,
 }
 
+fn run_generate(
+    model: Arc<TTSModel<f32, xn::CpuDevice>>,
+    mut state: pocket_tts::tts_model::TTSState<f32, xn::CpuDevice>,
+    tokens: Vec<u32>,
+    temperature: f32,
+    seed: u64,
+    frames_after_eos: usize,
+) -> Result<Vec<f32>, xn::Error> {
+    let num_tokens = tokens.len();
+    let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
+    let mut rng = StdRng::new(temperature, seed);
+    let mut mimi_state = model.init_mimi_state(1, 250)?;
+
+    model.prompt_text(&mut state, &tokens)?;
+
+    let ldim = model.flow_lm.ldim;
+    let nan_data: Vec<f32> = vec![f32::NAN; ldim];
+    let mut prev_latent: Tensor<f32, xn::CpuDevice> =
+        Tensor::from_vec(nan_data, (1, 1, ldim), &xn::CpuDevice)?;
+
+    let (latent_tx, latent_rx) = std::sync::mpsc::channel();
+
+    let decode_model = Arc::clone(&model);
+    let decode_handle =
+        std::thread::spawn(move || -> Result<Tensor<f32, xn::CpuDevice>, xn::Error> {
+            let mut audio_chunks = Vec::new();
+            while let Ok(latent) = latent_rx.recv() {
+                let audio_chunk = decode_model.decode_latent(&latent, &mut mimi_state)?;
+                audio_chunks.push(audio_chunk);
+            }
+            let audio_refs: Vec<_> = audio_chunks.iter().collect();
+            let audio = Tensor::cat(&audio_refs, 2)?;
+            let audio = audio.narrow(0, ..1)?.contiguous()?;
+            Ok(audio)
+        });
+
+    let mut eos_countdown: Option<usize> = None;
+    for _step in 0..max_frames {
+        let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+        latent_tx
+            .send(next_latent.clone())
+            .map_err(|e| xn::Error::Msg(e.to_string()))?;
+
+        if is_eos && eos_countdown.is_none() {
+            eos_countdown = Some(frames_after_eos);
+        }
+        if let Some(ref mut countdown) = eos_countdown {
+            if *countdown == 0 {
+                break;
+            }
+            *countdown -= 1;
+        }
+        prev_latent = next_latent;
+    }
+    drop(latent_tx);
+
+    let audio = decode_handle
+        .join()
+        .map_err(|_| xn::Error::Msg("decode thread panicked".to_string()))??;
+    let pcm = audio.to_vec()?;
+    Ok(pcm)
+}
+
 #[pymethods]
 impl ModelState {
     fn clone(&self) -> Self {
@@ -137,6 +200,10 @@ impl ModelState {
             model: Arc::clone(&self.model),
             state: self.state.clone(),
         }
+    }
+
+    fn tokenize(&self, text: &str) -> PyResult<Vec<u32>> {
+        self.model.flow_lm.conditioner.tokenize(text).w()
     }
 
     #[pyo3(signature = (text, temperature=0.7, seed=4242424242424242, pad_to=None))]
@@ -149,73 +216,66 @@ impl ModelState {
         pad_to: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let model = Arc::clone(&self.model);
-        let mut state = self.state.clone();
+        let state = self.state.clone();
         let text = text.to_string();
 
         let pcm = py
-            .detach(move || -> Result<Vec<f32>, xn::Error> {
-                let (text, frames_after_eos) = prepare_text_prompt(&text);
-                let tokens = model.flow_lm.conditioner.tokenize(&text)?;
-                let num_tokens = tokens.len();
-                let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
-
-                let mut rng = StdRng::new(temperature, seed);
-                let mut mimi_state = model.init_mimi_state(1, 250)?;
-
-                if let Some(pad_to) = pad_to {
-                    model.prompt_text_with_padding(&mut state, &tokens, pad_to)?;
-                } else {
-                    model.prompt_text(&mut state, &tokens)?;
-                }
-
-                let ldim = model.flow_lm.ldim;
-                let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-                let mut prev_latent: Tensor<f32, xn::CpuDevice> =
-                    Tensor::from_vec(nan_data, (1, 1, ldim), &xn::CpuDevice)?;
-
-                let (latent_tx, latent_rx) = std::sync::mpsc::channel();
-
-                let decode_model = Arc::clone(&model);
-                let decode_handle =
-                    std::thread::spawn(move || -> Result<Tensor<f32, xn::CpuDevice>, xn::Error> {
-                        let mut audio_chunks = Vec::new();
-                        while let Ok(latent) = latent_rx.recv() {
-                            let audio_chunk =
-                                decode_model.decode_latent(&latent, &mut mimi_state)?;
-                            audio_chunks.push(audio_chunk);
+            .detach(move || -> xn::Result<Vec<f32>> {
+                let (text, frames_after_eos) = pocket_tts::tts_model::prepare_text_prompt(&text);
+                let mut tokens = model.flow_lm.conditioner.tokenize(&text)?;
+                if let Some(pad_to) = pad_to
+                    && tokens.len() < pad_to
+                {
+                    let learnt_padding_id = match model.flow_lm.conditioner.learnt_padding_id() {
+                        Some(id) => id,
+                        None => {
+                            xn::bail!("model does not have a learnt padding token, cannot pad to {pad_to} tokens")
                         }
-                        let audio_refs: Vec<_> = audio_chunks.iter().collect();
-                        let audio = Tensor::cat(&audio_refs, 2)?;
-                        let audio = audio.narrow(0, ..1)?.contiguous()?;
-                        Ok(audio)
-                    });
-
-                let mut eos_countdown: Option<usize> = None;
-                for _step in 0..max_frames {
-                    let (next_latent, is_eos) =
-                        model.generate_step(&mut state, &prev_latent, &mut rng)?;
-                    latent_tx
-                        .send(next_latent.clone())
-                        .map_err(|e| xn::Error::Msg(e.to_string()))?;
-
-                    if is_eos && eos_countdown.is_none() {
-                        eos_countdown = Some(frames_after_eos);
-                    }
-                    if let Some(ref mut countdown) = eos_countdown {
-                        if *countdown == 0 {
-                            break;
-                        }
-                        *countdown -= 1;
-                    }
-                    prev_latent = next_latent;
+                    };
+                    tokens.resize(pad_to, learnt_padding_id);
                 }
-                drop(latent_tx);
+                run_generate(model, state, tokens, temperature, seed, frames_after_eos)
+            })
+            .w()?;
 
-                let audio = decode_handle
-                    .join()
-                    .map_err(|_| xn::Error::Msg("decode thread panicked".to_string()))??;
-                let pcm = audio.to_vec()?;
-                Ok(pcm)
+        Ok(PyArray1::from_vec(py, pcm))
+    }
+
+    #[pyo3(signature = (tokens, temperature=0.7, seed=4242424242424242, frames_after_eos=1))]
+    fn generate_audio_for_tokens<'py>(
+        &self,
+        py: Python<'py>,
+        tokens: Vec<i32>,
+        temperature: f32,
+        seed: u64,
+        frames_after_eos: usize,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let model = Arc::clone(&self.model);
+        let state = self.state.clone();
+        let mut new_tokens = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            if token < 0 {
+                let token = match model.flow_lm.conditioner.learnt_padding_id() {
+                    Some(id) => id,
+                    None => py_bail!(
+                        "model does not have a learnt padding token, cannot use negative token value {token}"
+                    ),
+                };
+                new_tokens.push(token);
+            } else {
+                new_tokens.push(token as u32);
+            }
+        }
+        let pcm = py
+            .detach(move || -> xn::Result<Vec<f32>> {
+                run_generate(
+                    model,
+                    state,
+                    new_tokens,
+                    temperature,
+                    seed,
+                    frames_after_eos,
+                )
             })
             .w()?;
 
@@ -381,6 +441,11 @@ fn set_num_threads(num_threads: usize) {
     xn::utils::set_num_threads(num_threads);
 }
 
+#[pyfunction]
+fn prepare_text_prompt(text: &str) -> String {
+    pocket_tts::tts_model::prepare_text_prompt(text).0
+}
+
 #[pymodule]
 fn ptts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Model>()?;
@@ -388,5 +453,6 @@ fn ptts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_model, m)?)?;
     m.add_function(wrap_pyfunction!(get_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_text_prompt, m)?)?;
     Ok(())
 }
