@@ -10,5 +10,9 @@ crate-type = ["cdylib"]
 [dependencies]
 xn = { workspace = true }
 pocket_tts = { workspace = true }
-pyo3 = { version = "0.28", features = ["extension-module"] }
+hf-hub = { workspace = true }
 numpy = "0.28"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+rand = { workspace = true, features = ["std_rng"] }
+rand_distr = { workspace = true }
+sentencepiece = { workspace = true }
