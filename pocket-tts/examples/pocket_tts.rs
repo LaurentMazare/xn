@@ -61,6 +61,9 @@ struct Args {
 
     #[arg(long)]
     wait_to_decode: bool,
+
+    #[arg(long)]
+    pad_to: Option<usize>,
 }
 
 const VOICES: &[&str] =
@@ -359,7 +362,11 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         let start = std::time::Instant::now();
         let mut tts_state = tts_state.clone();
         let mut mimi_state = mimi_state.clone();
-        model.prompt_text(&mut tts_state, &tokens)?;
+        if let Some(pad_to) = args.pad_to {
+            model.prompt_text_with_padding(&mut tts_state, &tokens, pad_to)?;
+        } else {
+            model.prompt_text(&mut tts_state, &tokens)?;
+        }
         if let Some((_, ref mut null_state)) = cfg_state {
             model.prompt_text_null(null_state)?;
         }

@@ -128,6 +128,31 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
         Ok(())
     }
 
+    /// Run flow LM step with text tokens. Increments state.
+    pub fn prompt_text_with_padding(
+        &self,
+        state: &mut TTSState<T, B>,
+        text_tokens: &[u32],
+        pad_to: usize,
+    ) -> Result<()> {
+        let text_embeddings = self.flow_lm.conditioner.embed_tokens(text_tokens)?;
+        let (batch_size, seq_len, dim) = text_embeddings.dims3()?;
+        let padding_required = pad_to.saturating_sub(seq_len);
+        let text_embeddings = if padding_required > 0
+            && let Some(padding_embeds) = self.flow_lm.conditioner.learnt_padding()
+        {
+            let padding_embeds =
+                padding_embeds.expand((batch_size, padding_required, dim))?.contiguous()?;
+            Tensor::cat(&[&text_embeddings, &padding_embeds], 1)?
+        } else {
+            text_embeddings
+        };
+        let dev = text_embeddings.device();
+        let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
+        self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
+        Ok(())
+    }
+
     pub fn prompt_text_null(&self, state: &mut TTSState<T, B>) -> Result<()> {
         let empty_text = match self.flow_lm.conditioner.learnt_padding() {
             None => xn::bail!("Model does not support null text prompt"),
