@@ -9,6 +9,7 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
+dependencies = ["numpy"]
 dynamic = ["version"]
 
 [tool.maturin]
