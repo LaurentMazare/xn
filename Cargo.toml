@@ -1,11 +1,11 @@
 [workspace]
-members = ["xn-core", "xn-pocket-tts", "wasm-pocket-tts", "xn-moshi"]
+members = ["xn-core", "pocket-tts", "pocket-tts-wasm", "xn-moshi"]
 exclude = ["xn-flash-attn"]
 resolver = "3"
 
 [workspace.dependencies]
 xn = { path = "xn-core" }
-pocket_tts = { path = "xn-pocket-tts" }
+pocket_tts = { path = "pocket-tts" }
 anyhow = "1"
 bindgen_cuda = "0.1.6"
 clap = { version = "4", features = ["derive"] }
