@@ -8,6 +8,7 @@ name = "ptts"
 crate-type = ["cdylib"]
 
 [dependencies]
+xn = { workspace = true }
 pocket_tts = { workspace = true }
 pyo3 = { version = "0.28", features = ["extension-module"] }
 numpy = "0.28"
