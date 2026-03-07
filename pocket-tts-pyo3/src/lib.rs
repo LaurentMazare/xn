@@ -345,6 +345,7 @@ fn load_model_(
     repo_id: String,
     model_file: String,
     config: Option<String>,
+    eos_threshold: Option<f32>,
 ) -> xn::Result<Model> {
     let (model_path, tokenizer_path, cfg, voices) = match config {
         Some(config_path) => {
@@ -404,6 +405,11 @@ fn load_model_(
     let dev = xn::CpuDevice;
     let vb = VB::load_with_key_map(&[&model_path], dev, remap_key)?.root();
     let model: TTSModel<f32, xn::CpuDevice> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
+    let model = if let Some(eos_threshold) = eos_threshold {
+        model.with_eos_threshold(eos_threshold)
+    } else {
+        model
+    };
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
             || v.starts_with("mimi.quantizer")
@@ -416,18 +422,19 @@ fn load_model_(
 }
 
 #[pyfunction]
-#[pyo3(signature = (temperature=0.7, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None))]
+#[pyo3(signature = (temperature=0.7, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None, eos_threshold=None))]
 fn load_model(
     py: Python<'_>,
     temperature: f32,
     repo_id: &str,
     model_file: &str,
     config: Option<&str>,
+    eos_threshold: Option<f32>,
 ) -> PyResult<Model> {
     let repo_id = repo_id.to_string();
     let model_file = model_file.to_string();
     let config = config.map(|s| s.to_string());
-    py.detach(move || load_model_(temperature, repo_id, model_file, config))
+    py.detach(move || load_model_(temperature, repo_id, model_file, config, eos_threshold))
         .w()
 }
 

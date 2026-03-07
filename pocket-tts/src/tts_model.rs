@@ -95,6 +95,11 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
         })
     }
 
+    pub fn with_eos_threshold(mut self, eos_threshold: f32) -> Self {
+        self.eos_threshold = eos_threshold;
+        self
+    }
+
     pub fn sample_rate(&self) -> usize {
         self.mimi.sample_rate
     }
@@ -339,11 +344,12 @@ pub fn split_into_best_sentences(
 
 /// Prepare text for generation: capitalize, add punctuation, pad short text.
 pub fn prepare_text_prompt(text: &str) -> (String, usize) {
-    let mut text = text.trim().to_string();
+    let text = text.trim().to_string();
     if text.is_empty() {
         return (text, 3);
     }
-    text = text.replace(['\n', '\r'], " ").replace("  ", " ");
+    let text = text.replace(['\n', '\r'], " ");
+    let mut text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let number_of_words = text.split_whitespace().count();
     let frames_after_eos = if number_of_words <= 4 { 3 } else { 1 };

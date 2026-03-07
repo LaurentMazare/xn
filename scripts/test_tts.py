@@ -19,6 +19,8 @@ def main():
     )
     parser.add_argument("-v", "--voice", default="alba", help="Voice to use")
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--pad-to", type=int, default=None)
+    parser.add_argument("--eos-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=4242424242424242)
     parser.add_argument(
         "--config", type=str, default=None, help="Path to JSON config file"
@@ -27,12 +29,12 @@ def main():
 
     if args.config is None:
         print("Loading model...")
-        model = ptts.load_model()
+        model = ptts.load_model(eos_threshold=args.eos_threshold)
         print(
             f"Model loaded, sample_rate={model.sample_rate()}, voices={model.voices()}"
         )
     else:
-        model = ptts.load_model(config=args.config)
+        model = ptts.load_model(config=args.config, eos_threshold=args.eos_threshold)
 
     if Path(args.voice).exists():
         print(f"Loading audio from {args.voice}...")
@@ -46,7 +48,7 @@ def main():
 
     print(f"Generating audio for: {args.text!r}")
     audio = state.generate_audio(
-        args.text, temperature=args.temperature, seed=args.seed
+        args.text, temperature=args.temperature, seed=args.seed, pad_to=args.pad_to
     )
     print(f"Generated {len(audio) / model.sample_rate():.2f}s of audio")
 
