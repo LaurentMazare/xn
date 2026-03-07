@@ -72,7 +72,7 @@ struct Model {
 #[pymethods]
 impl Model {
     #[pyo3(signature = (audio_prompt, max_seq_len=2048))]
-    fn get_state_for_audio_prompt(
+    fn get_state_for_audio(
         &self,
         audio_prompt: PyReadonlyArray1<'_, f32>,
         max_seq_len: usize,
@@ -86,8 +86,8 @@ impl Model {
                 audio_prompt.len()
             );
         }
-        let voice_emb =
-            xn::Tensor::from_vec(audio_prompt.to_vec(), expected_len, &xn::CpuDevice).w()?;
+        let pcm = xn::Tensor::from_vec(audio_prompt.to_vec(), (1, 1, ()), &xn::CpuDevice).w()?;
+        let voice_emb = self.inner.encode_audio(&pcm).w()?;
         let mut state = self.inner.init_flow_lm_state(1, max_seq_len).w()?;
         self.inner.prompt_audio(&mut state, &voice_emb).w()?;
         Ok(ModelState {

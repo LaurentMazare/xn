@@ -5,6 +5,7 @@
 # ///
 
 import argparse
+from pathlib import Path
 
 import ptts
 import sphn
@@ -13,21 +14,40 @@ import sphn
 def main():
     parser = argparse.ArgumentParser(description="Test pocket-tts generation")
     parser.add_argument("text", help="Text to synthesize")
-    parser.add_argument("-o", "--output", default="output.wav", help="Output WAV file path")
+    parser.add_argument(
+        "-o", "--output", default="output.wav", help="Output WAV file path"
+    )
     parser.add_argument("-v", "--voice", default="alba", help="Voice to use")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=4242424242424242)
+    parser.add_argument(
+        "--config", type=str, default=None, help="Path to JSON config file"
+    )
     args = parser.parse_args()
 
-    print("Loading model...")
-    model = ptts.load_model(temperature=args.temperature)
-    print(f"Model loaded, sample_rate={model.sample_rate()}, voices={model.voices()}")
+    if args.config is None:
+        print("Loading model...")
+        model = ptts.load_model(temperature=args.temperature)
+        print(
+            f"Model loaded, sample_rate={model.sample_rate()}, voices={model.voices()}"
+        )
+    else:
+        model = ptts.load_model_from_config(args.config)
 
-    print(f"Creating state for voice '{args.voice}'...")
-    state = model.get_state_for_voice(args.voice)
+    if Path(args.voice).exists():
+        print(f"Loading audio from {args.voice}...")
+        audio, _ = sphn.read(args.voice, sample_rate=24000)
+        print(f"Audio loaded, {audio.shape} {audio.dtype}")
+        audio = audio[0, : 24000 * 10]
+        state = model.get_state_for_audio(audio)
+    else:
+        print(f"Creating state for voice '{args.voice}'...")
+        state = model.get_state_for_voice(args.voice)
 
     print(f"Generating audio for: {args.text!r}")
-    audio = state.generate_audio(args.text, temperature=args.temperature, seed=args.seed)
+    audio = state.generate_audio(
+        args.text, temperature=args.temperature, seed=args.seed
+    )
     print(f"Generated {len(audio) / model.sample_rate():.2f}s of audio")
 
     sphn.write_wav(args.output, audio, model.sample_rate())
