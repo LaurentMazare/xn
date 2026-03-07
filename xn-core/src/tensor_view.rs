@@ -210,7 +210,7 @@ impl<T: WithDType, B: Backend> TensorView<T, B> {
     }
 
     /// Expand the specified dimension into a list of subdimensions.
-    pub fn expand<D: Dim, S: Into<Shape>>(&self, d: D, s: S) -> Result<Self> {
+    pub fn expand_dim<D: Dim, S: Into<Shape>>(&self, d: D, s: S) -> Result<Self> {
         let s = s.into();
         let d = d.to_index(&self.shape, "expand")?;
         let dims = self.dims();
@@ -224,6 +224,35 @@ impl<T: WithDType, B: Backend> TensorView<T, B> {
         Ok(Self {
             data: self.data.clone(),
             shape: dst_dims.into(),
+            strides: dst_strides,
+            start_offset: self.start_offset,
+            device: self.device.clone(),
+        })
+    }
+
+    /// Compared to the pytorch version, this only allows shape to be of the same rank as the
+    /// original tensor.
+    pub fn expand<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
+        let shape = shape.into();
+        if shape.rank() != self.shape.rank() {
+            crate::bail!(
+                "expand: target shape {:?} has different rank than source shape {:?}",
+                shape,
+                self.shape
+            )
+        }
+        let mut dst_strides = self.strides().to_vec();
+        for (i, (&tgt_dim, &slf_dim)) in shape.dims().iter().zip(self.shape.dims()).enumerate() {
+            if tgt_dim != slf_dim {
+                if slf_dim != 1 {
+                    crate::bail!("expand: cannot expand dim {i} from {slf_dim} to {tgt_dim}",)
+                }
+                dst_strides[i] = 0;
+            }
+        }
+        Ok(Self {
+            data: self.data.clone(),
+            shape,
             strides: dst_strides,
             start_offset: self.start_offset,
             device: self.device.clone(),

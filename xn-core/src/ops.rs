@@ -574,20 +574,8 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     }
 
     /// Expand tensor to a new shape (broadcasting).
-    pub fn expand(&self, _shape: impl Into<crate::Shape>) -> Result<Self> {
-        todo!("expand")
-    }
-
-    /// Repeat tensor along dimensions.
-    pub fn repeat(&self, _repeats: impl Into<Vec<usize>>) -> Result<Self> {
-        todo!("repeat")
-    }
-
-    /// Where condition: select from self or other based on condition.
-    /// The condition should be a tensor of the same shape where non-zero values
-    /// select from self, and zero values select from other.
-    pub fn where_cond(&self, _condition: &Self, _other: &Self) -> Result<Self> {
-        todo!("where_cond")
+    pub fn expand(&self, shape: impl Into<crate::Shape>) -> Result<crate::TensorView<T, B>> {
+        crate::TensorView::from(self).expand(shape)
     }
 
     /// Pad with zeros along a dimension.
