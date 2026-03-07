@@ -139,13 +139,14 @@ impl ModelState {
         }
     }
 
-    #[pyo3(signature = (text, temperature=0.7, seed=4242424242424242))]
+    #[pyo3(signature = (text, temperature=0.7, seed=4242424242424242, pad_to=None))]
     fn generate_audio<'py>(
         &self,
         py: Python<'py>,
         text: &str,
         temperature: f32,
         seed: u64,
+        pad_to: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let model = Arc::clone(&self.model);
         let mut state = self.state.clone();
@@ -161,7 +162,11 @@ impl ModelState {
                 let mut rng = StdRng::new(temperature, seed);
                 let mut mimi_state = model.init_mimi_state(1, 250)?;
 
-                model.prompt_text(&mut state, &tokens)?;
+                if let Some(pad_to) = pad_to {
+                    model.prompt_text_with_padding(&mut state, &tokens, pad_to)?;
+                } else {
+                    model.prompt_text(&mut state, &tokens)?;
+                }
 
                 let ldim = model.flow_lm.ldim;
                 let nan_data: Vec<f32> = vec![f32::NAN; ldim];
