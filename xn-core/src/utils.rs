@@ -6,6 +6,9 @@ static NUM_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 pub fn set_num_threads(num_threads: usize) {
     NUM_THREADS.store(num_threads, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        std::env::set_var("RAYON_NUM_THREADS", num_threads.to_string());
+    }
 }
 
 pub fn get_num_threads() -> usize {
