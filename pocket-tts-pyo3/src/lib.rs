@@ -1,5 +1,5 @@
 use numpy::{PyArray1, PyReadonlyArray1};
-use pocket_tts::tts_model::{TTSConfig, TTSModel};
+use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use xn::Tensor;
@@ -27,7 +27,6 @@ impl pocket_tts::flow_lm::Rng for StdRng {
 }
 
 trait PyRes<R> {
-    #[allow(unused)]
     fn w(self) -> PyResult<R>;
     #[allow(unused)]
     fn w_f<P: AsRef<std::path::Path>>(self, p: P) -> PyResult<R>;
@@ -71,10 +70,11 @@ struct Model {
 
 #[pymethods]
 impl Model {
-    #[pyo3(signature = (audio_prompt, max_seq_len=2048))]
+    #[pyo3(signature = (audio_prompt, cfg_coef=None, max_seq_len=2048))]
     fn get_state_for_audio(
         &self,
         audio_prompt: PyReadonlyArray1<'_, f32>,
+        cfg_coef: Option<f32>,
         max_seq_len: usize,
     ) -> PyResult<ModelState> {
         let expected_len = self.inner.sample_rate() * 10;
@@ -90,9 +90,19 @@ impl Model {
         let voice_emb = self.inner.encode_audio(&pcm).w()?;
         let mut state = self.inner.init_flow_lm_state(1, max_seq_len).w()?;
         self.inner.prompt_audio(&mut state, &voice_emb).w()?;
+        let cfg_state = if let Some(cfg_coef) = cfg_coef {
+            let null_pcm = pcm.zeros_like().w()?;
+            let null_emb = self.inner.encode_audio(&null_pcm).w()?;
+            let mut null_state = self.inner.init_flow_lm_state(1, max_seq_len).w()?;
+            self.inner.prompt_audio(&mut null_state, &null_emb).w()?;
+            Some((cfg_coef, null_state))
+        } else {
+            None
+        };
         Ok(ModelState {
             model: Arc::clone(&self.inner),
             state,
+            cfg_state,
         })
     }
 
@@ -110,6 +120,7 @@ impl Model {
         Ok(ModelState {
             model: Arc::clone(&self.inner),
             state,
+            cfg_state: None,
         })
     }
 
@@ -124,15 +135,15 @@ impl Model {
 
 #[pyclass]
 struct ModelState {
-    #[allow(unused)]
     model: Arc<TTSModel<f32, xn::CpuDevice>>,
-    #[allow(unused)]
-    state: pocket_tts::tts_model::TTSState<f32, xn::CpuDevice>,
+    state: TTSState<f32, xn::CpuDevice>,
+    cfg_state: Option<(f32, TTSState<f32, xn::CpuDevice>)>,
 }
 
 fn run_generate(
     model: Arc<TTSModel<f32, xn::CpuDevice>>,
-    mut state: pocket_tts::tts_model::TTSState<f32, xn::CpuDevice>,
+    mut state: TTSState<f32, xn::CpuDevice>,
+    mut cfg_state: Option<(f32, TTSState<f32, xn::CpuDevice>)>,
     tokens: Vec<u32>,
     temperature: f32,
     seed: u64,
@@ -144,6 +155,9 @@ fn run_generate(
     let mut mimi_state = model.init_mimi_state(1, 250)?;
 
     model.prompt_text(&mut state, &tokens)?;
+    if let Some((_, cfg_state)) = cfg_state.as_mut() {
+        model.prompt_text_null(cfg_state)?
+    }
 
     let ldim = model.flow_lm.ldim;
     let nan_data: Vec<f32> = vec![f32::NAN; ldim];
@@ -168,7 +182,12 @@ fn run_generate(
 
     let mut eos_countdown: Option<usize> = None;
     for _step in 0..max_frames {
-        let (next_latent, is_eos) = model.generate_step(&mut state, &prev_latent, &mut rng)?;
+        let (next_latent, is_eos) = match cfg_state.as_mut() {
+            Some((cfg_coef, cfg_state)) => {
+                model.generate_step_cfg(&mut state, cfg_state, *cfg_coef, &prev_latent, &mut rng)?
+            }
+            None => model.generate_step(&mut state, &prev_latent, &mut rng)?,
+        };
         latent_tx
             .send(next_latent.clone())
             .map_err(|e| xn::Error::Msg(e.to_string()))?;
@@ -199,6 +218,7 @@ impl ModelState {
         Self {
             model: Arc::clone(&self.model),
             state: self.state.clone(),
+            cfg_state: self.cfg_state.clone(),
         }
     }
 
@@ -217,6 +237,7 @@ impl ModelState {
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let model = Arc::clone(&self.model);
         let state = self.state.clone();
+        let cfg_state = self.cfg_state.clone();
         let text = text.to_string();
 
         let pcm = py
@@ -234,7 +255,7 @@ impl ModelState {
                     };
                     tokens.resize(pad_to, learnt_padding_id);
                 }
-                run_generate(model, state, tokens, temperature, seed, frames_after_eos)
+                run_generate(model, state, cfg_state, tokens, temperature, seed, frames_after_eos)
             })
             .w()?;
 
@@ -252,6 +273,7 @@ impl ModelState {
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let model = Arc::clone(&self.model);
         let state = self.state.clone();
+        let cfg_state = self.cfg_state.clone();
         let mut new_tokens = Vec::with_capacity(tokens.len());
         for token in tokens {
             if token < 0 {
@@ -271,6 +293,7 @@ impl ModelState {
                 run_generate(
                     model,
                     state,
+                    cfg_state,
                     new_tokens,
                     temperature,
                     seed,
