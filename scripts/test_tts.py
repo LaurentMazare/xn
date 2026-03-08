@@ -20,6 +20,7 @@ def main():
     parser.add_argument("-v", "--voice", default="alba", help="Voice to use")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--pad-to", type=int, default=None)
+    parser.add_argument("--cfg", type=float, default=None)
     parser.add_argument("--eos-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=4242424242424242)
     parser.add_argument(
@@ -41,7 +42,7 @@ def main():
         audio, _ = sphn.read(args.voice, sample_rate=24000)
         print(f"Audio loaded, {audio.shape} {audio.dtype}")
         audio = audio[0, : 24000 * 10]
-        state = model.get_state_for_audio(audio)
+        state = model.get_state_for_audio(audio, cfg_coef=args.cfg)
     else:
         print(f"Creating state for voice '{args.voice}'...")
         state = model.get_state_for_voice(args.voice)
