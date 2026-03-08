@@ -303,7 +303,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
 
     // Load voice embedding
     if let Some(voice) = voice {
-        let voice_emb = match voice {
+        let (voice_emb, null_emb) = match voice {
             Voice::Safetensors(voice_path) => {
                 let voice_vb = VB::load(&[&voice_path], dev.clone())?;
                 let voice_names = voice_vb.tensor_names();
@@ -316,11 +316,15 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
                 // Load as raw tensor and reshape to [1, T, dim]
                 let voice_emb: Tensor<f32, Dev> =
                     voice_vb.tensor(voice_key, voice_shape.clone())?;
-                if voice_dims.len() == 2 {
+                let voice_emb = if voice_dims.len() == 2 {
                     voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?
                 } else {
                     voice_emb
+                };
+                if cfg_state.is_some() {
+                    anyhow::bail!("cfg is not supported with pre-computed voice embeddings");
                 }
+                (voice_emb, None)
             }
             Voice::Audio(path) => {
                 tracing::info!("loading voice from audio file {}", path);
@@ -340,15 +344,26 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
                     pcm
                 };
                 let pcm_tensor = Tensor::from_vec(pcm, (1, 1, ()), &dev)?;
-                let encoded_audio = model.encode_audio(&pcm_tensor)?;
-                tracing::info!(?encoded_audio, "encoded audio to latent");
-                encoded_audio
+                let emb = model.encode_audio(&pcm_tensor)?;
+                tracing::info!(?emb, "encoded audio to latent");
+                let null_emb = if cfg_state.is_some() {
+                    let null_pcm_tensor = pcm_tensor.zeros_like()?;
+                    Some(model.encode_audio(&null_pcm_tensor)?)
+                } else {
+                    None
+                };
+                (emb, null_emb)
             }
         };
         // Prompt with audio conditioning
         tracing::info!("prompting with voice conditioning ({} frames)...", voice_emb.dim(1usize)?);
         let start = std::time::Instant::now();
         model.prompt_audio(&mut tts_state, &voice_emb)?;
+        if let Some((_, ref mut null_state)) = cfg_state
+            && let Some(null_emb) = null_emb.as_ref()
+        {
+            model.prompt_audio(null_state, null_emb)?;
+        }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!("done prompting with voice conditioning in {elapsed_ms:.2}ms");
     }
