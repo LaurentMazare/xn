@@ -86,7 +86,8 @@ impl Model {
                 audio_prompt.len()
             );
         }
-        let pcm = xn::Tensor::from_vec(audio_prompt.to_vec(), (1, 1, ()), &xn::CpuDevice).w()?;
+        let dev = self.inner.device();
+        let pcm = xn::Tensor::from_vec(audio_prompt.to_vec(), (1, 1, ()), dev).w()?;
         let voice_emb = self.inner.encode_audio(&pcm).w()?;
         let mut state = self.inner.init_flow_lm_state(1, max_seq_len).w()?;
         self.inner.prompt_audio(&mut state, &voice_emb).w()?;
@@ -140,15 +141,16 @@ struct ModelState {
     cfg_state: Option<(f32, TTSState<f32, xn::CpuDevice>)>,
 }
 
-fn run_generate(
-    model: Arc<TTSModel<f32, xn::CpuDevice>>,
-    mut state: TTSState<f32, xn::CpuDevice>,
-    mut cfg_state: Option<(f32, TTSState<f32, xn::CpuDevice>)>,
+fn run_generate<B: xn::Backend>(
+    model: Arc<TTSModel<f32, B>>,
+    mut state: TTSState<f32, B>,
+    mut cfg_state: Option<(f32, TTSState<f32, B>)>,
     tokens: Vec<u32>,
     temperature: f32,
     seed: u64,
     frames_after_eos: usize,
 ) -> Result<Vec<f32>, xn::Error> {
+    let device = model.device();
     let num_tokens = tokens.len();
     let max_frames = ((num_tokens as f64 / 3.0 + 2.0) * 12.5).ceil() as usize;
     let mut rng = StdRng::new(temperature, seed);
@@ -160,25 +162,23 @@ fn run_generate(
     }
 
     let ldim = model.flow_lm.ldim;
-    let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-    let mut prev_latent: Tensor<f32, xn::CpuDevice> =
-        Tensor::from_vec(nan_data, (1, 1, ldim), &xn::CpuDevice)?;
+    let nan_data = vec![f32::NAN; ldim];
+    let mut prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), device)?;
 
     let (latent_tx, latent_rx) = std::sync::mpsc::channel();
 
     let decode_model = Arc::clone(&model);
-    let decode_handle =
-        std::thread::spawn(move || -> Result<Tensor<f32, xn::CpuDevice>, xn::Error> {
-            let mut audio_chunks = Vec::new();
-            while let Ok(latent) = latent_rx.recv() {
-                let audio_chunk = decode_model.decode_latent(&latent, &mut mimi_state)?;
-                audio_chunks.push(audio_chunk);
-            }
-            let audio_refs: Vec<_> = audio_chunks.iter().collect();
-            let audio = Tensor::cat(&audio_refs, 2)?;
-            let audio = audio.narrow(0, ..1)?.contiguous()?;
-            Ok(audio)
-        });
+    let decode_handle = std::thread::spawn(move || -> Result<Tensor<f32, B>, xn::Error> {
+        let mut audio_chunks = Vec::new();
+        while let Ok(latent) = latent_rx.recv() {
+            let audio_chunk = decode_model.decode_latent(&latent, &mut mimi_state)?;
+            audio_chunks.push(audio_chunk);
+        }
+        let audio_refs: Vec<_> = audio_chunks.iter().collect();
+        let audio = Tensor::cat(&audio_refs, 2)?;
+        let audio = audio.narrow(0, ..1)?.contiguous()?;
+        Ok(audio)
+    });
 
     let mut eos_countdown: Option<usize> = None;
     for _step in 0..max_frames {
@@ -342,10 +342,11 @@ fn remap_key(name: &str) -> Option<String> {
     Some(name)
 }
 
-fn load_voice_embedding(
+fn load_voice_embedding<B: xn::Backend>(
     voice_path: &std::path::Path,
-) -> Result<Tensor<f32, xn::CpuDevice>, xn::Error> {
-    let voice_vb = VB::load(&[voice_path], xn::CpuDevice)?;
+    device: &B,
+) -> Result<Tensor<f32, B>, xn::Error> {
+    let voice_vb = VB::load(&[voice_path], device.clone())?;
     let voice_names = voice_vb.tensor_names();
     let voice_key = voice_names
         .first()
@@ -355,7 +356,7 @@ fn load_voice_embedding(
         .context("voice tensor not found")?;
     let voice_shape = &voice_td.shape;
     let voice_dims = voice_shape.dims();
-    let voice_emb: Tensor<f32, xn::CpuDevice> = voice_vb.tensor(voice_key, voice_shape.clone())?;
+    let voice_emb: Tensor<f32, B> = voice_vb.tensor(voice_key, voice_shape.clone())?;
     if voice_dims.len() == 2 {
         Ok(voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?)
     } else {
@@ -370,6 +371,7 @@ fn load_model_(
     config: Option<String>,
     eos_threshold: Option<f32>,
 ) -> xn::Result<Model> {
+    let dev = xn::CpuDevice;
     let (model_path, tokenizer_path, cfg, voices) = match config {
         Some(config_path) => {
             let config_path = std::fs::canonicalize(&config_path).map_err(xn::Error::msg)?;
@@ -398,7 +400,7 @@ fn load_model_(
             for &voice in VOICES {
                 let voice_file = format!("embeddings/{voice}.safetensors");
                 if let Ok(voice_path) = repo.get(&voice_file)
-                    && let Ok(voice_emb) = load_voice_embedding(&voice_path)
+                    && let Ok(voice_emb) = load_voice_embedding(&voice_path, &dev)
                 {
                     voices.insert(voice.to_string(), voice_emb);
                 }
@@ -413,9 +415,8 @@ fn load_model_(
     let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path).map_err(xn::Error::msg)?;
     let tokenizer = SpTokenizer(sp);
 
-    let dev = xn::CpuDevice;
     let vb = VB::load_with_key_map(&[&model_path], dev, remap_key)?.root();
-    let model: TTSModel<f32, xn::CpuDevice> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
+    let model = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
     let model = if let Some(eos_threshold) = eos_threshold {
         model.with_eos_threshold(eos_threshold)
     } else {

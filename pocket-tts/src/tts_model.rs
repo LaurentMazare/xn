@@ -263,6 +263,10 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
             self.flow_lm.transformer.forward(&input, &mut state.flow_lm_state.transformer_state)?;
         Ok(())
     }
+
+    pub fn device(&self) -> &B {
+        self.flow_lm.input_linear.device()
+    }
 }
 
 pub const MAX_TOKENS_PER_CHUNK: usize = 50;
