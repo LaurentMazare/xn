@@ -2,8 +2,8 @@ use numpy::{PyArray1, PyReadonlyArray1};
 use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState};
 use pyo3::prelude::*;
 use std::sync::Arc;
-use xn::Tensor;
 use xn::nn::VB;
+use xn::{Tensor, error::Context};
 
 struct StdRng {
     inner: rand::rngs::StdRng,
@@ -190,7 +190,7 @@ fn run_generate(
         };
         latent_tx
             .send(next_latent.clone())
-            .map_err(|e| xn::Error::Msg(e.to_string()))?;
+            .map_err(xn::Error::msg)?;
 
         if is_eos && eos_countdown.is_none() {
             eos_countdown = Some(frames_after_eos);
@@ -207,7 +207,7 @@ fn run_generate(
 
     let audio = decode_handle
         .join()
-        .map_err(|_| xn::Error::Msg("decode thread panicked".to_string()))??;
+        .map_err(|_| xn::Error::msg("decode thread panicked"))??;
     let pcm = audio.to_vec()?;
     Ok(pcm)
 }
@@ -349,10 +349,10 @@ fn load_voice_embedding(
     let voice_names = voice_vb.tensor_names();
     let voice_key = voice_names
         .first()
-        .ok_or_else(|| xn::Error::Msg("no tensors found in voice embedding file".into()))?;
+        .context("no tensors found in voice embedding file")?;
     let voice_td = voice_vb
         .get_tensor(voice_key)
-        .ok_or_else(|| xn::Error::Msg("voice tensor not found".into()))?;
+        .context("voice tensor not found")?;
     let voice_shape = &voice_td.shape;
     let voice_dims = voice_shape.dims();
     let voice_emb: Tensor<f32, xn::CpuDevice> = voice_vb.tensor(voice_key, voice_shape.clone())?;
@@ -372,17 +372,12 @@ fn load_model_(
 ) -> xn::Result<Model> {
     let (model_path, tokenizer_path, cfg, voices) = match config {
         Some(config_path) => {
-            let config_path =
-                std::fs::canonicalize(&config_path).map_err(|e| xn::Error::Msg(e.to_string()))?;
-            let parent = config_path
-                .parent()
-                .ok_or_else(|| xn::Error::Msg("config path has no parent".into()))?;
+            let config_path = std::fs::canonicalize(&config_path).map_err(xn::Error::msg)?;
+            let parent = config_path.parent().context("config path has no parent")?;
             let model_path = parent.join("model.safetensors");
             let tokenizer_path = parent.join("tokenizer.model");
-            let config_str =
-                std::fs::read_to_string(&config_path).map_err(|e| xn::Error::Msg(e.to_string()))?;
-            let cfg: TTSConfig =
-                serde_json::from_str(&config_str).map_err(|e| xn::Error::Msg(e.to_string()))?;
+            let config_str = std::fs::read_to_string(&config_path).map_err(xn::Error::msg)?;
+            let cfg: TTSConfig = serde_json::from_str(&config_str).map_err(xn::Error::msg)?;
             (
                 model_path,
                 tokenizer_path,
@@ -393,15 +388,11 @@ fn load_model_(
         None => {
             use hf_hub::{Repo, RepoType, api::sync::Api};
 
-            let api = Api::new().map_err(|e| xn::Error::Msg(e.to_string()))?;
+            let api = Api::new().map_err(xn::Error::msg)?;
             let repo = api.repo(Repo::new(repo_id, RepoType::Model));
 
-            let model_path = repo
-                .get(&model_file)
-                .map_err(|e| xn::Error::Msg(e.to_string()))?;
-            let tokenizer_path = repo
-                .get("tokenizer.model")
-                .map_err(|e| xn::Error::Msg(e.to_string()))?;
+            let model_path = repo.get(&model_file).map_err(xn::Error::msg)?;
+            let tokenizer_path = repo.get("tokenizer.model").map_err(xn::Error::msg)?;
 
             let mut voices = std::collections::HashMap::new();
             for &voice in VOICES {
@@ -418,11 +409,8 @@ fn load_model_(
         }
     };
 
-    let tokenizer_path = tokenizer_path
-        .to_str()
-        .ok_or_else(|| xn::Error::Msg("invalid tokenizer path".into()))?;
-    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
-        .map_err(|e| xn::Error::Msg(e.to_string()))?;
+    let tokenizer_path = tokenizer_path.to_str().context("invalid tokenizer path")?;
+    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path).map_err(xn::Error::msg)?;
     let tokenizer = SpTokenizer(sp);
 
     let dev = xn::CpuDevice;
