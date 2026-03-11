@@ -23,19 +23,22 @@ def main():
     parser.add_argument("--cfg", type=float, default=None)
     parser.add_argument("--eos-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=4242424242424242)
+    parser.add_argument("--device", type=str, default=None, help="Device to run on (e.g. 'cpu' or 'cuda')")
     parser.add_argument(
         "--config", type=str, default=None, help="Path to JSON config file"
     )
     args = parser.parse_args()
 
+    print(f"Using device: {args.device or 'cpu'}, cuda-available: {ptts.cuda_available()}")
+
     if args.config is None:
         print("Loading model...")
-        model = ptts.load_model(eos_threshold=args.eos_threshold)
+        model = ptts.load_model(eos_threshold=args.eos_threshold, device=args.device)
         print(
             f"Model loaded, sample_rate={model.sample_rate()}, voices={model.voices()}"
         )
     else:
-        model = ptts.load_model(config=args.config, eos_threshold=args.eos_threshold)
+        model = ptts.load_model(config=args.config, eos_threshold=args.eos_threshold, device=args.device)
 
     if Path(args.voice).exists():
         print(f"Loading audio from {args.voice}...")

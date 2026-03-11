@@ -602,6 +602,11 @@ fn prepare_text_prompt(text: &str) -> String {
     pocket_tts::tts_model::prepare_text_prompt(text).0
 }
 
+#[pyfunction]
+fn cuda_available() -> bool {
+    cfg!(feature = "cuda")
+}
+
 #[pymodule]
 fn ptts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Model>()?;
@@ -610,5 +615,6 @@ fn ptts(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_text_prompt, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
     Ok(())
 }
