@@ -17,3 +17,7 @@ rand = { workspace = true, features = ["std_rng"] }
 rand_distr = { workspace = true }
 sentencepiece = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+default = []
+cuda = ["xn/cuda", "pocket_tts/cuda"]
