@@ -62,63 +62,58 @@ const VOICES: &[&str] = &[
     "alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma",
 ];
 
-#[pyclass]
-struct Model {
-    inner: Arc<TTSModel<f32, xn::CpuDevice>>,
-    voices: std::collections::HashMap<String, Tensor<f32, xn::CpuDevice>>,
+struct ModelB<B: xn::Backend> {
+    inner: Arc<TTSModel<f32, B>>,
+    voices: std::collections::HashMap<String, Tensor<f32, B>>,
 }
 
-#[pymethods]
-impl Model {
-    #[pyo3(signature = (audio_prompt, cfg_coef=None, max_seq_len=2048))]
+impl<B: xn::Backend> ModelB<B> {
     fn get_state_for_audio(
         &self,
-        audio_prompt: PyReadonlyArray1<'_, f32>,
+        audio_prompt: &[f32],
         cfg_coef: Option<f32>,
         max_seq_len: usize,
-    ) -> PyResult<ModelState> {
+    ) -> xn::Result<ModelStateB<B>> {
         let expected_len = self.inner.sample_rate() * 10;
-        let audio_prompt = audio_prompt.as_slice()?;
         if audio_prompt.len() != expected_len {
-            py_bail!(
+            xn::bail!(
                 "audio_prompt must have exactly {expected_len} samples (10s at {}Hz), got {}",
                 self.inner.sample_rate(),
                 audio_prompt.len()
             );
         }
         let dev = self.inner.device();
-        let pcm = xn::Tensor::from_vec(audio_prompt.to_vec(), (1, 1, ()), dev).w()?;
-        let voice_emb = self.inner.encode_audio(&pcm).w()?;
-        let mut state = self.inner.init_flow_lm_state(1, max_seq_len).w()?;
-        self.inner.prompt_audio(&mut state, &voice_emb).w()?;
+        let pcm = xn::Tensor::from_vec(audio_prompt.to_vec(), (1, 1, ()), dev)?;
+        let voice_emb = self.inner.encode_audio(&pcm)?;
+        let mut state = self.inner.init_flow_lm_state(1, max_seq_len)?;
+        self.inner.prompt_audio(&mut state, &voice_emb)?;
         let cfg_state = if let Some(cfg_coef) = cfg_coef {
-            let null_pcm = pcm.zeros_like().w()?;
-            let null_emb = self.inner.encode_audio(&null_pcm).w()?;
-            let mut null_state = self.inner.init_flow_lm_state(1, max_seq_len).w()?;
-            self.inner.prompt_audio(&mut null_state, &null_emb).w()?;
+            let null_pcm = pcm.zeros_like()?;
+            let null_emb = self.inner.encode_audio(&null_pcm)?;
+            let mut null_state = self.inner.init_flow_lm_state(1, max_seq_len)?;
+            self.inner.prompt_audio(&mut null_state, &null_emb)?;
             Some((cfg_coef, null_state))
         } else {
             None
         };
-        Ok(ModelState {
+        Ok(ModelStateB {
             model: Arc::clone(&self.inner),
             state,
             cfg_state,
         })
     }
 
-    #[pyo3(signature = (voice, max_seq_len=2048))]
-    fn get_state_for_voice(&self, voice: &str, max_seq_len: usize) -> PyResult<ModelState> {
+    fn get_state_for_voice(&self, voice: &str, max_seq_len: usize) -> xn::Result<ModelStateB<B>> {
         let voice_emb = match self.voices.get(voice) {
             Some(emb) => emb,
             None => {
                 let available: Vec<_> = self.voices.keys().collect();
-                py_bail!("unknown voice '{voice}'. Available voices: {available:?}")
+                xn::bail!("unknown voice '{voice}'. Available voices: {available:?}")
             }
         };
-        let mut state = self.inner.init_flow_lm_state(1, max_seq_len).w()?;
-        self.inner.prompt_audio(&mut state, voice_emb).w()?;
-        Ok(ModelState {
+        let mut state = self.inner.init_flow_lm_state(1, max_seq_len)?;
+        self.inner.prompt_audio(&mut state, voice_emb)?;
+        Ok(ModelStateB {
             model: Arc::clone(&self.inner),
             state,
             cfg_state: None,
@@ -134,12 +129,67 @@ impl Model {
     }
 }
 
-#[pyclass]
-struct ModelState {
-    model: Arc<TTSModel<f32, xn::CpuDevice>>,
-    state: TTSState<f32, xn::CpuDevice>,
-    cfg_state: Option<(f32, TTSState<f32, xn::CpuDevice>)>,
+// Poor man's type erasure, that's especially painful with pyo3 where
+// the [pyclass] attribute is on a struct to get a proper object.
+enum ModelV {
+    Cpu(ModelB<xn::CpuDevice>),
 }
+
+#[pyclass]
+struct Model(ModelV);
+
+#[pymethods]
+impl Model {
+    #[pyo3(signature = (audio_prompt, cfg_coef=None, max_seq_len=2048))]
+    fn get_state_for_audio(
+        &self,
+        audio_prompt: PyReadonlyArray1<'_, f32>,
+        cfg_coef: Option<f32>,
+        max_seq_len: usize,
+    ) -> PyResult<ModelState> {
+        let audio_prompt = audio_prompt.as_slice()?;
+        let inner = match &self.0 {
+            ModelV::Cpu(m) => ModelStateV::Cpu(
+                m.get_state_for_audio(audio_prompt, cfg_coef, max_seq_len)
+                    .w()?,
+            ),
+        };
+        Ok(ModelState(inner))
+    }
+
+    #[pyo3(signature = (voice, max_seq_len=2048))]
+    fn get_state_for_voice(&self, voice: &str, max_seq_len: usize) -> PyResult<ModelState> {
+        let inner = match &self.0 {
+            ModelV::Cpu(m) => ModelStateV::Cpu(m.get_state_for_voice(voice, max_seq_len).w()?),
+        };
+        Ok(ModelState(inner))
+    }
+
+    fn voices(&self) -> Vec<String> {
+        match &self.0 {
+            ModelV::Cpu(m) => m.voices(),
+        }
+    }
+
+    fn sample_rate(&self) -> usize {
+        match &self.0 {
+            ModelV::Cpu(m) => m.sample_rate(),
+        }
+    }
+}
+
+struct ModelStateB<B: xn::Backend> {
+    model: Arc<TTSModel<f32, B>>,
+    state: TTSState<f32, B>,
+    cfg_state: Option<(f32, TTSState<f32, B>)>,
+}
+
+enum ModelStateV {
+    Cpu(ModelStateB<xn::CpuDevice>),
+}
+
+#[pyclass]
+struct ModelState(ModelStateV);
 
 fn run_generate<B: xn::Backend>(
     model: Arc<TTSModel<f32, B>>,
@@ -212,8 +262,7 @@ fn run_generate<B: xn::Backend>(
     Ok(pcm)
 }
 
-#[pymethods]
-impl ModelState {
+impl<B: xn::Backend> ModelStateB<B> {
     fn clone(&self) -> Self {
         Self {
             model: Arc::clone(&self.model),
@@ -226,7 +275,6 @@ impl ModelState {
         self.model.flow_lm.conditioner.tokenize(text).w()
     }
 
-    #[pyo3(signature = (text, temperature=0.7, seed=4242424242424242, pad_to=None))]
     fn generate_audio<'py>(
         &self,
         py: Python<'py>,
@@ -262,7 +310,6 @@ impl ModelState {
         Ok(PyArray1::from_vec(py, pcm))
     }
 
-    #[pyo3(signature = (tokens, temperature=0.7, seed=4242424242424242, frames_after_eos=1))]
     fn generate_audio_for_tokens<'py>(
         &self,
         py: Python<'py>,
@@ -303,6 +350,51 @@ impl ModelState {
             .w()?;
 
         Ok(PyArray1::from_vec(py, pcm))
+    }
+}
+
+#[pymethods]
+impl ModelState {
+    fn clone(&self) -> Self {
+        match &self.0 {
+            ModelStateV::Cpu(s) => ModelState(ModelStateV::Cpu(s.clone())),
+        }
+    }
+
+    fn tokenize(&self, text: &str) -> PyResult<Vec<u32>> {
+        match &self.0 {
+            ModelStateV::Cpu(s) => s.tokenize(text),
+        }
+    }
+
+    #[pyo3(signature = (text, temperature=0.7, seed=4242424242424242, pad_to=None))]
+    fn generate_audio<'py>(
+        &self,
+        py: Python<'py>,
+        text: &str,
+        temperature: f32,
+        seed: u64,
+        pad_to: Option<usize>,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        match &self.0 {
+            ModelStateV::Cpu(s) => s.generate_audio(py, text, temperature, seed, pad_to),
+        }
+    }
+
+    #[pyo3(signature = (tokens, temperature=0.7, seed=4242424242424242, frames_after_eos=1))]
+    fn generate_audio_for_tokens<'py>(
+        &self,
+        py: Python<'py>,
+        tokens: Vec<i32>,
+        temperature: f32,
+        seed: u64,
+        frames_after_eos: usize,
+    ) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        match &self.0 {
+            ModelStateV::Cpu(s) => {
+                s.generate_audio_for_tokens(py, tokens, temperature, seed, frames_after_eos)
+            }
+        }
     }
 }
 
@@ -427,10 +519,10 @@ fn load_model_(
             || v.starts_with("mimi.quantizer")
     })?;
 
-    Ok(Model {
+    Ok(Model(ModelV::Cpu(ModelB {
         inner: Arc::new(model),
         voices,
-    })
+    })))
 }
 
 #[pyfunction]
