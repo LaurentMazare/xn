@@ -133,6 +133,8 @@ impl<B: xn::Backend> ModelB<B> {
 // the [pyclass] attribute is on a struct to get a proper object.
 enum ModelV {
     Cpu(ModelB<xn::CpuDevice>),
+    #[cfg(feature = "cuda")]
+    Cuda(ModelB<xn::CudaDevice>),
 }
 
 #[pyclass]
@@ -153,6 +155,11 @@ impl Model {
                 m.get_state_for_audio(audio_prompt, cfg_coef, max_seq_len)
                     .w()?,
             ),
+            #[cfg(feature = "cuda")]
+            ModelV::Cuda(m) => ModelStateV::Cuda(
+                m.get_state_for_audio(audio_prompt, cfg_coef, max_seq_len)
+                    .w()?,
+            ),
         };
         Ok(ModelState(inner))
     }
@@ -161,6 +168,8 @@ impl Model {
     fn get_state_for_voice(&self, voice: &str, max_seq_len: usize) -> PyResult<ModelState> {
         let inner = match &self.0 {
             ModelV::Cpu(m) => ModelStateV::Cpu(m.get_state_for_voice(voice, max_seq_len).w()?),
+            #[cfg(feature = "cuda")]
+            ModelV::Cuda(m) => ModelStateV::Cuda(m.get_state_for_voice(voice, max_seq_len).w()?),
         };
         Ok(ModelState(inner))
     }
@@ -168,12 +177,16 @@ impl Model {
     fn voices(&self) -> Vec<String> {
         match &self.0 {
             ModelV::Cpu(m) => m.voices(),
+            #[cfg(feature = "cuda")]
+            ModelV::Cuda(m) => m.voices(),
         }
     }
 
     fn sample_rate(&self) -> usize {
         match &self.0 {
             ModelV::Cpu(m) => m.sample_rate(),
+            #[cfg(feature = "cuda")]
+            ModelV::Cuda(m) => m.sample_rate(),
         }
     }
 }
@@ -186,6 +199,8 @@ struct ModelStateB<B: xn::Backend> {
 
 enum ModelStateV {
     Cpu(ModelStateB<xn::CpuDevice>),
+    #[cfg(feature = "cuda")]
+    Cuda(ModelStateB<xn::CudaDevice>),
 }
 
 #[pyclass]
@@ -358,12 +373,16 @@ impl ModelState {
     fn clone(&self) -> Self {
         match &self.0 {
             ModelStateV::Cpu(s) => ModelState(ModelStateV::Cpu(s.clone())),
+            #[cfg(feature = "cuda")]
+            ModelStateV::Cuda(s) => ModelState(ModelStateV::Cuda(s.clone())),
         }
     }
 
     fn tokenize(&self, text: &str) -> PyResult<Vec<u32>> {
         match &self.0 {
             ModelStateV::Cpu(s) => s.tokenize(text),
+            #[cfg(feature = "cuda")]
+            ModelStateV::Cuda(s) => s.tokenize(text),
         }
     }
 
@@ -378,6 +397,8 @@ impl ModelState {
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         match &self.0 {
             ModelStateV::Cpu(s) => s.generate_audio(py, text, temperature, seed, pad_to),
+            #[cfg(feature = "cuda")]
+            ModelStateV::Cuda(s) => s.generate_audio(py, text, temperature, seed, pad_to),
         }
     }
 
@@ -392,6 +413,10 @@ impl ModelState {
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         match &self.0 {
             ModelStateV::Cpu(s) => {
+                s.generate_audio_for_tokens(py, tokens, temperature, seed, frames_after_eos)
+            }
+            #[cfg(feature = "cuda")]
+            ModelStateV::Cuda(s) => {
                 s.generate_audio_for_tokens(py, tokens, temperature, seed, frames_after_eos)
             }
         }
