@@ -481,14 +481,14 @@ fn load_voice_embedding<B: xn::Backend>(
     }
 }
 
-fn load_model_(
+fn load_model_<B: xn::Backend>(
     temperature: f32,
     repo_id: String,
     model_file: String,
     config: Option<String>,
     eos_threshold: Option<f32>,
-) -> xn::Result<Model> {
-    let dev = xn::CpuDevice;
+    dev: B,
+) -> xn::Result<ModelB<B>> {
     let (model_path, tokenizer_path, cfg, voices) = match config {
         Some(config_path) => {
             let config_path = std::fs::canonicalize(&config_path).map_err(xn::Error::msg)?;
@@ -544,14 +544,14 @@ fn load_model_(
             || v.starts_with("mimi.quantizer")
     })?;
 
-    Ok(Model(ModelV::Cpu(ModelB {
+    Ok(ModelB {
         inner: Arc::new(model),
         voices,
-    })))
+    })
 }
 
 #[pyfunction]
-#[pyo3(signature = (temperature=0.7, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None, eos_threshold=None))]
+#[pyo3(signature = (temperature=0.7, repo_id="kyutai/pocket-tts", model_file="tts_b6369a24.safetensors", config=None, eos_threshold=None, device=None))]
 fn load_model(
     py: Python<'_>,
     temperature: f32,
@@ -559,12 +559,32 @@ fn load_model(
     model_file: &str,
     config: Option<&str>,
     eos_threshold: Option<f32>,
+    device: Option<&str>,
 ) -> PyResult<Model> {
     let repo_id = repo_id.to_string();
     let model_file = model_file.to_string();
     let config = config.map(|s| s.to_string());
-    py.detach(move || load_model_(temperature, repo_id, model_file, config, eos_threshold))
-        .w()
+    py.detach(move || match device {
+        None | Some("cpu") => {
+            let model = load_model_(
+                temperature,
+                repo_id,
+                model_file,
+                config,
+                eos_threshold,
+                xn::CpuDevice,
+            )?;
+            Ok(Model(ModelV::Cpu(model)))
+        }
+        #[cfg(feature = "cuda")]
+        Some("cuda") => {
+            let dev = xn::CudaDevice::new(0)?;
+            let model = load_model_(temperature, repo_id, model_file, config, eos_threshold, dev)?;
+            Ok(Model(ModelV::Cuda(model)))
+        }
+        Some(d) => Err(xn::Error::msg(format!("unknown device '{d}'"))),
+    })
+    .w()
 }
 
 #[pyfunction]
