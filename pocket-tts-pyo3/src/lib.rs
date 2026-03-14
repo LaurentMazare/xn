@@ -207,8 +207,11 @@ enum ModelStateV {
 struct ModelState(ModelStateV);
 
 /// Returns true if a python signal has been raised, e.g. on an interrupt.
-fn check_py_interrupt() -> bool {
-    Python::attach(|py| py.check_signals().is_err())
+fn check_py_interrupt() -> xn::Result<()> {
+    if Python::attach(|py| py.check_signals().is_err()) {
+        xn::bail!("interrupted by python signal");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -278,9 +281,8 @@ fn run_generate<B: xn::Backend>(
         prev_latent = next_latent;
         if let Some(check_step) = check_py_interrupts_every.as_ref()
             && step % check_step == 0
-            && check_py_interrupt()
         {
-            xn::bail!("interrupted by python signal");
+            check_py_interrupt()?
         }
     }
     drop(latent_tx);
