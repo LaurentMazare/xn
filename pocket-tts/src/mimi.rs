@@ -1,9 +1,9 @@
 use crate::conv::pad_for_conv1d;
 use crate::conv::{StreamingConv1dState, StreamingConvTr1dState};
 use crate::dummy_quantizer::DummyQuantizer;
-use crate::mimi_transformer::{ProjectedTransformer, StreamingTransformerState};
 use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder, SEANetEncoderState};
+use crate::transformer::{ProjectedTransformer, StreamingTransformerState};
 use xn::nn::var_builder::Path;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 

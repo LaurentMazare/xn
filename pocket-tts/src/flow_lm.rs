@@ -1,6 +1,6 @@
 use crate::conditioners::LUTConditioner;
-use crate::mimi_transformer::{StreamingTransformer, StreamingTransformerState};
 use crate::mlp::SimpleMLPAdaLN;
+use crate::transformer::{StreamingTransformer, StreamingTransformerState};
 use xn::nn::{Linear, var_builder::Path};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
@@ -115,7 +115,7 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
             cfg.dim_feedforward,
             None,
             cfg.max_period,
-            crate::mimi_transformer::Kind::FlowLm,
+            crate::transformer::Kind::FlowLm,
         )?;
 
         let emb_std = vb.tensor("emb_std", (cfg.ldim,))?;

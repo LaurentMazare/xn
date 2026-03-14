@@ -4,7 +4,6 @@ pub mod dummy_quantizer;
 pub mod flow_lm;
 pub mod layer_scale;
 pub mod mimi;
-pub mod mimi_transformer;
 pub mod mlp;
 pub mod resample;
 pub mod rope;
