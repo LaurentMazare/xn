@@ -206,6 +206,12 @@ enum ModelStateV {
 #[pyclass]
 struct ModelState(ModelStateV);
 
+/// Returns true if a python signal has been raised, e.g. on an interrupt.
+fn check_py_interrupt() -> bool {
+    Python::attach(|py| py.check_signals().is_err())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_generate<B: xn::Backend>(
     model: Arc<TTSModel<f32, B>>,
     mut state: TTSState<f32, B>,
@@ -214,6 +220,7 @@ fn run_generate<B: xn::Backend>(
     temperature: f32,
     seed: u64,
     frames_after_eos: usize,
+    check_py_interrupts_every: Option<usize>,
 ) -> Result<Vec<f32>, xn::Error> {
     let device = model.device();
     let num_tokens = tokens.len();
@@ -246,7 +253,7 @@ fn run_generate<B: xn::Backend>(
     });
 
     let mut eos_countdown: Option<usize> = None;
-    for _step in 0..max_frames {
+    for step in 0..max_frames {
         let (next_latent, is_eos) = match cfg_state.as_mut() {
             Some((cfg_coef, cfg_state)) => {
                 model.generate_step_cfg(&mut state, cfg_state, *cfg_coef, &prev_latent, &mut rng)?
@@ -267,6 +274,12 @@ fn run_generate<B: xn::Backend>(
             *countdown -= 1;
         }
         prev_latent = next_latent;
+        if let Some(check_step) = check_py_interrupts_every.as_ref()
+            && step % check_step == 0
+            && check_py_interrupt()
+        {
+            xn::bail!("interrupted by python signal");
+        }
     }
     drop(latent_tx);
 
@@ -297,6 +310,7 @@ impl<B: xn::Backend> ModelStateB<B> {
         temperature: f32,
         seed: u64,
         pad_to: Option<usize>,
+        check_py_interrupts_every: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let model = Arc::clone(&self.model);
         let state = self.state.clone();
@@ -318,7 +332,7 @@ impl<B: xn::Backend> ModelStateB<B> {
                     };
                     tokens.resize(pad_to, learnt_padding_id);
                 }
-                run_generate(model, state, cfg_state, tokens, temperature, seed, frames_after_eos)
+                run_generate(model, state, cfg_state, tokens, temperature, seed, frames_after_eos, check_py_interrupts_every)
             })
             .w()?;
 
@@ -332,6 +346,7 @@ impl<B: xn::Backend> ModelStateB<B> {
         temperature: f32,
         seed: u64,
         frames_after_eos: usize,
+        check_py_interrupts_every: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         let model = Arc::clone(&self.model);
         let state = self.state.clone();
@@ -360,6 +375,7 @@ impl<B: xn::Backend> ModelStateB<B> {
                     temperature,
                     seed,
                     frames_after_eos,
+                    check_py_interrupts_every,
                 )
             })
             .w()?;
@@ -386,7 +402,7 @@ impl ModelState {
         }
     }
 
-    #[pyo3(signature = (text, temperature=0.7, seed=4242424242424242, pad_to=None))]
+    #[pyo3(signature = (text, temperature=0.7, seed=4242424242424242, pad_to=None, check_py_interrupts_every=5))]
     fn generate_audio<'py>(
         &self,
         py: Python<'py>,
@@ -394,15 +410,30 @@ impl ModelState {
         temperature: f32,
         seed: u64,
         pad_to: Option<usize>,
+        check_py_interrupts_every: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         match &self.0 {
-            ModelStateV::Cpu(s) => s.generate_audio(py, text, temperature, seed, pad_to),
+            ModelStateV::Cpu(s) => s.generate_audio(
+                py,
+                text,
+                temperature,
+                seed,
+                pad_to,
+                check_py_interrupts_every,
+            ),
             #[cfg(feature = "cuda")]
-            ModelStateV::Cuda(s) => s.generate_audio(py, text, temperature, seed, pad_to),
+            ModelStateV::Cuda(s) => s.generate_audio(
+                py,
+                text,
+                temperature,
+                seed,
+                pad_to,
+                check_py_interrupts_every,
+            ),
         }
     }
 
-    #[pyo3(signature = (tokens, temperature=0.7, seed=4242424242424242, frames_after_eos=1))]
+    #[pyo3(signature = (tokens, temperature=0.7, seed=4242424242424242, frames_after_eos=1, check_py_interrupts_every=5))]
     fn generate_audio_for_tokens<'py>(
         &self,
         py: Python<'py>,
@@ -410,15 +441,26 @@ impl ModelState {
         temperature: f32,
         seed: u64,
         frames_after_eos: usize,
+        check_py_interrupts_every: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         match &self.0 {
-            ModelStateV::Cpu(s) => {
-                s.generate_audio_for_tokens(py, tokens, temperature, seed, frames_after_eos)
-            }
+            ModelStateV::Cpu(s) => s.generate_audio_for_tokens(
+                py,
+                tokens,
+                temperature,
+                seed,
+                frames_after_eos,
+                check_py_interrupts_every,
+            ),
             #[cfg(feature = "cuda")]
-            ModelStateV::Cuda(s) => {
-                s.generate_audio_for_tokens(py, tokens, temperature, seed, frames_after_eos)
-            }
+            ModelStateV::Cuda(s) => s.generate_audio_for_tokens(
+                py,
+                tokens,
+                temperature,
+                seed,
+                frames_after_eos,
+                check_py_interrupts_every,
+            ),
         }
     }
 }
