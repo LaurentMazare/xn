@@ -1,6 +1,6 @@
 [package]
 name = "xn-flash-attn"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 description = "Flash attention bindings for the XN ML framework."
@@ -10,7 +10,7 @@ categories = ["science"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-xn = { path = "../xn-core", features = ["cuda"], version = "0.1.0" }
+xn = { path = "../xn-core", features = ["cuda"], version = "0.1.1" }
 cudarc = { version = "0.19.0", features = ["driver"], default-features = false }
 half = { version = "2.7.1", features = ["num-traits"] }
 

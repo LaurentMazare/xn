@@ -1,6 +1,6 @@
 [package]
 name = "xn"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Another minimalist deep-learning framework optimized for inference."
 repository = "https://github.com/LaurentMazare/xn"
