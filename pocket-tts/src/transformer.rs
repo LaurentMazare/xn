@@ -36,14 +36,13 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
         Ok((keys, values))
     }
 
-    fn materialize_causal_mask(&self, num_queries: usize) -> Result<Tensor<T, B>> {
-        let num_keys = self.current_end;
-        let shift = num_keys - num_queries;
+    pub fn materialize_causal_mask(&self, num_queries: usize) -> Result<Tensor<T, B>> {
+        let num_keys = self.current_end + num_queries;
         // Upper-left triangular mask (causal)
         let mut data = Vec::with_capacity(num_queries * num_keys);
         for q in 0..num_queries {
             for k in 0..num_keys {
-                if k <= q + shift {
+                if k <= q + self.current_end {
                     data.push(T::from_f32(0.0));
                 } else {
                     data.push(T::from_f32(f32::NEG_INFINITY));
@@ -95,6 +94,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         query: &Tensor<T, B>,
         rope: &RotaryEmbedding<T, B>,
         state: &mut StreamingMHAState<T, B>,
+        mask: Option<&Tensor<T, B>>,
     ) -> Result<Tensor<T, B>> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
@@ -114,7 +114,6 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         // Apply RoPE: q, k are [b, t, h, d]
         let (q, k) = rope.forward(&q, &k, state.current_end)?;
         let (k, v) = state.complete_kv(&k, &v)?;
-        let mask = state.materialize_causal_mask(t)?;
 
         // Transpose to [b, h, t, d] for attention
         let q = q.transpose(1, 2)?;
@@ -124,7 +123,10 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         // Scaled dot-product attention
         let scale = T::from_f32(1.0 / (d as f32).sqrt());
         let attn = q.matmul_t(&k)?.scale(scale)?;
-        let attn = attn.broadcast_add(&mask)?;
+        let attn = match mask {
+            Some(m) => attn.broadcast_add(m)?,
+            None => attn,
+        };
         let attn = attn.softmax()?;
         let x = attn.matmul(&v)?;
 

@@ -257,7 +257,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
                 attn.forward(&norm1, rope, cache, mask)?
             }
             (AttentionKind::FlowLm(attn), LayerAttentionState::FlowLm(mha_state)) => {
-                attn.forward(&norm1, rope, mha_state)?
+                attn.forward(&norm1, rope, mha_state, mask)?
             }
             _ => xn::bail!("attention kind and state type mismatch"),
         };
@@ -337,9 +337,9 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
         state: &mut StreamingTransformerState<T, B>,
     ) -> Result<Tensor<T, B>> {
         let mut x = x.clone();
+        let (_, seq_len, _) = x.dims3()?;
         let mask = match state.layer_states.first() {
             Some(LayerAttentionState::Mimi(kv_cache)) => {
-                let (_, seq_len, _) = x.dims3()?;
                 let kv_seq_len = kv_cache.current_seq_len()?;
                 let context = kv_cache.max_seq_len;
                 // Causal mask of shape (1, 1, seq_len, kv_seq_len + seq_len) with -inf in upper triangle
@@ -359,8 +359,9 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
                     Tensor::from_vec(mask_data, (1, 1, seq_len, kv_seq_len + seq_len), x.device())?;
                 Some(mask)
             }
-            // For the FlowLm model, attention is handled directly in the forward layer.
-            Some(LayerAttentionState::FlowLm(_)) => None,
+            Some(LayerAttentionState::FlowLm(kv_cache)) => {
+                Some(kv_cache.materialize_causal_mask(seq_len)?)
+            }
             _ => None,
         };
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
