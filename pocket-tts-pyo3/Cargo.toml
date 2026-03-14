@@ -21,3 +21,4 @@ serde_json = { workspace = true }
 [features]
 default = []
 cuda = ["xn/cuda", "pocket_tts/cuda"]
+accelerate = ["xn/accelerate", "pocket_tts/accelerate"]

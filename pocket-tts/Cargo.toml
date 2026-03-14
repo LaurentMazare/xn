@@ -25,6 +25,7 @@ tracing-chrome = { workspace = true }
 [features]
 default = []
 cuda = ["xn/cuda"]
+accelerate = ["xn/accelerate"]
 sp = ["dep:sentencepiece"]
 
 [[example]]
