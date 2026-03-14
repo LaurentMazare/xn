@@ -260,9 +260,11 @@ fn run_generate<B: xn::Backend>(
             }
             None => model.generate_step(&mut state, &prev_latent, &mut rng)?,
         };
-        latent_tx
-            .send(next_latent.clone())
-            .map_err(xn::Error::msg)?;
+        // Rather than raising an error when the channel is closed, we break out of the loop
+        // so as to get a proper error message from the decode thread.
+        if latent_tx.send(next_latent.clone()).is_err() {
+            break;
+        }
 
         if is_eos && eos_countdown.is_none() {
             eos_countdown = Some(frames_after_eos);
