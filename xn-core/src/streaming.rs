@@ -1,4 +1,4 @@
-use xn::{Backend, Result, Tensor, WithDType, WithDTypeF};
+use crate::{Backend, Result, Tensor, WithDType, WithDTypeF};
 
 /// A tensor that may be empty, used in streaming contexts.
 pub struct StreamTensor<T: WithDType, B: Backend>(Option<Tensor<T, B>>);
@@ -155,19 +155,11 @@ pub fn apply_state_mask<T: WithDTypeF, B: Backend>(
     match (new_state, old_state) {
         (None, None) => Ok(None),
         (None, Some(_)) => {
-            xn::bail!("streaming module should only be used with constant steps")
+            crate::bail!("streaming module should only be used with constant steps")
         }
         (Some(new_s), old_opt) => {
-            let mask_data: Vec<T> = cpu
-                .iter()
-                .map(|&b| {
-                    if b {
-                        T::from_f32(1.0)
-                    } else {
-                        T::from_f32(0.0)
-                    }
-                })
-                .collect();
+            let mask_data: Vec<T> =
+                cpu.iter().map(|&b| if b { T::from_f32(1.0) } else { T::from_f32(0.0) }).collect();
             let mask_t = Tensor::from_vec(mask_data, (cpu.len(), 1, 1), new_s.device())?;
             let result = match old_opt {
                 None => new_s.broadcast_mul(&mask_t)?,

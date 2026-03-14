@@ -1,8 +1,8 @@
 use crate::conv::{
     Conv1dState, ConvTr1dState, Norm, PadMode, StreamableConv1d, StreamableConvTranspose1d,
 };
-use crate::streaming::{StreamMask, StreamTensor};
 use xn::nn::var_builder::Path;
+use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 #[derive(Debug, Copy, Clone, PartialEq)]

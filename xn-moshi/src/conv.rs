@@ -1,5 +1,5 @@
-use crate::streaming::{StreamMask, StreamTensor, apply_state_mask};
 use xn::nn::var_builder::Path;
+use xn::streaming::{apply_state_mask, StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

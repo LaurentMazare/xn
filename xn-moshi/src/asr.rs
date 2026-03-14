@@ -1,6 +1,6 @@
 use crate::lm::{LmModel, LmState};
 use crate::mimi::{Mimi, MimiEncodeState};
-use crate::streaming::{StreamMask, StreamTensor};
+use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 // ============================================================================

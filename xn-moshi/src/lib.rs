@@ -5,7 +5,6 @@ pub mod lm;
 pub mod mimi;
 pub mod quantization;
 pub mod seanet;
-pub mod streaming;
 pub mod transformer;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

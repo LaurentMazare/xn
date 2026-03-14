@@ -12,6 +12,7 @@ pub mod nn;
 pub mod ops;
 pub mod safetensors;
 pub mod shape;
+pub mod streaming;
 pub mod tensor;
 pub mod tensor_view;
 pub mod utils;
