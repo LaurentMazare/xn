@@ -214,6 +214,7 @@ fn audio_to_audio<Dev: Backend>(
     dev: Dev,
 ) -> Result<()> {
     let target_sample_rate: usize = 24000;
+    let frame_size: usize = 1920;
 
     // --- Load audio ---
     println!("Loading audio from {}...", input.display());
@@ -253,13 +254,9 @@ fn audio_to_audio<Dev: Backend>(
     println!("  Model loaded");
 
     // --- Streaming encode ---
-    let chunk_size = 1920;
-    let num_chunks = pcm_data.len().div_ceil(chunk_size);
+    let num_chunks = pcm_data.len().div_ceil(frame_size);
 
-    println!(
-        "\nEncoding ({} chunks of {} samples)...",
-        num_chunks, chunk_size
-    );
+    println!("\nEncoding ({num_chunks} chunks of {frame_size} samples)...",);
     let mut enc_state = model.init_encode_state(1)?;
     let mask = StreamMask::all_active(1);
 
@@ -267,14 +264,14 @@ fn audio_to_audio<Dev: Backend>(
     let mut all_codes: Vec<Tensor<i64, Dev>> = Vec::with_capacity(num_chunks);
 
     for chunk_idx in 0..num_chunks {
-        let start = chunk_idx * chunk_size;
-        let end = (start + chunk_size).min(pcm_data.len());
+        let start = chunk_idx * frame_size;
+        let end = (start + frame_size).min(pcm_data.len());
         let mut chunk: Vec<f32> = pcm_data[start..end].to_vec();
-        if chunk.len() < chunk_size {
-            chunk.resize(chunk_size, 0.0);
+        if chunk.len() < frame_size {
+            chunk.resize(frame_size, 0.0);
         }
 
-        let audio: Tensor<f32, Dev> = Tensor::from_vec(chunk, (1, 1, chunk_size), &dev)?;
+        let audio: Tensor<f32, Dev> = Tensor::from_vec(chunk, (1, 1, frame_size), &dev)?;
         let codes_out =
             model.encode_step(&StreamTensor::from_tensor(audio), &mut enc_state, &mask)?;
 
@@ -380,6 +377,8 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     use std::io::Write;
 
     let target_sample_rate: usize = 24000;
+    let frame_size: usize = 1920;
+    let asr_delay_in_seconds = 2.5;
 
     // --- Load audio ---
     println!("Loading audio from {}...", input.display());
@@ -425,19 +424,27 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     println!("  LM loaded");
 
     // --- Create ASR ---
-    let asr_delay_in_tokens = 31; // 2.5s * 12.5fps
+    let asr_delay_in_tokens =
+        (asr_delay_in_seconds * target_sample_rate as f64 / frame_size as f64) as usize;
     let asr = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
     let mut state = asr.init_state(batch_size)?;
     let mask = StreamMask::all_active(batch_size);
 
     // --- Process audio ---
-    let chunk_size = 1920; // 80ms at 24kHz
-    let num_chunks = pcm_data.len().div_ceil(chunk_size);
+    // Add two frames before the start of the audio, and two seconds of silence after
+    // the end.
+    let pcm_data = [
+        vec![0.0; frame_size * 2],
+        pcm_data,
+        vec![0.0; (target_sample_rate as f64 * asr_delay_in_seconds) as usize],
+    ]
+    .concat();
+    let num_chunks = pcm_data.len().div_ceil(frame_size);
     let start_time = std::time::Instant::now();
 
     println!(
         "\nProcessing ({} chunks of {} samples, batch_size={})...",
-        num_chunks, chunk_size, batch_size
+        num_chunks, frame_size, batch_size
     );
     println!("---");
 
@@ -447,17 +454,17 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     let mut last_decoded_len = 0;
 
     for chunk_idx in 0..num_chunks {
-        let start = chunk_idx * chunk_size;
-        let end = (start + chunk_size).min(pcm_data.len());
+        let start = chunk_idx * frame_size;
+        let end = (start + frame_size).min(pcm_data.len());
         let mut chunk: Vec<f32> = pcm_data[start..end].to_vec();
-        if chunk.len() < chunk_size {
-            chunk.resize(chunk_size, 0.0);
+        if chunk.len() < frame_size {
+            chunk.resize(frame_size, 0.0);
         }
 
         // Replicate the same audio chunk across the batch.
         let chunk_batched: Vec<f32> = chunk.repeat(batch_size);
         let audio: Tensor<f32, Dev> =
-            Tensor::from_vec(chunk_batched, (batch_size, 1, chunk_size), &dev)?;
+            Tensor::from_vec(chunk_batched, (batch_size, 1, frame_size), &dev)?;
         let pcm = StreamTensor::from_tensor(audio);
         let start_time = std::time::Instant::now();
         let msgs = asr.step_pcm(&pcm, &mut state, &mask, |_, _, _| {})?;
