@@ -123,6 +123,59 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
         Ok(data_cow.into_owned())
     }
 
+    pub fn to_scalar(&self) -> Result<T> {
+        let len = self.elem_count();
+        if self.rank() != 0 || len != 1 {
+            crate::bail!(
+                "to_scalar can only be called on a scalar (rank 0) tensor, but got shape {:?}",
+                self.shape()
+            );
+        }
+        let data = self.storage()?;
+        let data_cow = B::data(&*data, len)?;
+        Ok(data_cow[0])
+    }
+
+    pub fn to_vec1(&self) -> Result<Vec<T>> {
+        if self.rank() != 1 {
+            crate::bail!(
+                "to_vec1 can only be called on a tensor of shape [_], but got shape {:?}",
+                self.shape
+            );
+        }
+        self.to_vec()
+    }
+
+    pub fn to_vec2(&self) -> Result<Vec<Vec<T>>> {
+        let (outer, inner) = self.dims2()?;
+        let data = self.storage()?;
+        let data_cow = B::data(&*data, self.elem_count())?;
+        let mut result = Vec::with_capacity(outer);
+        for i in 0..outer {
+            let start = i * inner;
+            let end = start + inner;
+            result.push(data_cow[start..end].to_vec());
+        }
+        Ok(result)
+    }
+
+    pub fn to_vec3(&self) -> Result<Vec<Vec<Vec<T>>>> {
+        let (d1, d2, d3) = self.dims3()?;
+        let data = self.storage()?;
+        let data_cow = B::data(&*data, self.elem_count())?;
+        let mut result = Vec::with_capacity(d1);
+        for i in 0..d1 {
+            let mut inner2 = Vec::with_capacity(d2);
+            for j in 0..d2 {
+                let start = (i * d2 + j) * d3;
+                let end = start + d3;
+                inner2.push(data_cow[start..end].to_vec());
+            }
+            result.push(inner2);
+        }
+        Ok(result)
+    }
+
     pub fn full(value: T, shape: impl Into<Shape>, device: &B) -> Result<Self> {
         let shape: Shape = shape.into();
         let size = shape.elem_count();
