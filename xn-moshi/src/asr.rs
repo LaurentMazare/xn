@@ -270,32 +270,20 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
 
             // Sample text tokens
             // text_logits shape: (batch, 1, text_out_vocab_size)
-            let logits_dims = text_logits.dims();
-            let vocab_size = logits_dims[2];
-            let logits_2d = text_logits.reshape((logits_dims[0], vocab_size))?;
-            let logits_data: Vec<LmT> = logits_2d.to_vec()?;
-
+            let (batch_size, _one, vocab_size) = text_logits.dims3()?;
+            let logits_2d = text_logits.reshape((batch_size, vocab_size))?;
             let sampled_tokens = if self.temperature <= 0.0 {
-                // Greedy: argmax over last dim on CPU
-                (0..batch_size)
-                    .map(|b| {
-                        let start = b * vocab_size;
-                        let slice = &logits_data[start..start + vocab_size];
-                        argmax(slice)
-                    })
-                    .collect::<Vec<u32>>()
+                logits_2d.argmax(1)?
             } else {
-                // Gumbel softmax sampling on CPU
-                (0..batch_size)
-                    .map(|b| {
-                        let start = b * vocab_size;
-                        let slice = &logits_data[start..start + vocab_size];
-                        gumbel_argmax(slice, self.temperature)
-                    })
-                    .collect::<Vec<u32>>()
+                xn::nn::sampling::gumbel_softmax(
+                    &logits_2d,
+                    self.temperature as f32,
+                    xn::D::Minus1,
+                )?
             };
 
             for (batch_idx, (text_token, item)) in sampled_tokens
+                .to_vec()?
                 .into_iter()
                 .zip(state.batch.iter_mut())
                 .enumerate()
@@ -303,7 +291,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
                 if !mask.is_active(batch_idx) {
                     continue;
                 }
-                item.text_token = text_token;
+                item.text_token = text_token as u32;
                 item.step_idx += 1;
                 if item.step_idx >= self.asr_delay_in_tokens {
                     if text_token == 3 || text_token == 0 {
@@ -352,41 +340,4 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         self.lm.reset_batch_idx(&mut state.lm, batch_idx)?;
         Ok(())
     }
-}
-
-/// Greedy argmax.
-fn argmax<T: WithDTypeF>(logits: &[T]) -> u32 {
-    let mut best_idx = 0u32;
-    let mut best_val = <T as WithDTypeF>::to_f32(logits[0]);
-    for (i, v) in logits.iter().enumerate().skip(1) {
-        let vf = <T as WithDTypeF>::to_f32(*v);
-        if vf > best_val {
-            best_val = vf;
-            best_idx = i as u32;
-        }
-    }
-    best_idx
-}
-
-/// Gumbel-max trick for sampling from logits.
-fn gumbel_argmax<T: WithDTypeF>(logits: &[T], temperature: f64) -> u32 {
-    use rand::Rng;
-    let mut rng = rand::rng();
-    let mut best_idx = 0u32;
-    let mut best_val = f64::NEG_INFINITY;
-    for (i, v) in logits.iter().enumerate() {
-        let u: f64 = loop {
-            let u: f64 = rng.random();
-            if u > 0.0 && u < 1.0 {
-                break u;
-            }
-        };
-        let gumbel = -(-u.ln()).ln();
-        let score = <T as WithDTypeF>::to_f32(*v) as f64 / temperature + gumbel;
-        if score > best_val {
-            best_val = score;
-            best_idx = i as u32;
-        }
-    }
-    best_idx
 }
