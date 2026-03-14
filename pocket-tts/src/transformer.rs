@@ -13,43 +13,45 @@ pub struct StreamingMHAState<T: WithDTypeF, B: Backend> {
     pub current_end: usize,
 }
 
-#[allow(clippy::type_complexity)]
-fn complete_kv<T: WithDTypeF, B: Backend>(
-    k_cache: &Tensor<T, B>,
-    v_cache: &Tensor<T, B>,
-    current_end: usize,
-    k: &Tensor<T, B>,
-    v: &Tensor<T, B>,
-) -> Result<(Tensor<T, B>, Tensor<T, B>, usize)> {
-    let t = k.dim(1usize)?;
+impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
+    pub fn device(&self) -> &B {
+        self.k_cache.device()
+    }
 
-    k_cache.slice_set(k, 1usize, current_end)?;
-    v_cache.slice_set(v, 1usize, current_end)?;
+    #[allow(clippy::type_complexity)]
+    pub fn complete_kv(
+        &mut self,
+        k: &Tensor<T, B>,
+        v: &Tensor<T, B>,
+    ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
+        let t = k.dim(1usize)?;
 
-    let new_end = current_end + t;
-    let keys = k_cache.narrow(1, 0..new_end)?.contiguous()?;
-    let values = v_cache.narrow(1, 0..new_end)?.contiguous()?;
-    Ok((keys, values, new_end))
-}
+        self.k_cache.slice_set(k, 1usize, self.current_end)?;
+        self.v_cache.slice_set(v, 1usize, self.current_end)?;
 
-fn materialize_causal_mask<T: WithDTypeF, B: Backend>(
-    num_queries: usize,
-    num_keys: usize,
-    device: &B,
-) -> Result<Tensor<T, B>> {
-    let shift = num_keys - num_queries;
-    // Upper-left triangular mask (causal)
-    let mut data = Vec::with_capacity(num_queries * num_keys);
-    for q in 0..num_queries {
-        for k in 0..num_keys {
-            if k <= q + shift {
-                data.push(T::from_f32(0.0));
-            } else {
-                data.push(T::from_f32(f32::NEG_INFINITY));
+        let new_end = self.current_end + t;
+        let keys = self.k_cache.narrow(1, 0..new_end)?.contiguous()?;
+        let values = self.v_cache.narrow(1, 0..new_end)?.contiguous()?;
+        self.current_end = new_end;
+        Ok((keys, values))
+    }
+
+    fn materialize_causal_mask(&self, num_queries: usize) -> Result<Tensor<T, B>> {
+        let num_keys = self.current_end;
+        let shift = num_keys - num_queries;
+        // Upper-left triangular mask (causal)
+        let mut data = Vec::with_capacity(num_queries * num_keys);
+        for q in 0..num_queries {
+            for k in 0..num_keys {
+                if k <= q + shift {
+                    data.push(T::from_f32(0.0));
+                } else {
+                    data.push(T::from_f32(f32::NEG_INFINITY));
+                }
             }
         }
+        Tensor::from_vec(data, (num_queries, num_keys), self.k_cache.device())
     }
-    Tensor::from_vec(data, (num_queries, num_keys), device)
 }
 
 /// Streaming multi-head attention (used by the flow LM transformer).
@@ -96,8 +98,6 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
     ) -> Result<Tensor<T, B>> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
-        let offset = state.current_end;
-
         let projected = self.in_proj.forward(query)?;
         // Split into q, k, v by narrowing on the last dimension
         let ed = self.embed_dim;
@@ -112,15 +112,9 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         ))?;
 
         // Apply RoPE: q, k are [b, t, h, d]
-        let (q, k) = rope.forward(&q, &k, offset)?;
-
-        // Complete KV cache: k, v are [b, t, h, d]
-        let (k, v, new_end) = complete_kv(&state.k_cache, &state.v_cache, offset, &k, &v)?;
-        state.current_end = new_end;
-
-        // Causal mask
-        let kv_len = k.dim(1usize)?;
-        let mask = materialize_causal_mask::<T, B>(t, kv_len, query.device())?;
+        let (q, k) = rope.forward(&q, &k, state.current_end)?;
+        let (k, v) = state.complete_kv(&k, &v)?;
+        let mask = state.materialize_causal_mask(t)?;
 
         // Transpose to [b, h, t, d] for attention
         let q = q.transpose(1, 2)?;
