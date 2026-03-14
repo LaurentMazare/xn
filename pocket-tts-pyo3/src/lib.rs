@@ -28,20 +28,11 @@ impl pocket_tts::flow_lm::Rng for StdRng {
 
 trait PyRes<R> {
     fn w(self) -> PyResult<R>;
-    #[allow(unused)]
-    fn w_f<P: AsRef<std::path::Path>>(self, p: P) -> PyResult<R>;
 }
 
 impl<R, E: Into<xn::Error>> PyRes<R> for Result<R, E> {
     fn w(self) -> PyResult<R> {
         self.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.into().to_string()))
-    }
-    fn w_f<P: AsRef<std::path::Path>>(self, p: P) -> PyResult<R> {
-        self.map_err(|e| {
-            let e = e.into().to_string();
-            let msg = format!("{:?}: {e}", p.as_ref());
-            pyo3::exceptions::PyValueError::new_err(msg)
-        })
     }
 }
 
@@ -541,8 +532,10 @@ fn load_model_<B: xn::Backend>(
             let parent = config_path.parent().context("config path has no parent")?;
             let model_path = parent.join("model.safetensors");
             let tokenizer_path = parent.join("tokenizer.model");
-            let config_str = std::fs::read_to_string(&config_path).map_err(xn::Error::msg)?;
-            let cfg: TTSConfig = serde_json::from_str(&config_str).map_err(xn::Error::msg)?;
+            let config_str = std::fs::read_to_string(&config_path)
+                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
+            let cfg: TTSConfig = serde_json::from_str(&config_str)
+                .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
             (
                 model_path,
                 tokenizer_path,
@@ -556,7 +549,9 @@ fn load_model_<B: xn::Backend>(
             let api = Api::new().map_err(xn::Error::msg)?;
             let repo = api.repo(Repo::new(repo_id, RepoType::Model));
 
-            let model_path = repo.get(&model_file).map_err(xn::Error::msg)?;
+            let model_path = repo
+                .get(&model_file)
+                .map_err(|e| xn::Error::msg(e).with_path(&model_file))?;
             let tokenizer_path = repo.get("tokenizer.model").map_err(xn::Error::msg)?;
 
             let mut voices = std::collections::HashMap::new();
@@ -575,10 +570,13 @@ fn load_model_<B: xn::Backend>(
     };
 
     let tokenizer_path = tokenizer_path.to_str().context("invalid tokenizer path")?;
-    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path).map_err(xn::Error::msg)?;
+    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
+        .map_err(|e| xn::Error::msg(e).with_path(tokenizer_path))?;
     let tokenizer = SpTokenizer(sp);
 
-    let vb = VB::load_with_key_map(&[&model_path], dev, remap_key)?.root();
+    let vb = VB::load_with_key_map(&[&model_path], dev, remap_key)
+        .map_err(|e| e.with_path(&model_path))?
+        .root();
     let model = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
     let model = if let Some(eos_threshold) = eos_threshold {
         model.with_eos_threshold(eos_threshold)
