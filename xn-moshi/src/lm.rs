@@ -1,6 +1,6 @@
 use crate::batched_transformer::{self as bt, BatchedTransformerState};
 use crate::transformer::{self, Config as TransformerConfig, Norm};
-use xn::nn::{var_builder::Path, Embedding, Linear};
+use xn::nn::{Embedding, Linear, var_builder::Path};
 use xn::streaming::StreamMask;
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
