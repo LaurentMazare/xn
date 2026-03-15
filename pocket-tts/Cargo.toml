@@ -3,6 +3,11 @@ name = "pocket_tts"
 version.workspace = true
 edition = "2024"
 autoexamples = false
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
 
 [dependencies]
 xn = { workspace = true }

@@ -2,11 +2,11 @@
 name = "xn"
 version.workspace = true
 edition = "2024"
-description = "Another minimalist deep-learning framework optimized for inference."
-repository = "https://github.com/LaurentMazare/xn"
-keywords = ["pytorch", "deep-learning", "machine-learning"]
-categories = ["science"]
-license = "MIT/Apache-2.0"
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
 
 [dependencies]
 cudarc = { workspace = true, optional = true }

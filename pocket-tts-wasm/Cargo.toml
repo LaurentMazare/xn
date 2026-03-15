@@ -2,6 +2,11 @@
 name = "wasm-pocket-tts"
 version.workspace = true
 edition = "2024"
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
