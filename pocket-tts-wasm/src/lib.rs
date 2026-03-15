@@ -11,10 +11,10 @@ macro_rules! console_log {
     ($($t:tt)*) => (log(&format!($($t)*)))
 }
 
-use pocket_tts::flow_lm::{self, FlowLMState};
-use pocket_tts::mimi::MimiState;
-use pocket_tts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
-use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
+use ptts::flow_lm::{self, FlowLMState};
+use ptts::mimi::MimiState;
+use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
+use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
 use xn::{CPU, CpuDevice, Tensor, TypedTensor};
 
@@ -35,7 +35,7 @@ impl PresetTokenizer {
     }
 }
 
-impl pocket_tts::Tokenizer for PresetTokenizer {
+impl ptts::Tokenizer for PresetTokenizer {
     fn encode(&self, _text: &str) -> Vec<u32> {
         self.tokens.lock().unwrap().clone()
     }
@@ -48,7 +48,7 @@ impl pocket_tts::Tokenizer for PresetTokenizer {
 /// Wrapper to allow sharing a PresetTokenizer via Arc while implementing the Tokenizer trait.
 struct SharedTokenizer(std::sync::Arc<PresetTokenizer>);
 
-impl pocket_tts::Tokenizer for SharedTokenizer {
+impl ptts::Tokenizer for SharedTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         self.0.encode(text)
     }
@@ -178,7 +178,7 @@ impl Model {
         let vb = VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?;
         let root = vb.root();
         let tokenizer = std::sync::Arc::new(PresetTokenizer::new());
-        let tokenizer_box: Box<dyn pocket_tts::Tokenizer + Send + Sync> =
+        let tokenizer_box: Box<dyn ptts::Tokenizer + Send + Sync> =
             Box::new(SharedTokenizer(std::sync::Arc::clone(&tokenizer)));
         let model: TTSModel<f32, CpuDevice> = TTSModel::load(&root, tokenizer_box, &cfg)?;
 

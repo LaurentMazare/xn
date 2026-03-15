@@ -1,5 +1,5 @@
 use numpy::{PyArray1, PyReadonlyArray1};
-use pocket_tts::tts_model::{TTSConfig, TTSModel, TTSState};
+use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use xn::nn::VB;
@@ -19,7 +19,7 @@ impl StdRng {
     }
 }
 
-impl pocket_tts::flow_lm::Rng for StdRng {
+impl ptts::flow_lm::Rng for StdRng {
     fn sample(&mut self) -> f32 {
         use rand::Rng;
         self.inner.sample(self.distr)
@@ -314,7 +314,7 @@ impl<B: xn::Backend> ModelStateB<B> {
 
         let pcm = py
             .detach(move || -> xn::Result<Vec<f32>> {
-                let (text, frames_after_eos) = pocket_tts::tts_model::prepare_text_prompt(&text);
+                let (text, frames_after_eos) = ptts::tts_model::prepare_text_prompt(&text);
                 let mut tokens = model.flow_lm.conditioner.tokenize(&text)?;
                 if let Some(pad_to) = pad_to
                     && tokens.len() < pad_to
@@ -462,7 +462,7 @@ impl ModelState {
 
 struct SpTokenizer(sentencepiece::SentencePieceProcessor);
 
-impl pocket_tts::Tokenizer for SpTokenizer {
+impl ptts::Tokenizer for SpTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         let pieces = self.0.encode(text).unwrap_or_default();
         pieces.iter().map(|p| p.id).collect()
@@ -643,7 +643,7 @@ fn set_num_threads(num_threads: usize) {
 
 #[pyfunction]
 fn prepare_text_prompt(text: &str) -> String {
-    pocket_tts::tts_model::prepare_text_prompt(text).0
+    ptts::tts_model::prepare_text_prompt(text).0
 }
 
 #[pyfunction]
@@ -651,8 +651,8 @@ fn cuda_available() -> bool {
     cfg!(feature = "cuda")
 }
 
-#[pymodule]
-fn ptts(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pymodule(name = "ptts")]
+fn ptts_(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Model>()?;
     m.add_class::<ModelState>()?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;

@@ -1,5 +1,5 @@
 [package]
-name = "pocket_tts"
+name = "ptts"
 version.workspace = true
 edition = "2024"
 autoexamples = false

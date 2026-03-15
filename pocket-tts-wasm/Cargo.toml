@@ -1,5 +1,5 @@
 [package]
-name = "wasm-pocket-tts"
+name = "ptts-wasm"
 version.workspace = true
 edition = "2024"
 description.workspace = true
@@ -12,7 +12,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-pocket_tts = { workspace = true }
+ptts = { workspace = true }
 xn = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }

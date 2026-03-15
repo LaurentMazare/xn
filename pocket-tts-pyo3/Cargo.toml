@@ -1,5 +1,5 @@
 [package]
-name = "pocket-tts-pyo3"
+name = "ptts-pyo3"
 version.workspace = true
 edition = "2024"
 description.workspace = true
@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 xn = { workspace = true }
-pocket_tts = { workspace = true }
+ptts = { workspace = true }
 hf-hub = { workspace = true }
 numpy = "0.28"
 pyo3 = { version = "0.28", features = ["extension-module"] }
@@ -25,5 +25,5 @@ serde_json = { workspace = true }
 
 [features]
 default = []
-cuda = ["xn/cuda", "pocket_tts/cuda"]
-accelerate = ["xn/accelerate", "pocket_tts/accelerate"]
+cuda = ["xn/cuda", "ptts/cuda"]
+accelerate = ["xn/accelerate", "ptts/accelerate"]
