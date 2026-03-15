@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use xn::nn::VB;
+use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Tensor, WithDTypeF};
 use xn_moshi::asr::{Asr, AsrMsg};
 use xn_moshi::lm::{self, LmModel};
 use xn_moshi::mimi::{self, Mimi};
-use xn_moshi::streaming::{StreamMask, StreamTensor};
 
 #[derive(Parser, Debug)]
 #[command(name = "moshi")]
