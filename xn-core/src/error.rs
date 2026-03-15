@@ -133,6 +133,10 @@ impl Error {
     pub fn context(self, c: impl std::fmt::Display + Send + Sync + 'static) -> Self {
         Self::Context { inner: Box::new(self), context: Box::new(c) }
     }
+
+    pub fn unwrap_none(c: impl std::fmt::Display + Send + Sync + 'static) -> Self {
+        Self::UnwrapNone.context(c)
+    }
 }
 
 #[macro_export]
@@ -178,7 +182,7 @@ impl<T> Context<T> for Option<T> {
     {
         match self {
             Some(v) => Ok(v),
-            None => Err(Error::UnwrapNone.context(context).bt()),
+            None => Err(Error::unwrap_none(context).bt()),
         }
     }
 
@@ -189,7 +193,7 @@ impl<T> Context<T> for Option<T> {
     {
         match self {
             Some(v) => Ok(v),
-            None => Err(Error::UnwrapNone.context(f()).bt()),
+            None => Err(Error::unwrap_none(f()).bt()),
         }
     }
 }
