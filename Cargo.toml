@@ -9,9 +9,12 @@ members = [
 exclude = ["xn-flash-attn"]
 resolver = "3"
 
+[workspace.package]
+version = "0.1.3"
+
 [workspace.dependencies]
-xn = { path = "xn-core" }
-pocket_tts = { path = "pocket-tts" }
+xn = { path = "xn-core", version = "0.1.3" }
+pocket_tts = { path = "pocket-tts", version = "0.1.3" }
 anyhow = "1"
 bindgen_cuda = "0.1.6"
 clap = { version = "4", features = ["derive"] }
