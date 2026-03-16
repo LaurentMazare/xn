@@ -92,15 +92,8 @@ impl<T: WithDTypeF, B: Backend> LayerScale<T, B> {
 // ============================================================================
 
 pub(crate) enum Norm<T: WithDTypeF, B: Backend> {
-    LayerNorm {
-        weight: Tensor<T, B>,
-        bias: Tensor<T, B>,
-        eps: f32,
-    },
-    RmsNorm {
-        alpha: Tensor<T, B>,
-        eps: f32,
-    },
+    LayerNorm { weight: Tensor<T, B>, bias: Tensor<T, B>, eps: f32 },
+    RmsNorm { alpha: Tensor<T, B>, eps: f32 },
 }
 
 impl<T: WithDTypeF, B: Backend> Norm<T, B> {
@@ -118,11 +111,7 @@ impl<T: WithDTypeF, B: Backend> Norm<T, B> {
                     vb.tensor("weight", (d_model,))?
                 };
                 let bias = vb.tensor("bias", (d_model,))?;
-                Ok(Self::LayerNorm {
-                    weight,
-                    bias,
-                    eps: 1e-5,
-                })
+                Ok(Self::LayerNorm { weight, bias, eps: 1e-5 })
             }
             crate::NormType::RmsNorm => {
                 let alpha = vb.tensor("alpha", (1, 1, d_model))?.reshape((d_model,))?;
@@ -176,11 +165,7 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
                 let linear_in =
                     Linear::load_o(vb.pp("linear_in"), d_model, 2 * hidden, cfg.bias_ff)?;
                 let linear_out = Linear::load_o(vb.pp("linear_out"), hidden, d_model, cfg.bias_ff)?;
-                Ok(Self::Gating {
-                    linear_in,
-                    linear_out,
-                    activation,
-                })
+                Ok(Self::Gating { linear_in, linear_out, activation })
             }
         }
     }
@@ -193,11 +178,7 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
                 let xs = linear2.forward(&xs)?;
                 Ok(xs)
             }
-            Self::Gating {
-                linear_in,
-                linear_out,
-                activation,
-            } => {
+            Self::Gating { linear_in, linear_out, activation } => {
                 let (b, t, _) = xs.dims3()?;
                 let xs = linear_in.forward(xs)?;
                 let xs = xs.reshape((b, t, 2, ()))?;

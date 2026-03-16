@@ -48,9 +48,8 @@ struct Rope<B: Backend> {
 impl<B: Backend> RotaryEmbedding<B> {
     fn new(head_dim: usize, max_period: f32, device: &B) -> Result<Self> {
         let half_dim = head_dim / 2;
-        let inv_freq: Vec<f32> = (0..half_dim)
-            .map(|i| 1.0 / max_period.powf(i as f32 / half_dim as f32))
-            .collect();
+        let inv_freq: Vec<f32> =
+            (0..half_dim).map(|i| 1.0 / max_period.powf(i as f32 / half_dim as f32)).collect();
         let inv_freq = Tensor::from_vec(inv_freq, (1, 1, half_dim), device)?;
         Ok(Self { inv_freq })
     }
@@ -99,11 +98,8 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
 
         let vb_attn = vb.pp("self_attn");
         let in_proj_weight = vb_attn.tensor("in_proj_weight", (out_dim, d_model))?;
-        let in_proj_bias = if cfg.bias_attn {
-            Some(vb_attn.tensor("in_proj_bias", (out_dim,))?)
-        } else {
-            None
-        };
+        let in_proj_bias =
+            if cfg.bias_attn { Some(vb_attn.tensor("in_proj_bias", (out_dim,))?) } else { None };
 
         let out_proj = Linear::load_o(vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
         Ok(Self {
@@ -179,8 +175,7 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
         // Trim mask to match k/v length if needed
         let mask_context = mask_dims[3];
         let mask_t = if k_target_len < mask_context {
-            mask.narrow(3, mask_context - k_target_len..mask_context)?
-                .contiguous()?
+            mask.narrow(3, mask_context - k_target_len..mask_context)?.contiguous()?
         } else {
             mask.clone()
         };
@@ -189,10 +184,7 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
         let attn_weights = attn_weights.softmax()?; // (b, h, t, k)
         let attn_output = attn_weights.matmul(&v)?; // (b, h, t, d)
 
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, t, d_model))?;
+        let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b, t, d_model))?;
 
         let out = self.out_proj.forward(&attn_output)?;
         Ok(out)
@@ -233,14 +225,7 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
             None
         };
 
-        Ok(Self {
-            self_attn,
-            mlp,
-            norm1,
-            norm2,
-            layer_scale_1,
-            layer_scale_2,
-        })
+        Ok(Self { self_attn, mlp, norm1, norm2, layer_scale_1, layer_scale_2 })
     }
 
     fn forward(
@@ -301,11 +286,7 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
 
         let rope = if cfg.positional_embedding == PositionalEmbedding::Rope {
             let head_dim = cfg.d_model / cfg.num_heads;
-            Some(RotaryEmbedding::new(
-                head_dim,
-                cfg.max_period as f32,
-                vb.device(),
-            )?)
+            Some(RotaryEmbedding::new(head_dim, cfg.max_period as f32, vb.device())?)
         } else {
             None
         };
@@ -399,23 +380,14 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
             None
         };
         let output_proj = if input_dim != cfg.d_model {
-            Some(Linear::load(
-                vb.pp("output_proj").pp(0),
-                cfg.d_model,
-                input_dim,
-            )?)
+            Some(Linear::load(vb.pp("output_proj").pp(0), cfg.d_model, input_dim)?)
         } else {
             None
         };
 
         let transformer = BatchedTransformer::load(&vb.pp("transformer"), cfg)?;
 
-        Ok(Self {
-            input_proj,
-            output_proj,
-            transformer,
-            conv_layout: cfg.conv_layout,
-        })
+        Ok(Self { input_proj, output_proj, transformer, conv_layout: cfg.conv_layout })
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<T, B>> {
@@ -428,11 +400,7 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
         state: &mut BatchedTransformerState<T, B>,
         mask: &StreamMask,
     ) -> Result<Vec<Tensor<T, B>>> {
-        let xs = if self.conv_layout {
-            xs.transpose(1, 2)?.contiguous()?
-        } else {
-            xs.clone()
-        };
+        let xs = if self.conv_layout { xs.transpose(1, 2)?.contiguous()? } else { xs.clone() };
         let xs = match &self.input_proj {
             Some(proj) => proj.forward(&xs)?,
             None => xs,
@@ -442,11 +410,7 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
             Some(proj) => proj.forward(&xs)?,
             None => xs,
         };
-        let ys = if self.conv_layout {
-            ys.transpose(1, 2)?.contiguous()?
-        } else {
-            ys
-        };
+        let ys = if self.conv_layout { ys.transpose(1, 2)?.contiguous()? } else { ys };
         Ok(vec![ys])
     }
 

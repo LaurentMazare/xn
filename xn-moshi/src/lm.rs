@@ -187,10 +187,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
     }
 
     pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<LmState<T, B>> {
-        Ok(LmState {
-            model: self.clone(),
-            transformer: self.transformer.init_state(batch_size)?,
-        })
+        Ok(LmState { model: self.clone(), transformer: self.transformer.init_state(batch_size)? })
     }
 
     pub fn audio_pad_token(&self) -> u32 {
@@ -253,9 +250,7 @@ impl<T: WithDTypeF, B: Backend> LmState<T, B> {
         }
 
         // Transformer
-        let ys = model
-            .transformer
-            .forward(&emb, &mut self.transformer, mask)?;
+        let ys = model.transformer.forward(&emb, &mut self.transformer, mask)?;
         let ys = model.out_norm.forward(&ys)?;
         let logits = model.text_linear.forward(&ys)?;
         Ok((logits, ys))

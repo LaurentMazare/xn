@@ -25,9 +25,7 @@ struct PresetTokenizer {
 
 impl PresetTokenizer {
     fn new() -> Self {
-        Self {
-            tokens: Mutex::new(Vec::new()),
-        }
+        Self { tokens: Mutex::new(Vec::new()) }
     }
 
     fn set_tokens(&self, tokens: Vec<u32>) {
@@ -69,10 +67,7 @@ impl WasmRng {
         let std = temperature.sqrt();
         let distr = rand_distr::Normal::new(0f32, std).unwrap();
         let rng = rand::rngs::StdRng::seed_from_u64(42);
-        Self {
-            inner: Box::new(rng),
-            distr,
-        }
+        Self { inner: Box::new(rng), distr }
     }
 }
 
@@ -144,9 +139,7 @@ fn resize_tts_state(
     }
     Ok(TTSState {
         flow_lm_state: FlowLMState {
-            transformer_state: StreamingTransformerState {
-                layer_states: new_layer_states,
-            },
+            transformer_state: StreamingTransformerState { layer_states: new_layer_states },
         },
     })
 }
@@ -182,13 +175,7 @@ impl Model {
             Box::new(SharedTokenizer(std::sync::Arc::clone(&tokenizer)));
         let model: TTSModel<f32, CpuDevice> = TTSModel::load(&root, tokenizer_box, &cfg)?;
 
-        Ok(Model {
-            inner: model,
-            tokenizer,
-            cfg,
-            gen_state: None,
-            voice_states: Vec::new(),
-        })
+        Ok(Model { inner: model, tokenizer, cfg, gen_state: None, voice_states: Vec::new() })
     }
 
     /// Load a pre-computed KV cache state from a safetensors buffer.
@@ -196,10 +183,7 @@ impl Model {
     /// and `transformer.layers.{i}.self_attn/current_end` (single f32) for each layer.
     /// Returns the voice index for use with start_generation.
     pub fn add_voice_(&mut self, state_bytes: &[u8]) -> xn::Result<usize> {
-        console_log!(
-            "[add_voice] loading safetensors, {} bytes",
-            state_bytes.len()
-        );
+        console_log!("[add_voice] loading safetensors, {} bytes", state_bytes.len());
         let tensors = xn::safetensors::load_from_buffer(state_bytes, &CPU)?;
         let num_layers = 6;
         let mut layer_states = Vec::with_capacity(num_layers);
@@ -304,12 +288,9 @@ impl Model {
         }
 
         let (next_latent, is_eos) =
-            self.inner
-                .generate_step(&mut state.tts_state, &state.prev_latent, &mut state.rng)?;
+            self.inner.generate_step(&mut state.tts_state, &state.prev_latent, &mut state.rng)?;
 
-        let audio_chunk = self
-            .inner
-            .decode_latent(&next_latent, &mut state.mimi_state)?;
+        let audio_chunk = self.inner.decode_latent(&next_latent, &mut state.mimi_state)?;
 
         if is_eos && state.eos_countdown.is_none() {
             state.eos_countdown = Some(state.frames_after_eos);
@@ -349,8 +330,7 @@ impl Model {
     }
 
     pub fn add_voice(&mut self, voice_weights: &[u8]) -> Result<usize, JsError> {
-        self.add_voice_(voice_weights)
-            .map_err(|e| JsError::new(&e.to_string()))
+        self.add_voice_(voice_weights).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Prepare text for generation: capitalize, add punctuation, pad short text.
@@ -375,8 +355,7 @@ impl Model {
     }
 
     pub fn generation_step(&mut self) -> Result<Option<js_sys::Float32Array>, JsError> {
-        self.generation_step_()
-            .map_err(|e| JsError::new(&e.to_string()))
+        self.generation_step_().map_err(|e| JsError::new(&e.to_string()))
     }
 
     pub fn sample_rate(&self) -> usize {

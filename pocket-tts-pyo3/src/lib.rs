@@ -49,9 +49,8 @@ macro_rules! py_bail {
     };
 }
 
-const VOICES: &[&str] = &[
-    "alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma",
-];
+const VOICES: &[&str] =
+    &["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"];
 
 struct ModelB<B: xn::Backend> {
     inner: Arc<TTSModel<f32, B>>,
@@ -87,11 +86,7 @@ impl<B: xn::Backend> ModelB<B> {
         } else {
             None
         };
-        Ok(ModelStateB {
-            model: Arc::clone(&self.inner),
-            state,
-            cfg_state,
-        })
+        Ok(ModelStateB { model: Arc::clone(&self.inner), state, cfg_state })
     }
 
     fn get_state_for_voice(&self, voice: &str, max_seq_len: usize) -> xn::Result<ModelStateB<B>> {
@@ -104,11 +99,7 @@ impl<B: xn::Backend> ModelB<B> {
         };
         let mut state = self.inner.init_flow_lm_state(1, max_seq_len)?;
         self.inner.prompt_audio(&mut state, voice_emb)?;
-        Ok(ModelStateB {
-            model: Arc::clone(&self.inner),
-            state,
-            cfg_state: None,
-        })
+        Ok(ModelStateB { model: Arc::clone(&self.inner), state, cfg_state: None })
     }
 
     fn voices(&self) -> Vec<String> {
@@ -142,15 +133,13 @@ impl Model {
     ) -> PyResult<ModelState> {
         let audio_prompt = audio_prompt.as_slice()?;
         let inner = match &self.0 {
-            ModelV::Cpu(m) => ModelStateV::Cpu(
-                m.get_state_for_audio(audio_prompt, cfg_coef, max_seq_len)
-                    .w()?,
-            ),
+            ModelV::Cpu(m) => {
+                ModelStateV::Cpu(m.get_state_for_audio(audio_prompt, cfg_coef, max_seq_len).w()?)
+            }
             #[cfg(feature = "cuda")]
-            ModelV::Cuda(m) => ModelStateV::Cuda(
-                m.get_state_for_audio(audio_prompt, cfg_coef, max_seq_len)
-                    .w()?,
-            ),
+            ModelV::Cuda(m) => {
+                ModelStateV::Cuda(m.get_state_for_audio(audio_prompt, cfg_coef, max_seq_len).w()?)
+            }
         };
         Ok(ModelState(inner))
     }
@@ -278,9 +267,7 @@ fn run_generate<B: xn::Backend>(
     }
     drop(latent_tx);
 
-    let audio = decode_handle
-        .join()
-        .map_err(|_| xn::Error::msg("decode thread panicked"))??;
+    let audio = decode_handle.join().map_err(|_| xn::Error::msg("decode thread panicked"))??;
     let pcm = audio.to_vec()?;
     Ok(pcm)
 }
@@ -408,23 +395,13 @@ impl ModelState {
         check_py_interrupts_every: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<f32>>> {
         match &self.0 {
-            ModelStateV::Cpu(s) => s.generate_audio(
-                py,
-                text,
-                temperature,
-                seed,
-                pad_to,
-                check_py_interrupts_every,
-            ),
+            ModelStateV::Cpu(s) => {
+                s.generate_audio(py, text, temperature, seed, pad_to, check_py_interrupts_every)
+            }
             #[cfg(feature = "cuda")]
-            ModelStateV::Cuda(s) => s.generate_audio(
-                py,
-                text,
-                temperature,
-                seed,
-                pad_to,
-                check_py_interrupts_every,
-            ),
+            ModelStateV::Cuda(s) => {
+                s.generate_audio(py, text, temperature, seed, pad_to, check_py_interrupts_every)
+            }
         }
     }
 
@@ -502,12 +479,8 @@ fn load_voice_embedding<B: xn::Backend>(
 ) -> Result<Tensor<f32, B>, xn::Error> {
     let voice_vb = VB::load(&[voice_path], device.clone())?;
     let voice_names = voice_vb.tensor_names();
-    let voice_key = voice_names
-        .first()
-        .context("no tensors found in voice embedding file")?;
-    let voice_td = voice_vb
-        .get_tensor(voice_key)
-        .context("voice tensor not found")?;
+    let voice_key = voice_names.first().context("no tensors found in voice embedding file")?;
+    let voice_td = voice_vb.get_tensor(voice_key).context("voice tensor not found")?;
     let voice_shape = &voice_td.shape;
     let voice_dims = voice_shape.dims();
     let voice_emb: Tensor<f32, B> = voice_vb.tensor(voice_key, voice_shape.clone())?;
@@ -536,12 +509,7 @@ fn load_model_<B: xn::Backend>(
                 .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
             let cfg: TTSConfig = serde_json::from_str(&config_str)
                 .map_err(|e| xn::Error::msg(e).with_path(&config_path))?;
-            (
-                model_path,
-                tokenizer_path,
-                cfg,
-                std::collections::HashMap::new(),
-            )
+            (model_path, tokenizer_path, cfg, std::collections::HashMap::new())
         }
         None => {
             use hf_hub::{Repo, RepoType, api::sync::Api};
@@ -549,9 +517,8 @@ fn load_model_<B: xn::Backend>(
             let api = Api::new().map_err(xn::Error::msg)?;
             let repo = api.repo(Repo::new(repo_id, RepoType::Model));
 
-            let model_path = repo
-                .get(&model_file)
-                .map_err(|e| xn::Error::msg(e).with_path(&model_file))?;
+            let model_path =
+                repo.get(&model_file).map_err(|e| xn::Error::msg(e).with_path(&model_file))?;
             let tokenizer_path = repo.get("tokenizer.model").map_err(xn::Error::msg)?;
 
             let mut voices = std::collections::HashMap::new();
@@ -588,10 +555,7 @@ fn load_model_<B: xn::Backend>(
             || v.starts_with("mimi.quantizer")
     })?;
 
-    Ok(ModelB {
-        inner: Arc::new(model),
-        voices,
-    })
+    Ok(ModelB { inner: Arc::new(model), voices })
 }
 
 #[pyfunction]

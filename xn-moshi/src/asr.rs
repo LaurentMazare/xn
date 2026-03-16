@@ -9,19 +9,9 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 
 #[derive(Debug, Clone)]
 pub enum AsrMsg {
-    Step {
-        step_idx: usize,
-        prs: Vec<Vec<f32>>,
-    },
-    Word {
-        tokens: Vec<u32>,
-        start_time: f64,
-        batch_idx: usize,
-    },
-    EndWord {
-        stop_time: f64,
-        batch_idx: usize,
-    },
+    Step { step_idx: usize, prs: Vec<Vec<f32>> },
+    Word { tokens: Vec<u32>, start_time: f64, batch_idx: usize },
+    EndWord { stop_time: f64, batch_idx: usize },
 }
 
 // ============================================================================
@@ -60,11 +50,7 @@ impl ItemState {
     pub fn next_token(&mut self, codebook_idx: usize, token: u32) -> u32 {
         let v = self.next_codebooks[codebook_idx];
         self.next_codebooks[codebook_idx] = token;
-        if self.is_first_step() {
-            self.audio_pad_token
-        } else {
-            v
-        }
+        if self.is_first_step() { self.audio_pad_token } else { v }
     }
 }
 
@@ -171,13 +157,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         let text_start_token = self.model.lm.text_start_token();
         self.batch
             .iter()
-            .map(|s| {
-                if s.is_first_step() {
-                    text_start_token
-                } else {
-                    s.text_token()
-                }
-            })
+            .map(|s| if s.is_first_step() { text_start_token } else { s.text_token() })
             .collect()
     }
 
@@ -261,10 +241,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                 prs.push(prs_);
             }
             if !prs.is_empty() {
-                words.push(AsrMsg::Step {
-                    step_idx: self.model_step_idx,
-                    prs,
-                });
+                words.push(AsrMsg::Step { step_idx: self.model_step_idx, prs });
             }
 
             // Sample text tokens
@@ -281,11 +258,8 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                 )?
             };
 
-            for (batch_idx, (text_token, item)) in sampled_tokens
-                .to_vec()?
-                .into_iter()
-                .zip(self.batch.iter_mut())
-                .enumerate()
+            for (batch_idx, (text_token, item)) in
+                sampled_tokens.to_vec()?.into_iter().zip(self.batch.iter_mut()).enumerate()
             {
                 if !mask.is_active(batch_idx) {
                     continue;
@@ -312,10 +286,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                             (item.step_idx - self.model.asr_delay_in_tokens) as f64 / 12.5;
                         if item.unended_word {
                             item.unended_word = false;
-                            words.push(AsrMsg::EndWord {
-                                stop_time,
-                                batch_idx,
-                            });
+                            words.push(AsrMsg::EndWord { stop_time, batch_idx });
                         }
                         item.last_stop_time = stop_time;
                     }
@@ -327,10 +298,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
 
     pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
         if batch_idx >= self.batch.len() {
-            xn::bail!(
-                "batch index out of range: {batch_idx} >= {}",
-                self.batch.len()
-            );
+            xn::bail!("batch index out of range: {batch_idx} >= {}", self.batch.len());
         }
         self.batch[batch_idx].reset();
         self.lm.reset_batch_idx(batch_idx)?;

@@ -94,23 +94,14 @@ fn download_asr_model() -> Result<AsrFiles> {
     println!("Downloading ASR model from {repo_id}...");
     let api = Api::new()?;
     let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
-    let lm = repo
-        .get("model.safetensors")
-        .context("LM safetensors not found")?;
+    let lm = repo.get("model.safetensors").context("LM safetensors not found")?;
     println!("  LM at {}", lm.display());
-    let mimi = repo
-        .get("mimi-pytorch-e351c8d8@125.safetensors")
-        .context("mimi safetensors not found")?;
+    let mimi =
+        repo.get("mimi-pytorch-e351c8d8@125.safetensors").context("mimi safetensors not found")?;
     println!("  Mimi at {}", mimi.display());
-    let tokenizer = repo
-        .get("tokenizer_en_audio_4000.model")
-        .context("tokenizer not found")?;
+    let tokenizer = repo.get("tokenizer_en_audio_4000.model").context("tokenizer not found")?;
     println!("  Tokenizer at {}", tokenizer.display());
-    Ok(AsrFiles {
-        lm,
-        mimi,
-        tokenizer,
-    })
+    Ok(AsrFiles { lm, mimi, tokenizer })
 }
 
 fn init_tracing() -> tracing_chrome::FlushGuard {
@@ -125,18 +116,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::AudioToAudio {
-            input,
-            output,
-            codebooks,
-            cpu,
-            chrome_tracing,
-        } => {
-            let _guard = if chrome_tracing {
-                Some(init_tracing())
-            } else {
-                None
-            };
+        Command::AudioToAudio { input, output, codebooks, cpu, chrome_tracing } => {
+            let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
 
             #[cfg(feature = "cuda")]
             {
@@ -169,11 +150,7 @@ fn main() -> Result<()> {
             chrome_tracing,
             verbose,
         } => {
-            let _guard = if chrome_tracing {
-                Some(init_tracing())
-            } else {
-                None
-            };
+            let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
 
             #[cfg(feature = "cuda")]
             {
@@ -227,10 +204,7 @@ fn audio_to_audio<Dev: Backend>(
     );
 
     let pcm_data = if sample_rate as usize != target_sample_rate {
-        println!(
-            "  Resampling {} Hz -> {} Hz",
-            sample_rate, target_sample_rate
-        );
+        println!("  Resampling {} Hz -> {} Hz", sample_rate, target_sample_rate);
         kaudio::resample(&pcm_data, sample_rate as usize, target_sample_rate)?
     } else {
         pcm_data
@@ -300,10 +274,7 @@ fn audio_to_audio<Dev: Backend>(
     let code_refs: Vec<&Tensor<i64, Dev>> = all_codes.iter().collect();
     let all_codes = Tensor::cat(&code_refs, 2)?;
     let total_frames = all_codes.dims()[2];
-    println!(
-        "\nCodes shape: {:?} (batch, codebooks, frames)",
-        all_codes.dims()
-    );
+    println!("\nCodes shape: {:?} (batch, codebooks, frames)", all_codes.dims());
     println!("{all_codes}");
 
     // --- Streaming decode ---
@@ -313,9 +284,7 @@ fn audio_to_audio<Dev: Backend>(
     let mut all_decoded: Vec<Tensor<f32, Dev>> = Vec::with_capacity(total_frames);
 
     for frame_idx in 0..total_frames {
-        let codes_frame = all_codes
-            .narrow(2, frame_idx..frame_idx + 1)?
-            .contiguous()?;
+        let codes_frame = all_codes.narrow(2, frame_idx..frame_idx + 1)?.contiguous()?;
         let decoded = dec_state.decode_step(&StreamTensor::from_tensor(codes_frame), &mask)?;
 
         if let Some(pcm) = decoded.as_option() {
@@ -380,18 +349,10 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     println!("Loading audio from {}...", input.display());
     let (pcm_data, sample_rate) = kaudio::pcm_decode(&input)?;
     let audio_duration = pcm_data.len() as f64 / sample_rate as f64;
-    println!(
-        "  {} samples at {} Hz ({:.2}s)",
-        pcm_data.len(),
-        sample_rate,
-        audio_duration
-    );
+    println!("  {} samples at {} Hz ({:.2}s)", pcm_data.len(), sample_rate, audio_duration);
 
     let pcm_data = if sample_rate as usize != target_sample_rate {
-        println!(
-            "  Resampling {} Hz -> {} Hz",
-            sample_rate, target_sample_rate
-        );
+        println!("  Resampling {} Hz -> {} Hz", sample_rate, target_sample_rate);
         kaudio::resample(&pcm_data, sample_rate as usize, target_sample_rate)?
     } else {
         pcm_data
@@ -474,9 +435,7 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
         }
 
         for msg in msgs {
-            if let AsrMsg::Word {
-                tokens, batch_idx, ..
-            } = msg
+            if let AsrMsg::Word { tokens, batch_idx, .. } = msg
                 && batch_idx == 0
             {
                 all_text_tokens.push(3); // re-insert space/separator token

@@ -110,11 +110,7 @@ impl<T: WithDTypeF, B: Backend> SeaNetResnetBlock<T, B> {
 
         for (i, &(k_size, dilation)) in k_sizes_and_dilations.iter().enumerate() {
             let in_c = if i == 0 { dim } else { hidden };
-            let out_c = if i == k_sizes_and_dilations.len() - 1 {
-                dim
-            } else {
-                hidden
-            };
+            let out_c = if i == k_sizes_and_dilations.len() - 1 { dim } else { hidden };
             let c = StreamableConv1d::load(
                 &vb_b.pp(2 * i + 1),
                 in_c,
@@ -150,11 +146,7 @@ impl<T: WithDTypeF, B: Backend> SeaNetResnetBlock<T, B> {
             Some(c)
         };
 
-        Ok(Self {
-            block,
-            shortcut,
-            activation,
-        })
+        Ok(Self { block, shortcut, activation })
     }
 
     pub fn init_state(&self) -> ResnetBlockState<T, B> {
@@ -243,11 +235,7 @@ impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
         }
         let n_blocks = 2 + cfg.ratios.len();
         let mut mult = 1usize;
-        let init_norm = if cfg.disable_norm_outer_blocks >= 1 {
-            None
-        } else {
-            Some(cfg.norm)
-        };
+        let init_norm = if cfg.disable_norm_outer_blocks >= 1 { None } else { Some(cfg.norm) };
         let mut layer_idx = 0;
         let vb = vb.pp("model");
 
@@ -268,21 +256,14 @@ impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
 
         let mut layers = Vec::with_capacity(cfg.ratios.len());
         for (i, &ratio) in cfg.ratios.iter().rev().enumerate() {
-            let norm = if cfg.disable_norm_outer_blocks >= i + 2 {
-                None
-            } else {
-                Some(cfg.norm)
-            };
+            let norm = if cfg.disable_norm_outer_blocks >= i + 2 { None } else { Some(cfg.norm) };
 
             let mut residuals = Vec::with_capacity(cfg.n_residual_layers);
             for j in 0..cfg.n_residual_layers {
                 let block = SeaNetResnetBlock::load(
                     &vb.pp(layer_idx),
                     mult * cfg.n_filters,
-                    &[
-                        (cfg.residual_kernel_size, cfg.dilation_base.pow(j as u32)),
-                        (1, 1),
-                    ],
+                    &[(cfg.residual_kernel_size, cfg.dilation_base.pow(j as u32)), (1, 1)],
                     cfg.activation,
                     norm,
                     cfg.causal,
@@ -308,18 +289,12 @@ impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
                 /* pad_mode */ cfg.pad_mode,
             )?;
             layer_idx += 2;
-            layers.push(EncoderLayer {
-                residuals,
-                downsample,
-            });
+            layers.push(EncoderLayer { residuals, downsample });
             mult *= 2;
         }
 
-        let final_norm = if cfg.disable_norm_outer_blocks >= n_blocks {
-            None
-        } else {
-            Some(cfg.norm)
-        };
+        let final_norm =
+            if cfg.disable_norm_outer_blocks >= n_blocks { None } else { Some(cfg.norm) };
         let final_conv = StreamableConv1d::load(
             &vb.pp(layer_idx + 1),
             mult * cfg.n_filters,
@@ -334,12 +309,7 @@ impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
             /* pad_mode */ cfg.pad_mode,
         )?;
 
-        Ok(Self {
-            init_conv,
-            activation: cfg.activation,
-            layers,
-            final_conv,
-        })
+        Ok(Self { init_conv, activation: cfg.activation, layers, final_conv })
     }
 
     pub fn init_state(&self) -> EncoderState<T, B> {
@@ -395,8 +365,7 @@ impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
         }
         if let Some(x) = xs.as_option() {
             let x = self.activation.apply(x)?;
-            self.final_conv
-                .step(&StreamTensor::from_tensor(x), &mut state.final_conv, m)
+            self.final_conv.step(&StreamTensor::from_tensor(x), &mut state.final_conv, m)
         } else {
             Ok(StreamTensor::empty())
         }
@@ -427,11 +396,8 @@ impl<T: WithDTypeF, B: Backend> SeaNetDecoder<T, B> {
         }
         let n_blocks = 2 + cfg.ratios.len();
         let mut mult = 1 << cfg.ratios.len();
-        let init_norm = if cfg.disable_norm_outer_blocks == n_blocks {
-            None
-        } else {
-            Some(cfg.norm)
-        };
+        let init_norm =
+            if cfg.disable_norm_outer_blocks == n_blocks { None } else { Some(cfg.norm) };
         let mut layer_idx = 0;
         let vb = vb.pp("model");
 
@@ -476,10 +442,7 @@ impl<T: WithDTypeF, B: Backend> SeaNetDecoder<T, B> {
                 let block = SeaNetResnetBlock::load(
                     &vb.pp(layer_idx),
                     mult * cfg.n_filters / 2,
-                    &[
-                        (cfg.residual_kernel_size, cfg.dilation_base.pow(j as u32)),
-                        (1, 1),
-                    ],
+                    &[(cfg.residual_kernel_size, cfg.dilation_base.pow(j as u32)), (1, 1)],
                     cfg.activation,
                     norm,
                     cfg.causal,
@@ -491,18 +454,11 @@ impl<T: WithDTypeF, B: Backend> SeaNetDecoder<T, B> {
                 layer_idx += 1;
             }
 
-            layers.push(DecoderLayer {
-                upsample,
-                residuals,
-            });
+            layers.push(DecoderLayer { upsample, residuals });
             mult /= 2;
         }
 
-        let final_norm = if cfg.disable_norm_outer_blocks >= 1 {
-            None
-        } else {
-            Some(cfg.norm)
-        };
+        let final_norm = if cfg.disable_norm_outer_blocks >= 1 { None } else { Some(cfg.norm) };
         let final_conv = StreamableConv1d::load(
             &vb.pp(layer_idx + 1),
             cfg.n_filters,

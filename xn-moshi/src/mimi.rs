@@ -209,9 +209,7 @@ impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
         let xs = self.encoder.forward(xs)?;
         let mut tf_state = self.encoder_transformer.init_state(batch_size)?;
         let mask = StreamMask::all_active(batch_size);
-        let xs = self
-            .encoder_transformer
-            .forward(&xs, &mut tf_state, &mask)?;
+        let xs = self.encoder_transformer.forward(&xs, &mut tf_state, &mask)?;
         let xs = &xs[0];
         let xs = self.downsample.forward(xs)?;
         self.quantizer.encode(&xs)
@@ -224,9 +222,7 @@ impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
         let emb = self.upsample.forward(&emb)?;
         let mut tf_state = self.decoder_transformer.init_state(batch_size)?;
         let mask = StreamMask::all_active(batch_size);
-        let outs = self
-            .decoder_transformer
-            .forward(&emb, &mut tf_state, &mask)?;
+        let outs = self.decoder_transformer.forward(&emb, &mut tf_state, &mask)?;
         self.decoder.forward(&outs[0])
     }
 }
@@ -240,9 +236,7 @@ impl<T: WithDTypeF, B: Backend> MimiEncodeState<T, B> {
     ) -> Result<StreamTensor<i64, B>> {
         let model = &self.model;
         let xs = model.encoder.step(xs, &mut self.encoder, mask)?;
-        let xs = model
-            .encoder_transformer
-            .step(&xs, &mut self.encoder_transformer, mask)?;
+        let xs = model.encoder_transformer.step(&xs, &mut self.encoder_transformer, mask)?;
         let xs = model.downsample.step(&xs, &mut self.downsample, mask)?;
         match xs.as_option() {
             None => Ok(StreamTensor::empty()),
@@ -264,9 +258,7 @@ impl<T: WithDTypeF, B: Backend> MimiDecodeState<T, B> {
             None => StreamTensor::empty(),
         };
         let emb = model.upsample.step(&emb, &mut self.upsample, mask)?;
-        let out = model
-            .decoder_transformer
-            .step(&emb, &mut self.decoder_transformer, mask)?;
+        let out = model.decoder_transformer.step(&emb, &mut self.decoder_transformer, mask)?;
         model.decoder.step(&out, &mut self.decoder, mask)
     }
 }

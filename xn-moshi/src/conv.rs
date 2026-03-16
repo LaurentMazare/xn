@@ -76,29 +76,12 @@ impl<T: WithDTypeF, B: Backend> NormConv1d<T, B> {
             }
             None => vb.tensor("weight", (out_c, in_c / groups, k_size))?,
         };
-        let bias = if bias {
-            Some(vb.tensor("bias", (out_c,))?)
-        } else {
-            None
-        };
-        Ok(Self {
-            weight,
-            bias,
-            stride,
-            dilation,
-            groups,
-        })
+        let bias = if bias { Some(vb.tensor("bias", (out_c,))?) } else { None };
+        Ok(Self { weight, bias, stride, dilation, groups })
     }
 
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        xs.conv1d(
-            &self.weight,
-            self.bias.as_ref(),
-            self.stride,
-            0,
-            self.dilation,
-            self.groups,
-        )
+        xs.conv1d(&self.weight, self.bias.as_ref(), self.stride, 0, self.dilation, self.groups)
     }
 
     pub fn kernel_size(&self) -> usize {
@@ -160,29 +143,12 @@ impl<T: WithDTypeF, B: Backend> NormConvTranspose1d<T, B> {
             }
             None => vb.tensor("weight", (in_c, out_c / groups, k_size))?,
         };
-        let bias = if bias {
-            Some(vb.tensor("bias", (out_c,))?)
-        } else {
-            None
-        };
-        Ok(Self {
-            weight,
-            bias,
-            k_size,
-            stride,
-            groups,
-        })
+        let bias = if bias { Some(vb.tensor("bias", (out_c,))?) } else { None };
+        Ok(Self { weight, bias, k_size, stride, groups })
     }
 
     pub fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        xs.conv_transpose1d(
-            &self.weight,
-            self.bias.as_ref(),
-            self.stride,
-            0,
-            0,
-            self.groups,
-        )
+        xs.conv_transpose1d(&self.weight, self.bias.as_ref(), self.stride, 0, 0, self.groups)
     }
 }
 
@@ -260,19 +226,11 @@ impl<T: WithDTypeF, B: Backend> StreamableConv1d<T, B> {
         if k_size < stride {
             xn::bail!("kernel-size {k_size} is smaller than stride {stride}");
         }
-        Ok(Self {
-            conv,
-            causal,
-            pad_mode,
-            kernel_size: k_size,
-        })
+        Ok(Self { conv, causal, pad_mode, kernel_size: k_size })
     }
 
     pub fn init_state(&self) -> Conv1dState<T, B> {
-        Conv1dState {
-            prev_xs: None,
-            left_pad_applied: false,
-        }
+        Conv1dState { prev_xs: None, left_pad_applied: false }
     }
 
     fn padding_total(&self) -> usize {
@@ -292,12 +250,7 @@ impl<T: WithDTypeF, B: Backend> StreamableConv1d<T, B> {
         } else {
             let padding_right = padding_total / 2;
             let padding_left = padding_total - padding_right;
-            pad1d(
-                xs,
-                padding_left,
-                padding_right + extra_padding,
-                self.pad_mode,
-            )?
+            pad1d(xs, padding_left, padding_right + extra_padding, self.pad_mode)?
         };
         self.conv.forward(&xs)
     }
@@ -378,11 +331,7 @@ impl<T: WithDTypeF, B: Backend> StreamableConvTranspose1d<T, B> {
     ) -> Result<Self> {
         let convtr =
             NormConvTranspose1d::load(vb, in_c, out_c, k_size, causal, norm, bias, stride, groups)?;
-        Ok(Self {
-            convtr,
-            causal,
-            kernel_size: k_size,
-        })
+        Ok(Self { convtr, causal, kernel_size: k_size })
     }
 
     pub fn init_state(&self) -> ConvTr1dState<T, B> {

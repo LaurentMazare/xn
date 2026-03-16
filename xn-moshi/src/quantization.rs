@@ -18,20 +18,14 @@ impl<T: WithDTypeF, B: Backend> EuclideanCodebook<T, B> {
         let embedding_sum = vb.tensor::<T>("embedding_sum", (codebook_size, dim))?;
 
         // embedding = embedding_sum / max(cluster_usage, epsilon)
-        let epsilon_t = Tensor::full(
-            T::from_f32(epsilon),
-            (codebook_size,),
-            cluster_usage.device(),
-        )?;
+        let epsilon_t =
+            Tensor::full(T::from_f32(epsilon), (codebook_size,), cluster_usage.device())?;
         let cluster_usage = cluster_usage.maximum(&epsilon_t)?;
         let cluster_usage = cluster_usage.unsqueeze(1)?;
         let embedding = embedding_sum.broadcast_div(&cluster_usage)?;
 
         // Precompute c2 = (embedding * embedding).sum(dim=-1) / 2.0
-        let c2 = embedding
-            .sqr()?
-            .sum_keepdim(vec![1])?
-            .scale(T::from_f32(0.5))?;
+        let c2 = embedding.sqr()?.sum_keepdim(vec![1])?.scale(T::from_f32(0.5))?;
         let c2 = c2.reshape((codebook_size,))?;
 
         Ok(Self { embedding, c2, dim })
@@ -53,11 +47,7 @@ impl<T: WithDTypeF, B: Backend> EuclideanCodebook<T, B> {
         let dists = self.c2.broadcast_sub(&dot_prod)?;
 
         let codes = dists.argmin(1)?;
-        if target_shape.is_empty() {
-            Ok(codes)
-        } else {
-            codes.reshape(target_shape)
-        }
+        if target_shape.is_empty() { Ok(codes) } else { codes.reshape(target_shape) }
     }
 
     #[tracing::instrument(name = "ec-decode", skip_all)]
@@ -97,11 +87,7 @@ impl<T: WithDTypeF, B: Backend> VectorQuantization<T, B> {
             (Some(p_in), Some(p_out))
         };
         let codebook = EuclideanCodebook::load(&vb.pp("_codebook"), codebook_dim, codebook_size)?;
-        Ok(Self {
-            project_in,
-            project_out,
-            codebook,
-        })
+        Ok(Self { project_in, project_out, codebook })
     }
 
     #[tracing::instrument(name = "vq-encode", skip_all)]
@@ -168,17 +154,11 @@ impl<T: WithDTypeF, B: Backend> ResidualVectorQuantization<T, B> {
             xn::bail!("empty layers in ResidualVectorQuantization");
         }
         let inner_shape: Vec<usize> = codes.dims()[1..].to_vec();
-        let mut quantized = self.layers[0].decode(
-            &codes
-                .narrow(0, ..1)?
-                .contiguous()?
-                .reshape(inner_shape.clone())?,
-        )?;
+        let mut quantized = self.layers[0]
+            .decode(&codes.narrow(0, ..1)?.contiguous()?.reshape(inner_shape.clone())?)?;
         for (i, layer) in self.layers.iter().enumerate().skip(1) {
-            let layer_codes = codes
-                .narrow(0, i..i + 1)?
-                .contiguous()?
-                .reshape(inner_shape.clone())?;
+            let layer_codes =
+                codes.narrow(0, i..i + 1)?.contiguous()?.reshape(inner_shape.clone())?;
             quantized = quantized.add(&layer.decode(&layer_codes)?)?;
         }
         Ok(quantized)
@@ -214,20 +194,13 @@ impl<T: WithDTypeF, B: Backend> ResidualVectorQuantizer<T, B> {
             None
         };
         let output_proj = if output_dim != dim || force_projection {
-            Some(
-                vb.pp("output_proj")
-                    .tensor("weight", (output_dim, dim, 1))?,
-            )
+            Some(vb.pp("output_proj").tensor("weight", (output_dim, dim, 1))?)
         } else {
             None
         };
 
         let vq = ResidualVectorQuantization::load(&vb.pp("vq"), n_q, dim, bins, None)?;
-        Ok(Self {
-            vq,
-            input_proj,
-            output_proj,
-        })
+        Ok(Self { vq, input_proj, output_proj })
     }
 
     pub fn encode(&self, xs: &Tensor<T, B>) -> Result<Tensor<i64, B>> {
@@ -286,11 +259,7 @@ impl<T: WithDTypeF, B: Backend> SplitResidualVectorQuantizer<T, B> {
             bins,
             true,
         )?;
-        Ok(Self {
-            rvq_first,
-            rvq_rest,
-            n_q,
-        })
+        Ok(Self { rvq_first, rvq_rest, n_q })
     }
 
     #[tracing::instrument(name = "rvq-encode", skip_all)]
