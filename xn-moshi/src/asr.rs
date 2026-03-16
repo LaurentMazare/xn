@@ -73,17 +73,22 @@ impl ItemState {
 // ============================================================================
 
 pub struct AsrState<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
+    model: std::sync::Arc<Model<MimiT, LmT, B>>,
     pub lm: LmState<LmT, B>,
     pub audio_tokenizer: MimiEncodeState<MimiT, B>,
     pub batch: Vec<ItemState>,
     model_step_idx: usize,
 }
 
-pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
+pub struct Model<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
     asr_delay_in_tokens: usize,
     temperature: f64,
     lm: LmModel<LmT, B>,
     audio_tokenizer: Mimi<MimiT, B>,
+}
+
+pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
+    model: std::sync::Arc<Model<MimiT, LmT, B>>,
 }
 
 impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
@@ -93,18 +98,22 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         audio_tokenizer: Mimi<MimiT, B>,
         lm: LmModel<LmT, B>,
     ) -> Self {
-        Self {
+        let model = Model {
             asr_delay_in_tokens,
             temperature,
             lm,
             audio_tokenizer,
+        };
+        Self {
+            model: std::sync::Arc::new(model),
         }
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<AsrState<MimiT, LmT, B>> {
-        let text_start_token = self.lm.text_start_token();
-        let audio_pad_token = self.lm.audio_pad_token();
-        let in_audio_codebooks = self.lm.in_audio_codebooks();
+        let lm = &self.model.lm;
+        let text_start_token = lm.text_start_token();
+        let audio_pad_token = lm.audio_pad_token();
+        let in_audio_codebooks = lm.in_audio_codebooks();
 
         let item_state = ItemState {
             text_token: text_start_token,
@@ -117,38 +126,40 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         };
 
         Ok(AsrState {
-            lm: self.lm.init_state(batch_size)?,
-            audio_tokenizer: self.audio_tokenizer.init_encode_state(batch_size)?,
+            model: self.model.clone(),
+            lm: lm.init_state(batch_size)?,
+            audio_tokenizer: self.model.audio_tokenizer.init_encode_state(batch_size)?,
             batch: vec![item_state; batch_size],
             model_step_idx: 0,
         })
     }
 
     pub fn device(&self) -> &B {
-        self.lm.device()
+        self.model.lm.device()
     }
 
     pub fn asr_delay_in_tokens(&self) -> usize {
-        self.asr_delay_in_tokens
+        self.model.asr_delay_in_tokens
+    }
+}
+
+impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
+    pub fn model_step_idx(&self) -> usize {
+        self.model_step_idx
     }
 
-    pub fn model_step_idx(&self, state: &AsrState<MimiT, LmT, B>) -> usize {
-        state.model_step_idx
-    }
-
-    pub fn reset_state(&self, state: &mut AsrState<MimiT, LmT, B>) -> Result<()> {
-        state.batch.iter_mut().for_each(|s| s.reset());
-        state.model_step_idx = 0;
-        let batch_size = state.batch.len();
-        state.lm = self.lm.init_state(batch_size)?;
-        state.audio_tokenizer = self.audio_tokenizer.init_encode_state(batch_size)?;
+    pub fn reset_state(&mut self) -> Result<()> {
+        self.batch.iter_mut().for_each(|s| s.reset());
+        self.model_step_idx = 0;
+        let batch_size = self.batch.len();
+        self.lm = self.model.lm.init_state(batch_size)?;
+        self.audio_tokenizer = self.model.audio_tokenizer.init_encode_state(batch_size)?;
         Ok(())
     }
 
     pub fn step_pcm<F>(
-        &self,
+        &mut self,
         pcm: &StreamTensor<MimiT, B>,
-        state: &mut AsrState<MimiT, LmT, B>,
         mask: &StreamMask,
         f: F,
     ) -> Result<Vec<AsrMsg>>
@@ -156,19 +167,19 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         F: Fn(&[ItemState], &[u32], &[Vec<u32>]),
     {
         let audio_tokens =
-            self.audio_tokenizer
-                .encode_step(pcm, &mut state.audio_tokenizer, mask)?;
+            self.model
+                .audio_tokenizer
+                .encode_step(pcm, &mut self.audio_tokenizer, mask)?;
         if let Some(audio_tokens) = audio_tokens.as_option() {
-            self.step_tokens(audio_tokens, state, mask, f)
+            self.step_tokens(audio_tokens, mask, f)
         } else {
             Ok(vec![])
         }
     }
 
-    fn text_tokens(&self, state: &AsrState<MimiT, LmT, B>) -> Vec<u32> {
-        let text_start_token = self.lm.text_start_token();
-        state
-            .batch
+    fn text_tokens(&self) -> Vec<u32> {
+        let text_start_token = self.model.lm.text_start_token();
+        self.batch
             .iter()
             .map(|s| {
                 if s.is_first_step() {
@@ -182,9 +193,8 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
 
     /// Process audio tokens (shape: batch, codebooks, steps as i64) and return ASR messages.
     pub fn step_tokens<F>(
-        &self,
+        &mut self,
         audio_tokens: &Tensor<i64, B>,
-        state: &mut AsrState<MimiT, LmT, B>,
         mask: &StreamMask,
         f: F,
     ) -> Result<Vec<AsrMsg>>
@@ -193,8 +203,8 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
     {
         let dims = audio_tokens.dims();
         let (batch_size, codebooks, steps) = (dims[0], dims[1], dims[2]);
-        if batch_size != state.batch.len() {
-            xn::bail!("batch size mismatch: {batch_size} != {}", state.batch.len());
+        if batch_size != self.batch.len() {
+            xn::bail!("batch size mismatch: {batch_size} != {}", self.batch.len());
         }
 
         // Pull all audio tokens to CPU once.
@@ -219,7 +229,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
                 .map(|codebook_idx| {
                     audio_tokens_step
                         .iter()
-                        .zip(state.batch.iter_mut())
+                        .zip(self.batch.iter_mut())
                         .enumerate()
                         .map(|(batch_idx, (tokens, item))| {
                             if !mask.is_active(batch_idx) {
@@ -232,22 +242,23 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
                 })
                 .collect();
 
-            let text_tokens = self.text_tokens(state);
+            let text_tokens = self.text_tokens();
 
-            f(state.batch.as_slice(), &text_tokens, &audio_ids);
+            f(self.batch.as_slice(), &text_tokens, &audio_ids);
 
             // Build audio_ids as slices for the LM forward pass
             let audio_id_refs: Vec<Option<&[u32]>> =
                 audio_ids.iter().map(|ids| Some(ids.as_slice())).collect();
 
             let (text_logits, transformer_out) =
-                self.lm
-                    .forward(Some(&text_tokens), &audio_id_refs, &mut state.lm, mask)?;
+                self.model
+                    .lm
+                    .forward(Some(&text_tokens), &audio_id_refs, &mut self.lm, mask)?;
 
-            state.model_step_idx += 1;
+            self.model_step_idx += 1;
 
             // Extra heads
-            let extra_heads = self.lm.extra_heads(&transformer_out)?;
+            let extra_heads = self.model.lm.extra_heads(&transformer_out)?;
             let mut prs = vec![];
             for extra_head in extra_heads.iter() {
                 // softmax on last dim, shape (batch, 1, dim) -> take (:, 0, 0)
@@ -263,7 +274,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
             }
             if !prs.is_empty() {
                 words.push(AsrMsg::Step {
-                    step_idx: state.model_step_idx,
+                    step_idx: self.model_step_idx,
                     prs,
                 });
             }
@@ -272,12 +283,12 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
             // text_logits shape: (batch, 1, text_out_vocab_size)
             let (batch_size, _one, vocab_size) = text_logits.dims3()?;
             let logits_2d = text_logits.reshape((batch_size, vocab_size))?;
-            let sampled_tokens = if self.temperature <= 0.0 {
+            let sampled_tokens = if self.model.temperature <= 0.0 {
                 logits_2d.argmax(1)?
             } else {
                 xn::nn::sampling::gumbel_softmax(
                     &logits_2d,
-                    self.temperature as f32,
+                    self.model.temperature as f32,
                     xn::D::Minus1,
                 )?
             };
@@ -285,7 +296,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
             for (batch_idx, (text_token, item)) in sampled_tokens
                 .to_vec()?
                 .into_iter()
-                .zip(state.batch.iter_mut())
+                .zip(self.batch.iter_mut())
                 .enumerate()
             {
                 if !mask.is_active(batch_idx) {
@@ -293,7 +304,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
                 }
                 item.text_token = text_token as u32;
                 item.step_idx += 1;
-                if item.step_idx >= self.asr_delay_in_tokens {
+                if item.step_idx >= self.model.asr_delay_in_tokens {
                     if text_token == 3 || text_token == 0 {
                         if !item.word_tokens.is_empty() {
                             let mut tokens = vec![];
@@ -309,7 +320,8 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
                         item.word_tokens.push(item.text_token);
                     }
                     if item.text_token == 0 {
-                        let stop_time = (item.step_idx - self.asr_delay_in_tokens) as f64 / 12.5;
+                        let stop_time =
+                            (item.step_idx - self.model.asr_delay_in_tokens) as f64 / 12.5;
                         if item.unended_word {
                             item.unended_word = false;
                             words.push(AsrMsg::EndWord {
@@ -325,19 +337,15 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         Ok(words)
     }
 
-    pub fn reset_batch_idx(
-        &self,
-        state: &mut AsrState<MimiT, LmT, B>,
-        batch_idx: usize,
-    ) -> Result<()> {
-        if batch_idx >= state.batch.len() {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        if batch_idx >= self.batch.len() {
             xn::bail!(
                 "batch index out of range: {batch_idx} >= {}",
-                state.batch.len()
+                self.batch.len()
             );
         }
-        state.batch[batch_idx].reset();
-        self.lm.reset_batch_idx(&mut state.lm, batch_idx)?;
+        self.batch[batch_idx].reset();
+        self.model.lm.reset_batch_idx(&mut self.lm, batch_idx)?;
         Ok(())
     }
 }
