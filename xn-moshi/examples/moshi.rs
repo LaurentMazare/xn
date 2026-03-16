@@ -251,6 +251,7 @@ fn audio_to_audio<Dev: Backend>(
             || s.ends_with("_codebook.cluster_usage")
             || s.ends_with("_codebook.embedding_sum")
     })?;
+    let model = std::sync::Arc::new(model);
     println!("  Model loaded");
 
     // --- Streaming encode ---
@@ -272,8 +273,7 @@ fn audio_to_audio<Dev: Backend>(
         }
 
         let audio: Tensor<f32, Dev> = Tensor::from_vec(chunk, (1, 1, frame_size), &dev)?;
-        let codes_out =
-            model.encode_step(&StreamTensor::from_tensor(audio), &mut enc_state, &mask)?;
+        let codes_out = enc_state.encode_step(&StreamTensor::from_tensor(audio), &mask)?;
 
         if let Some(codes) = codes_out.as_option() {
             let mut codes = codes.copy()?;
@@ -316,11 +316,7 @@ fn audio_to_audio<Dev: Backend>(
         let codes_frame = all_codes
             .narrow(2, frame_idx..frame_idx + 1)?
             .contiguous()?;
-        let decoded = model.decode_step(
-            &StreamTensor::from_tensor(codes_frame),
-            &mut dec_state,
-            &mask,
-        )?;
+        let decoded = dec_state.decode_step(&StreamTensor::from_tensor(codes_frame), &mask)?;
 
         if let Some(pcm) = decoded.as_option() {
             all_decoded.push(pcm.copy()?);
