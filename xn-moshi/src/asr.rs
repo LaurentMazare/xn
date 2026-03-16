@@ -73,22 +73,19 @@ impl ItemState {
 // ============================================================================
 
 pub struct AsrState<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
-    model: std::sync::Arc<Model<MimiT, LmT, B>>,
+    model: Asr<MimiT, LmT, B>,
     pub lm: LmState<LmT, B>,
     pub audio_tokenizer: MimiEncodeState<MimiT, B>,
     pub batch: Vec<ItemState>,
     model_step_idx: usize,
 }
 
-pub struct Model<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
+#[derive(Clone)]
+pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
     asr_delay_in_tokens: usize,
     temperature: f64,
     lm: std::sync::Arc<LmModel<LmT, B>>,
     audio_tokenizer: std::sync::Arc<Mimi<MimiT, B>>,
-}
-
-pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
-    model: std::sync::Arc<Model<MimiT, LmT, B>>,
 }
 
 impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
@@ -98,22 +95,18 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         audio_tokenizer: Mimi<MimiT, B>,
         lm: LmModel<LmT, B>,
     ) -> Self {
-        let model = Model {
+        Self {
             asr_delay_in_tokens,
             temperature,
             lm: std::sync::Arc::new(lm),
             audio_tokenizer: std::sync::Arc::new(audio_tokenizer),
-        };
-        Self {
-            model: std::sync::Arc::new(model),
         }
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<AsrState<MimiT, LmT, B>> {
-        let lm = &self.model.lm;
-        let text_start_token = lm.text_start_token();
-        let audio_pad_token = lm.audio_pad_token();
-        let in_audio_codebooks = lm.in_audio_codebooks();
+        let text_start_token = self.lm.text_start_token();
+        let audio_pad_token = self.lm.audio_pad_token();
+        let in_audio_codebooks = self.lm.in_audio_codebooks();
 
         let item_state = ItemState {
             text_token: text_start_token,
@@ -126,20 +119,20 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         };
 
         Ok(AsrState {
-            model: self.model.clone(),
-            lm: lm.init_state(batch_size)?,
-            audio_tokenizer: self.model.audio_tokenizer.init_encode_state(batch_size)?,
+            model: self.clone(),
+            lm: self.lm.init_state(batch_size)?,
+            audio_tokenizer: self.audio_tokenizer.init_encode_state(batch_size)?,
             batch: vec![item_state; batch_size],
             model_step_idx: 0,
         })
     }
 
     pub fn device(&self) -> &B {
-        self.model.lm.device()
+        self.lm.device()
     }
 
     pub fn asr_delay_in_tokens(&self) -> usize {
-        self.model.asr_delay_in_tokens
+        self.asr_delay_in_tokens
     }
 }
 
