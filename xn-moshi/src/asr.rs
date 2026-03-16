@@ -73,22 +73,19 @@ impl ItemState {
 // ============================================================================
 
 pub struct AsrState<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
-    model: std::sync::Arc<Model<MimiT, LmT, B>>,
+    model: Asr<MimiT, LmT, B>,
     pub lm: LmState<LmT, B>,
     pub audio_tokenizer: MimiEncodeState<MimiT, B>,
     pub batch: Vec<ItemState>,
     model_step_idx: usize,
 }
 
-pub struct Model<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
+#[derive(Clone)]
+pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
     asr_delay_in_tokens: usize,
     temperature: f64,
-    lm: LmModel<LmT, B>,
-    audio_tokenizer: Mimi<MimiT, B>,
-}
-
-pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
-    model: std::sync::Arc<Model<MimiT, LmT, B>>,
+    lm: std::sync::Arc<LmModel<LmT, B>>,
+    audio_tokenizer: std::sync::Arc<Mimi<MimiT, B>>,
 }
 
 impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
@@ -98,22 +95,18 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         audio_tokenizer: Mimi<MimiT, B>,
         lm: LmModel<LmT, B>,
     ) -> Self {
-        let model = Model {
+        Self {
             asr_delay_in_tokens,
             temperature,
-            lm,
-            audio_tokenizer,
-        };
-        Self {
-            model: std::sync::Arc::new(model),
+            lm: std::sync::Arc::new(lm),
+            audio_tokenizer: std::sync::Arc::new(audio_tokenizer),
         }
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<AsrState<MimiT, LmT, B>> {
-        let lm = &self.model.lm;
-        let text_start_token = lm.text_start_token();
-        let audio_pad_token = lm.audio_pad_token();
-        let in_audio_codebooks = lm.in_audio_codebooks();
+        let text_start_token = self.lm.text_start_token();
+        let audio_pad_token = self.lm.audio_pad_token();
+        let in_audio_codebooks = self.lm.in_audio_codebooks();
 
         let item_state = ItemState {
             text_token: text_start_token,
@@ -126,20 +119,20 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         };
 
         Ok(AsrState {
-            model: self.model.clone(),
-            lm: lm.init_state(batch_size)?,
-            audio_tokenizer: self.model.audio_tokenizer.init_encode_state(batch_size)?,
+            model: self.clone(),
+            lm: self.lm.init_state(batch_size)?,
+            audio_tokenizer: self.audio_tokenizer.init_encode_state(batch_size)?,
             batch: vec![item_state; batch_size],
             model_step_idx: 0,
         })
     }
 
     pub fn device(&self) -> &B {
-        self.model.lm.device()
+        self.lm.device()
     }
 
     pub fn asr_delay_in_tokens(&self) -> usize {
-        self.model.asr_delay_in_tokens
+        self.asr_delay_in_tokens
     }
 }
 
@@ -166,10 +159,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
     where
         F: Fn(&[ItemState], &[u32], &[Vec<u32>]),
     {
-        let audio_tokens =
-            self.model
-                .audio_tokenizer
-                .encode_step(pcm, &mut self.audio_tokenizer, mask)?;
+        let audio_tokens = self.audio_tokenizer.encode_step(pcm, mask)?;
         if let Some(audio_tokens) = audio_tokens.as_option() {
             self.step_tokens(audio_tokens, mask, f)
         } else {
@@ -251,14 +241,12 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                 audio_ids.iter().map(|ids| Some(ids.as_slice())).collect();
 
             let (text_logits, transformer_out) =
-                self.model
-                    .lm
-                    .forward(Some(&text_tokens), &audio_id_refs, &mut self.lm, mask)?;
+                self.lm.forward(Some(&text_tokens), &audio_id_refs, mask)?;
 
             self.model_step_idx += 1;
 
             // Extra heads
-            let extra_heads = self.model.lm.extra_heads(&transformer_out)?;
+            let extra_heads = self.lm.extra_heads(&transformer_out)?;
             let mut prs = vec![];
             for extra_head in extra_heads.iter() {
                 // softmax on last dim, shape (batch, 1, dim) -> take (:, 0, 0)
@@ -345,7 +333,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
             );
         }
         self.batch[batch_idx].reset();
-        self.model.lm.reset_batch_idx(&mut self.lm, batch_idx)?;
+        self.lm.reset_batch_idx(batch_idx)?;
         Ok(())
     }
 }

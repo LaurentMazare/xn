@@ -130,6 +130,7 @@ impl Config {
 // ============================================================================
 
 pub struct LmState<T: WithDTypeF, B: Backend> {
+    pub model: std::sync::Arc<LmModel<T, B>>,
     pub transformer: BatchedTransformerState<T, B>,
 }
 
@@ -185,8 +186,9 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         })
     }
 
-    pub fn init_state(&self, batch_size: usize) -> Result<LmState<T, B>> {
+    pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<LmState<T, B>> {
         Ok(LmState {
+            model: self.clone(),
             transformer: self.transformer.init_state(batch_size)?,
         })
     }
@@ -206,42 +208,44 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
     pub fn device(&self) -> &B {
         self.text_emb.device()
     }
+}
 
+impl<T: WithDTypeF, B: Backend> LmState<T, B> {
     /// Forward pass returning (text_logits, transformer_output).
     ///
     /// `text_ids`: token IDs per batch element (batch_size,), or None for zeros.
     /// `audio_ids`: per-codebook token IDs, each (batch_size,) or None to skip.
     pub fn forward(
-        &self,
+        &mut self,
         text_ids: Option<&[u32]>,
         audio_ids: &[Option<&[u32]>],
-        state: &mut LmState<T, B>,
         mask: &StreamMask,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
+        let model = &self.model;
         // Text embedding: forward gives (batch, d_model), unsqueeze to (batch, 1, d_model)
         let mut emb = match text_ids {
             Some(ids) => {
                 let ids_t = Tensor::from_vec(
                     ids.iter().map(|&x| x as i64).collect(),
                     ids.len(),
-                    self.device(),
+                    model.device(),
                 )?;
-                self.text_emb.forward(&ids_t)?.unsqueeze(1)?
+                model.text_emb.forward(&ids_t)?.unsqueeze(1)?
             }
             None => {
-                let d_model = self.text_emb.hidden_size();
-                let batch_size = state.transformer.batch_size();
-                Tensor::zeros((batch_size, 1, d_model), self.device())?
+                let d_model = model.text_emb.hidden_size();
+                let batch_size = self.transformer.batch_size();
+                Tensor::zeros((batch_size, 1, d_model), model.device())?
             }
         };
 
         // Audio embeddings
-        for (audio_emb, audio_ids) in self.audio_embs.iter().zip(audio_ids.iter()) {
+        for (audio_emb, audio_ids) in model.audio_embs.iter().zip(audio_ids.iter()) {
             if let Some(ids) = audio_ids {
                 let ids_t = Tensor::from_vec(
                     ids.iter().map(|&x| x as i64).collect(),
                     ids.len(),
-                    self.device(),
+                    model.device(),
                 )?;
                 let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
                 emb = emb.add(&e)?;
@@ -249,24 +253,24 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         }
 
         // Transformer
-        let ys = self
+        let ys = model
             .transformer
-            .forward(&emb, &mut state.transformer, mask)?;
-        let ys = self.out_norm.forward(&ys)?;
-        let logits = self.text_linear.forward(&ys)?;
+            .forward(&emb, &mut self.transformer, mask)?;
+        let ys = model.out_norm.forward(&ys)?;
+        let logits = model.text_linear.forward(&ys)?;
         Ok((logits, ys))
     }
 
     /// Compute extra head outputs from transformer output.
     pub fn extra_heads(&self, ys: &Tensor<T, B>) -> Result<Vec<Tensor<T, B>>> {
-        let mut results = Vec::with_capacity(self.extra_heads.len());
-        for head in &self.extra_heads {
+        let mut results = Vec::with_capacity(self.model.extra_heads.len());
+        for head in &self.model.extra_heads {
             results.push(head.forward(ys)?);
         }
         Ok(results)
     }
 
-    pub fn reset_batch_idx(&self, state: &mut LmState<T, B>, batch_idx: usize) -> Result<()> {
-        state.transformer.reset_batch_idx(batch_idx)
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        self.transformer.reset_batch_idx(batch_idx)
     }
 }
