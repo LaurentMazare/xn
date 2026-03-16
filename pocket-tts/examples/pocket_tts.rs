@@ -3,13 +3,13 @@ mod audio_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use pocket_tts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences};
+use ptts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences};
 use xn::nn::VB;
 use xn::{Backend, Tensor};
 
 struct SpTokenizer(sentencepiece::SentencePieceProcessor);
 
-impl pocket_tts::Tokenizer for SpTokenizer {
+impl ptts::Tokenizer for SpTokenizer {
     fn encode(&self, text: &str) -> Vec<u32> {
         let pieces = self.0.encode(text).unwrap_or_default();
         pieces.iter().map(|p| p.id).collect()
@@ -193,7 +193,7 @@ impl Rng {
     }
 }
 
-impl pocket_tts::flow_lm::Rng for Rng {
+impl ptts::flow_lm::Rng for Rng {
     fn sample(&mut self) -> f32 {
         match self {
             Self::StdRng { inner, distr } => {
@@ -235,7 +235,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
             let model_path = parent.join("model.safetensors");
             let tokenizer_path = parent.join("tokenizer.model");
             tracing::info!(?config, "using local config");
-            let config: pocket_tts::tts_model::TTSConfig =
+            let config: ptts::tts_model::TTSConfig =
                 serde_json::from_str(&std::fs::read_to_string(config)?)?;
             let voice = args.voice.map(Voice::Audio);
             (model_path, tokenizer_path, voice, config)
@@ -470,7 +470,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     // Write WAV
     let output_file = std::fs::File::create(&args.output)?;
     let mut writer = std::io::BufWriter::new(output_file);
-    pocket_tts::wav::write_pcm_as_wav(&mut writer, &pcm, cfg.mimi.sample_rate as u32, 1)?;
+    ptts::wav::write_pcm_as_wav(&mut writer, &pcm, cfg.mimi.sample_rate as u32, 1)?;
     tracing::info!("saving output to {}", args.output.display());
     Ok(())
 }

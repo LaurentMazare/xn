@@ -4,12 +4,43 @@ use xn::nn::{Linear, var_builder::Path};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FuserConfig {
+    pub sum: Vec<String>,
+    pub streaming_sum: Vec<String>,
+    pub prepend: Vec<String>,
+    pub cross: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LutConditioner {
+    n_bins: usize,
+    dim: usize,
+    possible_values: Vec<String>,
+    tokenizer: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConditionerInnerConfig {
+    Lut { lut: LutConditioner },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConditionerConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub inner: ConditionerInnerConfig,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TTSConfig {
     pub flow_lm: FlowLMConfig,
     pub mimi: MimiConfig,
     pub temp: f32,
     pub lsd_decode_steps: usize,
     pub eos_threshold: f32,
+    pub fuser: FuserConfig,
+    pub conditioners: Vec<ConditionerConfig>,
 }
 
 impl TTSConfig {
@@ -53,6 +84,13 @@ impl TTSConfig {
             temp,
             lsd_decode_steps: 1,
             eos_threshold: -4.0,
+            conditioners: vec![],
+            fuser: FuserConfig {
+                sum: vec![],
+                streaming_sum: vec![],
+                prepend: vec![],
+                cross: vec![],
+            },
         }
     }
 }
