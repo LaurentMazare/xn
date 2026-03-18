@@ -8,10 +8,23 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub enum AsrMsg {
-    Step { step_idx: usize, prs: Vec<Vec<f32>> },
+pub enum AsrWord {
     Word { tokens: Vec<u32>, start_time: f64, batch_idx: usize },
     EndWord { stop_time: f64, batch_idx: usize },
+}
+
+impl AsrWord {
+    pub fn batch_idx(&self) -> usize {
+        match self {
+            AsrWord::Word { batch_idx, .. } | AsrWord::EndWord { batch_idx, .. } => *batch_idx,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StepResult {
+    pub words: Vec<AsrWord>,
+    pub prs: Vec<Vec<f32>>,
 }
 
 // ============================================================================
@@ -141,7 +154,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         pcm: &StreamTensor<MimiT, B>,
         mask: &StreamMask,
         f: F,
-    ) -> Result<Vec<AsrMsg>>
+    ) -> Result<Vec<StepResult>>
     where
         F: Fn(&[ItemState], &[u32], &[Vec<u32>]),
     {
@@ -167,7 +180,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         audio_tokens: &Tensor<i64, B>,
         mask: &StreamMask,
         f: F,
-    ) -> Result<Vec<AsrMsg>>
+    ) -> Result<Vec<StepResult>>
     where
         F: Fn(&[ItemState], &[u32], &[Vec<u32>]),
     {
@@ -181,7 +194,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         let all_audio_tokens: Vec<i64> = audio_tokens.to_vec()?;
         // Layout: [batch][codebook][step] in row-major = batch * codebooks * steps
 
-        let mut words = vec![];
+        let mut step_results = vec![];
         for step in 0..steps {
             // Extract tokens for this step: audio_tokens[:, :, step]
             let audio_tokens_step: Vec<Vec<u32>> = (0..batch_size)
@@ -240,9 +253,6 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                     .collect();
                 prs.push(prs_);
             }
-            if !prs.is_empty() {
-                words.push(AsrMsg::Step { step_idx: self.model_step_idx, prs });
-            }
 
             // Sample text tokens
             // text_logits shape: (batch, 1, text_out_vocab_size)
@@ -258,6 +268,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                 )?
             };
 
+            let mut words = vec![];
             for (batch_idx, (text_token, item)) in
                 sampled_tokens.to_vec()?.into_iter().zip(self.batch.iter_mut()).enumerate()
             {
@@ -271,7 +282,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                         if !item.word_tokens.is_empty() {
                             let mut tokens = vec![];
                             std::mem::swap(&mut item.word_tokens, &mut tokens);
-                            words.push(AsrMsg::Word {
+                            words.push(AsrWord::Word {
                                 tokens,
                                 start_time: item.last_stop_time,
                                 batch_idx,
@@ -286,14 +297,16 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                             (item.step_idx - self.model.asr_delay_in_tokens) as f64 / 12.5;
                         if item.unended_word {
                             item.unended_word = false;
-                            words.push(AsrMsg::EndWord { stop_time, batch_idx });
+                            words.push(AsrWord::EndWord { stop_time, batch_idx });
                         }
                         item.last_stop_time = stop_time;
                     }
                 }
             }
+            let step_result = StepResult { words, prs };
+            step_results.push(step_result);
         }
-        Ok(words)
+        Ok(step_results)
     }
 
     pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {

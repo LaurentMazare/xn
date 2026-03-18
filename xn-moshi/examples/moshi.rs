@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use xn::nn::VB;
 use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Tensor, WithDTypeF};
-use xn_moshi::asr::{Asr, AsrMsg};
+use xn_moshi::asr::{Asr, AsrWord};
 use xn_moshi::lm::{self, LmModel};
 use xn_moshi::mimi::{self, Mimi};
 
@@ -424,7 +424,7 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
             Tensor::from_vec(chunk_batched, (batch_size, 1, frame_size), &dev)?;
         let pcm = StreamTensor::from_tensor(audio);
         let start_time = std::time::Instant::now();
-        let msgs = state.step_pcm(&pcm, &mask, |_, _, _| {})?;
+        let step_results = state.step_pcm(&pcm, &mask, |_, _, _| {})?;
         if verbose {
             println!(
                 "  chunk {}/{} processed in {:.2}ms",
@@ -434,19 +434,21 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
             );
         }
 
-        for msg in msgs {
-            if let AsrMsg::Word { tokens, batch_idx, .. } = msg
-                && batch_idx == 0
-            {
-                all_text_tokens.push(3); // re-insert space/separator token
-                all_text_tokens.extend_from_slice(&tokens);
-                let text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
-                let new_chars = text.len() - last_decoded_len;
-                if new_chars > 0 && !verbose {
-                    print!("{}", &text[last_decoded_len..]);
-                    std::io::stdout().flush()?;
+        for sr in step_results {
+            for word in sr.words {
+                if let AsrWord::Word { tokens, batch_idx, .. } = word
+                    && batch_idx == 0
+                {
+                    all_text_tokens.push(3); // re-insert space/separator token
+                    all_text_tokens.extend_from_slice(&tokens);
+                    let text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
+                    let new_chars = text.len() - last_decoded_len;
+                    if new_chars > 0 && !verbose {
+                        print!("{}", &text[last_decoded_len..]);
+                        std::io::stdout().flush()?;
+                    }
+                    last_decoded_len = text.len();
                 }
-                last_decoded_len = text.len();
             }
         }
     }
