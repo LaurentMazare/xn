@@ -70,22 +70,26 @@ impl<M: Module> Module for Option<&M> {
 }
 
 pub trait WithDevice {
-    fn run<T: WithDTypeF, B: Backend>(dev: B) -> Result<()>;
+    fn run<T: WithDTypeF, B: Backend>(self, dev: B) -> Result<()>;
 }
 
-pub fn run_with_device<W: WithDevice>(_cpu_only: bool, _device_id: usize) -> Result<()> {
+pub fn run_with_device<W: WithDevice>(
+    w: impl WithDevice,
+    _cpu_only: bool,
+    _device_id: usize,
+) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         if _cpu_only {
-            W::run::<f32, _>(CpuDevice)?;
+            w.run::<f32, _>(CpuDevice)?;
         } else {
             let dev = cuda_backend::Device::new(_device_id)?;
-            W::run::<half::bf16, _>(dev)?;
+            w.run::<half::bf16, _>(dev)?;
         }
     }
     #[cfg(not(feature = "cuda"))]
     {
-        W::run::<f32, _>(CpuDevice)?;
+        w.run::<f32, _>(CpuDevice)?;
     }
     Ok(())
 }
