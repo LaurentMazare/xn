@@ -1502,6 +1502,88 @@ test_both_backends!(test_randn_shape, test_randn_shape_impl);
 // Unary op tests
 // =============================================================================
 
+// =============================================================================
+// Rope tests
+// =============================================================================
+
+/// Test that rope_i with batched (3D) cos/sin correctly applies per-batch rotary embeddings.
+///
+/// When cos/sin are 3D (batch, t, half_dim), each batch element should use its own
+/// cos/sin values. This test creates two batch elements with different cos/sin:
+///   batch 0: identity rotation (cos=1, sin=0)
+///   batch 1: 90-degree rotation (cos=0, sin=1)
+///
+/// The interleaved rope formula is:
+///   dst[2i]   = src[2i] * cos[i] - src[2i+1] * sin[i]
+///   dst[2i+1] = src[2i] * sin[i] + src[2i+1] * cos[i]
+fn test_rope_i_batched_cos_sin_impl<B: Backend>(dev: &B) -> Result<()> {
+    // Input: (batch=2, heads=1, t=1, d=4)
+    // Both batch elements have the same input values.
+    let src: Tensor<f32, B> = Tensor::from_vec(
+        vec![
+            1.0, 2.0, 3.0, 4.0, // batch 0
+            1.0, 2.0, 3.0, 4.0, // batch 1
+        ],
+        (2, 1, 1, 4),
+        dev,
+    )?;
+
+    // Batched cos/sin: (batch=2, t=1, half_dim=2)
+    // batch 0: cos=[1,1] sin=[0,0] → identity
+    // batch 1: cos=[0,0] sin=[1,1] → 90-degree rotation
+    let cos: Tensor<f32, B> = Tensor::from_vec(vec![1.0, 1.0, 0.0, 0.0], (2, 1, 2), dev)?;
+    let sin: Tensor<f32, B> = Tensor::from_vec(vec![0.0, 0.0, 1.0, 1.0], (2, 1, 2), dev)?;
+
+    let out = src.rope_i(&cos, &sin, 0)?;
+    let out_data = out.to_vec()?;
+
+    // batch 0 (identity): [1*1 - 2*0, 1*0 + 2*1, 3*1 - 4*0, 3*0 + 4*1] = [1, 2, 3, 4]
+    assert_approx_eq(&out_data[0..4], &[1.0, 2.0, 3.0, 4.0], 1e-5);
+
+    // batch 1 (90-degree): [1*0 - 2*1, 1*1 + 2*0, 3*0 - 4*1, 3*1 + 4*0] = [-2, 1, -4, 3]
+    assert_approx_eq(&out_data[4..8], &[-2.0, 1.0, -4.0, 3.0], 1e-5);
+
+    Ok(())
+}
+test_both_backends!(test_rope_i_batched_cos_sin, test_rope_i_batched_cos_sin_impl);
+
+/// Same test but for the non-interleaved rope variant.
+///
+/// The non-interleaved rope formula (for head_dim=d) splits into first and second halves:
+///   dst[i]       = src[i]     * cos[i] - src[i+d/2] * sin[i]    for i in 0..d/2
+///   dst[i+d/2]   = src[i]     * sin[i] + src[i+d/2] * cos[i]    for i in 0..d/2
+fn test_rope_batched_cos_sin_impl<B: Backend>(dev: &B) -> Result<()> {
+    // Input: (batch=2, heads=1, t=1, d=4)
+    let src: Tensor<f32, B> = Tensor::from_vec(
+        vec![
+            1.0, 2.0, 3.0, 4.0, // batch 0
+            1.0, 2.0, 3.0, 4.0, // batch 1
+        ],
+        (2, 1, 1, 4),
+        dev,
+    )?;
+
+    // Batched cos/sin: (batch=2, t=1, half_dim=2)
+    let cos: Tensor<f32, B> = Tensor::from_vec(vec![1.0, 1.0, 0.0, 0.0], (2, 1, 2), dev)?;
+    let sin: Tensor<f32, B> = Tensor::from_vec(vec![0.0, 0.0, 1.0, 1.0], (2, 1, 2), dev)?;
+
+    let out = src.rope(&cos, &sin, 0)?;
+    let out_data = out.to_vec()?;
+
+    // batch 0 (identity): cos=[1,1], sin=[0,0]
+    //   dst[0] = 1*1 - 3*0 = 1, dst[1] = 2*1 - 4*0 = 2
+    //   dst[2] = 1*0 + 3*1 = 3, dst[3] = 2*0 + 4*1 = 4
+    assert_approx_eq(&out_data[0..4], &[1.0, 2.0, 3.0, 4.0], 1e-5);
+
+    // batch 1 (90-degree): cos=[0,0], sin=[1,1]
+    //   dst[0] = 1*0 - 3*1 = -3, dst[1] = 2*0 - 4*1 = -4
+    //   dst[2] = 1*1 + 3*0 = 1,  dst[3] = 2*1 + 4*0 = 2
+    assert_approx_eq(&out_data[4..8], &[-3.0, -4.0, 1.0, 2.0], 1e-5);
+
+    Ok(())
+}
+test_both_backends!(test_rope_batched_cos_sin, test_rope_batched_cos_sin_impl);
+
 fn assert_approx_eq(a: &[f32], b: &[f32], tol: f32) {
     assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
