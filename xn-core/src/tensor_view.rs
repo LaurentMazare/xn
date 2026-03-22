@@ -293,15 +293,7 @@ impl<T: WithDType, B: Backend> TensorView<T, B> {
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn contiguous(&self) -> Result<Tensor<T, B>> {
-        if self.is_contiguous() && self.start_offset == 0 {
-            return Ok(Tensor {
-                data: self.data.clone(),
-                shape: self.shape.clone(),
-                device: self.device.clone(),
-                _marker: std::marker::PhantomData,
-            });
-        }
+    pub fn contiguous_always_copy(&self) -> Result<Tensor<T, B>> {
         let result: Tensor<T, B> =
             unsafe { Tensor::alloc_uninit(self.shape.clone(), &self.device) }?;
         {
@@ -313,6 +305,19 @@ impl<T: WithDType, B: Backend> TensorView<T, B> {
             B::copy_strided(&mut dst_data, &*src_data, self.start_offset, &c_dims, &c_strides)?;
         }
         Ok(result)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn contiguous(&self) -> Result<Tensor<T, B>> {
+        if self.is_contiguous() && self.start_offset == 0 {
+            return Ok(Tensor {
+                data: self.data.clone(),
+                shape: self.shape.clone(),
+                device: self.device.clone(),
+                _marker: std::marker::PhantomData,
+            });
+        }
+        self.contiguous_always_copy()
     }
 
     pub fn broadcast_as<S: Into<Shape>>(&self, shape: S) -> Result<Self> {
