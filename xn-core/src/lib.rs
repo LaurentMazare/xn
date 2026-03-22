@@ -73,13 +73,13 @@ pub trait WithDevice {
     fn run<T: WithDTypeF, B: Backend>(dev: B) -> Result<()>;
 }
 
-pub fn run_with_device<W: WithDevice>(_use_cpu: bool, _device_id: usize) -> Result<()> {
+pub fn run_with_device<W: WithDevice>(_cpu_only: bool, _device_id: usize) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
-        if _use_cpu {
+        if _cpu_only {
             W::run::<f32, _>(CpuDevice)?;
         } else {
-            let dev = cuda_backend::Device::new(0)?;
+            let dev = cuda_backend::Device::new(_device_id)?;
             W::run::<half::bf16, _>(dev)?;
         }
     }
