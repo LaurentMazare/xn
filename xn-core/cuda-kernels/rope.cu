@@ -3,13 +3,18 @@
 #include<stdint.h>
 
 template <typename T>
-__device__ void ropei(const T * cos, const T * sin, const T * src, T * dst, const uint32_t bh, const uint32_t td) {
+__device__ void ropei(const T * cos, const T * sin, const T * src, T * dst, const uint32_t bh, const uint32_t td, const uint32_t h, const uint32_t cs_stride_b) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (2 * idx >= bh * td) return;
 
+    uint32_t i_bh = idx / (td / 2);
     uint32_t rope_idx = idx % (td / 2);
-    T c = cos[rope_idx];
-    T s = sin[rope_idx];
+    uint32_t cos_idx = rope_idx;
+    if (cs_stride_b > 0) {
+        cos_idx += (i_bh / h) * cs_stride_b;
+    }
+    T c = cos[cos_idx];
+    T s = sin[cos_idx];
 
     T src1 = src[2 * idx];
     T src2 = src[2 * idx + 1];
@@ -19,7 +24,7 @@ __device__ void ropei(const T * cos, const T * sin, const T * src, T * dst, cons
 }
 
 template <typename T>
-__device__ void rope(const T * cos, const T * sin, const T * src, T * dst, const uint32_t bh, const uint32_t td, const uint32_t d) {
+__device__ void rope(const T * cos, const T * sin, const T * src, T * dst, const uint32_t bh, const uint32_t td, const uint32_t d, const uint32_t h, const uint32_t cs_stride_b) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (2 * idx >= bh * td) return;
 
@@ -30,6 +35,9 @@ __device__ void rope(const T * cos, const T * sin, const T * src, T * dst, const
     uint32_t i1 = i_bh * td + i_t * d + i_d;
     uint32_t i2 = i1 + d / 2;
     uint32_t i_cs = i_t * (d / 2) + i_d;
+    if (cs_stride_b > 0) {
+        i_cs += (i_bh / h) * cs_stride_b;
+    }
     T c = cos[i_cs];
     T s = sin[i_cs];
     T src1 = src[i1];
@@ -48,17 +56,22 @@ __device__ void rope_thd(
     const uint32_t b,
     const uint32_t t,
     const uint32_t h,
-    const uint32_t d
+    const uint32_t d,
+    const uint32_t cs_stride_b
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (2 * idx >= b * t * h * d) return;
 
     uint32_t i_bth = idx / (d / 2);
     uint32_t i_d = idx - (d / 2) * i_bth;
+    uint32_t i_b = i_bth / (t * h);
     uint32_t i_t = (i_bth / h) % t;
     uint32_t i1 = i_bth * d + i_d;
     uint32_t i2 = i1 + d / 2;
     uint32_t i_cs = i_t * (d / 2) + i_d;
+    if (cs_stride_b > 0) {
+        i_cs += i_b * cs_stride_b;
+    }
     T c = cos[i_cs];
     T s = sin[i_cs];
     T src1 = src[i1];
@@ -75,8 +88,10 @@ __device__ void rope_thd(
       const TYPENAME *src, \
       TYPENAME *dst, \
       const uint32_t bh, \
-      const uint32_t td) { \
-    ropei<TYPENAME>(cos, sin, src, dst, bh, td); \
+      const uint32_t td, \
+      const uint32_t h, \
+      const uint32_t cs_stride_b) { \
+    ropei<TYPENAME>(cos, sin, src, dst, bh, td, h, cs_stride_b); \
   } \
   extern "C" __global__ void FN_NAME( \
       const TYPENAME *cos, \
@@ -85,8 +100,10 @@ __device__ void rope_thd(
       TYPENAME *dst, \
       const uint32_t bh, \
       const uint32_t td, \
-      const uint32_t d) { \
-    rope<TYPENAME>(cos, sin, src, dst, bh, td, d); \
+      const uint32_t d, \
+      const uint32_t h, \
+      const uint32_t cs_stride_b) { \
+    rope<TYPENAME>(cos, sin, src, dst, bh, td, d, h, cs_stride_b); \
   } \
   extern "C" __global__ void FN_NAME_THD( \
       const TYPENAME *cos, \
@@ -96,8 +113,9 @@ __device__ void rope_thd(
       const uint32_t b, \
       const uint32_t t, \
       const uint32_t h, \
-      const uint32_t d) { \
-    rope_thd<TYPENAME>(cos, sin, src, dst, b, t, h, d); \
+      const uint32_t d, \
+      const uint32_t cs_stride_b) { \
+    rope_thd<TYPENAME>(cos, sin, src, dst, b, t, h, d, cs_stride_b); \
   } \
 
 #if __CUDA_ARCH__ >= 800

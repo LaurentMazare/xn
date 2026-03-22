@@ -824,7 +824,9 @@ impl crate::Backend for Device {
         let bh = (b * h) as u32;
         let td = (t * d) as u32;
         let d_u32 = d as u32;
-        let stride_b = if unbatched_rope { (h * t * d) as u32 } else { 0u32 };
+        let h_u32 = h as u32;
+        // cos/sin per-batch stride: t * d/2 when batched (3D), 0 when unbatched (2D)
+        let cs_stride_b = if unbatched_rope { (t * d / 2) as u32 } else { 0u32 };
         // The kernel processes bh * td / 2 elements (each thread handles 2 elements)
         let cfg = LaunchConfig::for_num_elems(bh * td / 2);
 
@@ -842,7 +844,8 @@ impl crate::Backend for Device {
         launch_args.arg(&bh);
         launch_args.arg(&td);
         launch_args.arg(&d_u32);
-        launch_args.arg(&stride_b);
+        launch_args.arg(&h_u32);
+        launch_args.arg(&cs_stride_b);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -863,7 +866,9 @@ impl crate::Backend for Device {
         let func = dst.device.get_func(&kname, PTXModule::Rope)?;
         let bh = (b * h) as u32;
         let td = (t * d) as u32;
-        let stride_b = if unbatched_rope { (h * t * d) as u32 } else { 0u32 };
+        let h_u32 = h as u32;
+        // cos/sin per-batch stride: t * d/2 when batched (3D), 0 when unbatched (2D)
+        let cs_stride_b = if unbatched_rope { (t * d / 2) as u32 } else { 0u32 };
         // The kernel processes bh * td / 2 elements (each thread handles 2 elements)
         let cfg = LaunchConfig::for_num_elems(bh * td / 2);
 
@@ -880,7 +885,8 @@ impl crate::Backend for Device {
         launch_args.arg(&mut dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&td);
-        launch_args.arg(&stride_b);
+        launch_args.arg(&h_u32);
+        launch_args.arg(&cs_stride_b);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
