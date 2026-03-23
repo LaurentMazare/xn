@@ -3103,6 +3103,8 @@ dependencies = [
  "kaudio",
  "rand",
  "sentencepiece",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",

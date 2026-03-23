@@ -9,10 +9,12 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-xn = { workspace = true }
-tracing = { workspace = true }
-rand = { workspace = true, features = ["thread_rng"] }
 kaudio = { workspace = true, optional = true }
+rand = { workspace = true, features = ["thread_rng"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+xn = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

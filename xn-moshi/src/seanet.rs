@@ -59,10 +59,36 @@ pub struct ResnetBlockState<T: WithDTypeF, B: Backend> {
     pub shortcut: Option<Conv1dState<T, B>>,
 }
 
+impl<T: WithDTypeF, B: Backend> ResnetBlockState<T, B> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        for c in self.block_convs.iter_mut() {
+            c.reset_batch_idx(batch_idx)?;
+        }
+        if let Some(shortcut) = self.shortcut.as_mut() {
+            shortcut.reset_batch_idx(batch_idx)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct EncoderState<T: WithDTypeF, B: Backend> {
     pub init_conv: Conv1dState<T, B>,
     pub layers: Vec<EncoderLayerState<T, B>>,
     pub final_conv: Conv1dState<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> EncoderState<T, B> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        self.init_conv.reset_batch_idx(batch_idx)?;
+        self.final_conv.reset_batch_idx(batch_idx)?;
+        for layer in self.layers.iter_mut() {
+            layer.downsample.reset_batch_idx(batch_idx)?;
+            for r in layer.residuals.iter_mut() {
+                r.reset_batch_idx(batch_idx)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct EncoderLayerState<T: WithDTypeF, B: Backend> {
@@ -74,6 +100,20 @@ pub struct DecoderState<T: WithDTypeF, B: Backend> {
     pub init_conv: Conv1dState<T, B>,
     pub layers: Vec<DecoderLayerState<T, B>>,
     pub final_conv: Conv1dState<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> DecoderState<T, B> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        self.init_conv.reset_batch_idx(batch_idx)?;
+        self.final_conv.reset_batch_idx(batch_idx)?;
+        for layer in self.layers.iter_mut() {
+            layer.upsample.reset_batch_idx(batch_idx)?;
+            for r in layer.residuals.iter_mut() {
+                r.reset_batch_idx(batch_idx)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct DecoderLayerState<T: WithDTypeF, B: Backend> {

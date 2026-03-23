@@ -93,11 +93,29 @@ pub struct MimiEncodeState<T: WithDTypeF, B: Backend> {
     pub downsample: conv::Conv1dState<T, B>,
 }
 
+impl<T: WithDTypeF, B: Backend> MimiEncodeState<T, B> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        self.encoder.reset_batch_idx(batch_idx)?;
+        self.encoder_transformer.reset_batch_idx(batch_idx)?;
+        self.downsample.reset_batch_idx(batch_idx)?;
+        Ok(())
+    }
+}
+
 pub struct MimiDecodeState<T: WithDTypeF, B: Backend> {
     model: std::sync::Arc<Mimi<T, B>>,
     pub upsample: conv::ConvTr1dState<T, B>,
     pub decoder_transformer: bt::BatchedTransformerState<T, B>,
     pub decoder: seanet::DecoderState<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> MimiDecodeState<T, B> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        self.upsample.reset_batch_idx(batch_idx)?;
+        self.decoder_transformer.reset_batch_idx(batch_idx)?;
+        self.decoder.reset_batch_idx(batch_idx)?;
+        Ok(())
+    }
 }
 
 // ============================================================================

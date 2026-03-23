@@ -217,6 +217,7 @@ impl<T: WithDTypeF, B: Backend> LmState<T, B> {
         text_ids: Option<&[u32]>,
         audio_ids: &[Option<&[u32]>],
         mask: &StreamMask,
+        condition: Option<&Tensor<T, B>>,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
         let model = &self.model;
         // Text embedding: forward gives (batch, d_model), unsqueeze to (batch, 1, d_model)
@@ -247,6 +248,11 @@ impl<T: WithDTypeF, B: Backend> LmState<T, B> {
                 let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
                 emb = emb.add(&e)?;
             }
+        }
+
+        // Conditioning
+        if let Some(cond) = condition {
+            emb = emb.add(cond)?;
         }
 
         // Transformer

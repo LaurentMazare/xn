@@ -1,7 +1,13 @@
+use crate::conditioners::Conditioners;
 use crate::lm::{LmModel, LmState};
 use crate::mimi::{Mimi, MimiEncodeState};
+use crate::moshi;
 use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
+
+const TOKEN_EOP: u32 = 0;
+const TOKEN_PAD: u32 = 3;
+const TOKEN_SILENCE_PAD: u32 = 4;
 
 // ============================================================================
 // Messages
@@ -33,6 +39,7 @@ pub struct StepResult {
 
 #[derive(Debug, Clone)]
 pub struct ItemState {
+    batch_idx: usize,
     step_idx: usize,
     text_token: u32,
     word_tokens: Vec<u32>,
@@ -65,6 +72,22 @@ impl ItemState {
         self.next_codebooks[codebook_idx] = token;
         if self.is_first_step() { self.audio_pad_token } else { v }
     }
+
+    pub fn flush_tokens(&mut self) -> Option<AsrWord> {
+        if !self.word_tokens.is_empty() {
+            let mut tokens = vec![];
+            std::mem::swap(&mut self.word_tokens, &mut tokens);
+            let word = AsrWord::Word {
+                tokens,
+                start_time: self.last_stop_time,
+                batch_idx: self.batch_idx,
+            };
+            self.unended_word = true;
+            Some(word)
+        } else {
+            None
+        }
+    }
 }
 
 // ============================================================================
@@ -77,29 +100,39 @@ pub struct AsrState<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
     pub audio_tokenizer: MimiEncodeState<MimiT, B>,
     pub batch: Vec<ItemState>,
     model_step_idx: usize,
+    temperature: Tensor<f32, B>,
+    condition: Option<Tensor<LmT, B>>,
 }
 
 #[derive(Clone)]
 pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
     asr_delay_in_tokens: usize,
-    temperature: f64,
+    default_temperature: f64,
     lm: std::sync::Arc<LmModel<LmT, B>>,
     audio_tokenizer: std::sync::Arc<Mimi<MimiT, B>>,
+    conditioners: Option<std::sync::Arc<Conditioners<LmT, B>>>,
+    default_condition: Option<Tensor<LmT, B>>,
 }
 
 impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
     pub fn new(
         asr_delay_in_tokens: usize,
-        temperature: f64,
+        default_temperature: f64,
         audio_tokenizer: Mimi<MimiT, B>,
         lm: LmModel<LmT, B>,
     ) -> Self {
         Self {
             asr_delay_in_tokens,
-            temperature,
+            default_temperature,
             lm: std::sync::Arc::new(lm),
             audio_tokenizer: std::sync::Arc::new(audio_tokenizer),
+            conditioners: None,
+            default_condition: None,
         }
+    }
+
+    pub fn conditioners(&self) -> Option<&Conditioners<LmT, B>> {
+        self.conditioners.as_deref()
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<AsrState<MimiT, LmT, B>> {
@@ -107,22 +140,36 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         let audio_pad_token = self.lm.audio_pad_token();
         let in_audio_codebooks = self.lm.in_audio_codebooks();
 
-        let item_state = ItemState {
-            text_token: text_start_token,
-            word_tokens: vec![],
-            unended_word: false,
-            step_idx: 0,
-            last_stop_time: 0.,
-            audio_pad_token,
-            next_codebooks: vec![audio_pad_token; in_audio_codebooks],
+        let batch = (0..batch_size)
+            .map(|batch_idx| ItemState {
+                batch_idx,
+                text_token: text_start_token,
+                word_tokens: vec![],
+                unended_word: false,
+                step_idx: 0,
+                last_stop_time: 0.,
+                audio_pad_token,
+                next_codebooks: vec![audio_pad_token; in_audio_codebooks],
+            })
+            .collect();
+        let temperature =
+            Tensor::full(self.default_temperature as f32, (batch_size, 1), self.device())?;
+        let condition = match self.default_condition.as_ref() {
+            None => None,
+            Some(c) => {
+                let c = c.expand((batch_size, 1, c.dim(xn::D::Minus1)?))?;
+                // TODO(laurent): add to xn a contiguous function that ensures a copy is made.
+                Some(c.contiguous()?.copy()?)
+            }
         };
-
         Ok(AsrState {
             model: self.clone(),
             lm: self.lm.init_state(batch_size)?,
             audio_tokenizer: self.audio_tokenizer.init_encode_state(batch_size)?,
-            batch: vec![item_state; batch_size],
+            batch,
             model_step_idx: 0,
+            temperature,
+            condition,
         })
     }
 
@@ -133,11 +180,108 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
     pub fn asr_delay_in_tokens(&self) -> usize {
         self.asr_delay_in_tokens
     }
+
+    pub fn warmup(&self, frame_size: usize) -> Result<()> {
+        let mut state = self.init_state(1)?;
+        let audio: Tensor<MimiT, _> = Tensor::zeros((1, 1, frame_size), self.device())?;
+        let pcm = StreamTensor::from_tensor(audio);
+        let mask = StreamMask::all_active(1);
+        for _ in 0..3 {
+            let _ = state.step_pcm(&pcm, &mask, |_, _, _| {})?;
+        }
+        Ok(())
+    }
+}
+
+/// Loading from weight files.
+impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
+    pub fn load(
+        mimi_weight: &str,
+        lm_weight: &str,
+        config: Option<&str>,
+        asr_delay_in_tokens: usize,
+        default_temperature: f64,
+        dev: B,
+    ) -> Result<Self> {
+        use crate::lm;
+        use crate::mimi;
+        use xn::nn::VB;
+
+        let moshi_config = match config {
+            Some(c) => {
+                let c = std::fs::read_to_string(c)
+                    .map_err(|e| xn::Error::Msg(format!("reading config {c}: {e}")))?;
+                Some(
+                    serde_json::from_str::<moshi::Config>(&c)
+                        .map_err(|e| xn::Error::Msg(format!("parsing config: {e}")))?,
+                )
+            }
+            None => None,
+        };
+        let lm_config = match &moshi_config {
+            Some(c) => c.to_lm_config(),
+            None => lm::Config::stt_2_6b(),
+        };
+
+        let mimi_vb = VB::load(&[mimi_weight], dev.clone())?.root();
+        let mimi_config = mimi::Config::v0_1(Some(32));
+        let mimi_model: Mimi<MimiT, B> = Mimi::load(&mimi_vb, mimi_config)?;
+        mimi_vb.check_all_used_with_ignore(|s| {
+            s.ends_with("_codebook._initialized")
+                || s.ends_with("_codebook.cluster_usage")
+                || s.ends_with("_codebook.embedding_sum")
+        })?;
+
+        let lm_vb = VB::load(&[lm_weight], dev)?.root();
+        let lm_model: LmModel<LmT, B> = LmModel::load(&lm_vb, &lm_config)?;
+        let conditioners = match &moshi_config {
+            Some(c) => Some(c.load_conditioners::<LmT, _>(&lm_vb)?),
+            None => None,
+        };
+        lm_vb.check_all_used()?;
+
+        let default_condition = match conditioners.as_ref() {
+            Some(conds) => {
+                let delay = -0.08 * asr_delay_in_tokens as f64;
+                let values = std::collections::HashMap::from([("delay".to_string(), delay.into())]);
+                conds.condition_sum(&values)?
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            asr_delay_in_tokens,
+            default_temperature,
+            lm: std::sync::Arc::new(lm_model),
+            audio_tokenizer: std::sync::Arc::new(mimi_model),
+            conditioners: conditioners.map(std::sync::Arc::new),
+            default_condition,
+        })
+    }
+}
+
+/// Sample according to the Gumbel-Softmax distribution.
+fn gumbel_max<T: WithDTypeF, B: Backend>(
+    logits: &Tensor<T, B>,
+    temperature: &Tensor<f32, B>,
+) -> Result<Tensor<i64, B>> {
+    // Cast to f32, doing the Gumbel softmax in bf16 is a bit unstable.
+    let logits = logits.to::<f32>()?;
+    let gumbel_noise = logits.rand_uniform_like(1e-7, 0.999)?.log()?.neg()?.log()?;
+    let adjusted_logits = logits.sub(&gumbel_noise.broadcast_mul(temperature)?)?;
+    adjusted_logits.argmax(xn::D::Minus1)
 }
 
 impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
     pub fn model_step_idx(&self) -> usize {
         self.model_step_idx
+    }
+
+    pub fn flush_tokens(&mut self, batch_idx: usize) -> Result<Option<AsrWord>> {
+        if batch_idx >= self.batch.len() {
+            xn::bail!("unexpected batch idx {batch_idx}")
+        }
+        Ok(self.batch[batch_idx].flush_tokens())
     }
 
     pub fn reset_state(&mut self) -> Result<()> {
@@ -147,6 +291,26 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         self.lm = self.model.lm.init_state(batch_size)?;
         self.audio_tokenizer = self.model.audio_tokenizer.init_encode_state(batch_size)?;
         Ok(())
+    }
+
+    pub fn device(&self) -> &B {
+        self.model.device()
+    }
+
+    pub fn condition_sum(&self, lang: Option<&str>, delay: f64) -> Result<Option<Tensor<LmT, B>>> {
+        let conds = match self.model.conditioners.as_ref() {
+            Some(conds) => {
+                let mut values =
+                    std::collections::HashMap::from([("delay".to_string(), delay.into())]);
+                if let Some(lang) = lang {
+                    values.insert("lang".to_string(), lang.into());
+                    values.insert("languages_in_segment".to_string(), lang.into());
+                }
+                conds.condition_sum(&values)?
+            }
+            None => None,
+        };
+        Ok(conds)
     }
 
     pub fn step_pcm<F>(
@@ -233,8 +397,12 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
             let audio_id_refs: Vec<Option<&[u32]>> =
                 audio_ids.iter().map(|ids| Some(ids.as_slice())).collect();
 
-            let (text_logits, transformer_out) =
-                self.lm.forward(Some(&text_tokens), &audio_id_refs, mask)?;
+            let (text_logits, transformer_out) = self.lm.forward(
+                Some(&text_tokens),
+                &audio_id_refs,
+                mask,
+                self.condition.as_ref(),
+            )?;
 
             self.model_step_idx += 1;
 
@@ -258,16 +426,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
             // text_logits shape: (batch, 1, text_out_vocab_size)
             let (batch_size, _one, vocab_size) = text_logits.dims3()?;
             let logits_2d = text_logits.reshape((batch_size, vocab_size))?;
-            let sampled_tokens = if self.model.temperature <= 0.0 {
-                logits_2d.argmax(1)?
-            } else {
-                xn::nn::sampling::gumbel_max(
-                    &logits_2d,
-                    self.model.temperature as f32,
-                    xn::D::Minus1,
-                )?
-            };
-
+            let sampled_tokens = gumbel_max(&logits_2d, &self.temperature)?;
             let mut words = vec![];
             for (batch_idx, (text_token, item)) in
                 sampled_tokens.to_vec()?.into_iter().zip(self.batch.iter_mut()).enumerate()
@@ -275,24 +434,21 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                 if !mask.is_active(batch_idx) {
                     continue;
                 }
-                item.text_token = text_token as u32;
+                let text_token = text_token as u32;
+                item.text_token = text_token;
                 item.step_idx += 1;
                 if item.step_idx >= self.model.asr_delay_in_tokens {
-                    if text_token == 3 || text_token == 0 {
-                        if !item.word_tokens.is_empty() {
-                            let mut tokens = vec![];
-                            std::mem::swap(&mut item.word_tokens, &mut tokens);
-                            words.push(AsrWord::Word {
-                                tokens,
-                                start_time: item.last_stop_time,
-                                batch_idx,
-                            });
-                            item.unended_word = true;
+                    if text_token == TOKEN_PAD
+                        || text_token == TOKEN_EOP
+                        || text_token == TOKEN_SILENCE_PAD
+                    {
+                        if let Some(word) = item.flush_tokens() {
+                            words.push(word)
                         }
                     } else {
                         item.word_tokens.push(item.text_token);
                     }
-                    if item.text_token == 0 {
+                    if item.text_token == TOKEN_EOP {
                         let stop_time =
                             (item.step_idx - self.model.asr_delay_in_tokens) as f64 / 12.5;
                         if item.unended_word {
@@ -309,12 +465,30 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         Ok(step_results)
     }
 
-    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+    pub fn reset_batch_idx(
+        &mut self,
+        batch_idx: usize,
+        temp: Option<f64>,
+        cond: Option<&Tensor<LmT, B>>,
+    ) -> Result<()> {
         if batch_idx >= self.batch.len() {
             xn::bail!("batch index out of range: {batch_idx} >= {}", self.batch.len());
         }
         self.batch[batch_idx].reset();
         self.lm.reset_batch_idx(batch_idx)?;
+        self.audio_tokenizer.reset_batch_idx(batch_idx)?;
+        let temp = temp.unwrap_or(self.model.default_temperature) as f32;
+        let temp = Tensor::full(temp, (1, 1), self.device())?;
+        self.temperature.slice_set(&temp, 0, batch_idx)?;
+        let cond = match cond {
+            None => self.model.default_condition.as_ref(),
+            Some(_) => cond,
+        };
+        if let Some(batch_cond) = self.condition.as_mut()
+            && let Some(c) = cond
+        {
+            batch_cond.slice_set(c, 0, batch_idx)?;
+        }
         Ok(())
     }
 }

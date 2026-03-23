@@ -25,8 +25,30 @@ pub struct Conv1dState<T: WithDTypeF, B: Backend> {
     pub left_pad_applied: bool,
 }
 
+impl<T: WithDTypeF, B: Backend> Conv1dState<T, B> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        if let Some(v) = &self.prev_xs {
+            let dims = v.dims();
+            let zeros = Tensor::zeros((1, dims[1], dims[2]), v.device())?;
+            v.slice_set(&zeros, 0, batch_idx)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct ConvTr1dState<T: WithDTypeF, B: Backend> {
     pub prev_ys: Option<Tensor<T, B>>,
+}
+
+impl<T: WithDTypeF, B: Backend> ConvTr1dState<T, B> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        if let Some(v) = &self.prev_ys {
+            let dims = v.dims();
+            let zeros = Tensor::zeros((1, dims[1], dims[2]), v.device())?;
+            v.slice_set(&zeros, 0, batch_idx)?;
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
