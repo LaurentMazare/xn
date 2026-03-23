@@ -261,7 +261,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
             let sampled_tokens = if self.model.temperature <= 0.0 {
                 logits_2d.argmax(1)?
             } else {
-                xn::nn::sampling::gumbel_softmax(
+                xn::nn::sampling::gumbel_max(
                     &logits_2d,
                     self.model.temperature as f32,
                     xn::D::Minus1,
