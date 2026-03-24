@@ -23,7 +23,7 @@ ptts = { path = "pocket-tts", version = "0.1.5" }
 anyhow = "1"
 bindgen_cuda = "0.1.6"
 clap = { version = "4", features = ["derive"] }
-cudarc = { version = "0.19.0", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"] }
+cudarc = { version = "0.19.2", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"] }
 gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
 getrandom = "0.3"
 half = { version = "2.7.1", features = ["num-traits"] }
