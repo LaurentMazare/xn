@@ -278,6 +278,47 @@ extern "C" __global__ void fp8_dequant_bf16(
 }
 
 // ---------------------------------------------------------------------------
+// extern "C" instantiations for f16 -> fp8_e4m3
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void segmented_max_reduction_f16(
+    float *__restrict__ scale,
+    const __half *__restrict__ input,
+    int hidden_size,
+    long long in_row_stride,
+    long long num_tokens
+) {
+    segmented_max_reduction_strided<__half, fp8_e4m3>(
+        scale, input, hidden_size, in_row_stride, num_tokens);
+}
+
+extern "C" __global__ void scaled_fp8_quant_dynamic_f16(
+    __nv_fp8_e4m3 *__restrict__ out,
+    const __half *__restrict__ input,
+    const float *__restrict__ scale,
+    int hidden_size,
+    long long in_row_stride,
+    long long out_row_stride
+) {
+    scaled_fp8_quant_kernel_strided_dynamic<__half, fp8_e4m3>(
+        out, input, scale, hidden_size, in_row_stride, out_row_stride);
+}
+
+extern "C" __global__ void fp8_dequant_f16(
+    __half *__restrict__ out,
+    const __nv_fp8_e4m3 *__restrict__ input,
+    const float *__restrict__ scale,
+    const unsigned int numel
+) {
+    const float s = *scale;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
+         i += blockDim.x * gridDim.x) {
+        float v = static_cast<float>(input[i]) * s;
+        out[i] = __float2half(v);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // extern "C" instantiations for f32 -> fp8_e4m3
 // ---------------------------------------------------------------------------
 

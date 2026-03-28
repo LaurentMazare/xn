@@ -1,18 +1,24 @@
 use super::{Device, PTXModule, Storage};
 use crate::{Result, Shape, Tensor, WithDType};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
-use half::bf16;
+use half::{bf16, f16};
 use std::sync::{Arc, RwLock};
 
 /// Trait for types that can be quantized to/from FP8.
 pub trait Fp8Quantizable: WithDType {
-    /// Suffix used in kernel names, e.g. "bf16" or "f32".
+    /// Suffix used in kernel names, e.g. "bf16", "f16", or "f32".
     fn fp8_suffix() -> &'static str;
 }
 
 impl Fp8Quantizable for bf16 {
     fn fp8_suffix() -> &'static str {
         "bf16"
+    }
+}
+
+impl Fp8Quantizable for f16 {
+    fn fp8_suffix() -> &'static str {
+        "f16"
     }
 }
 
