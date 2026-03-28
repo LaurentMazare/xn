@@ -36,8 +36,6 @@ pub(crate) use inplace_ops::{BinaryOp, UnaryOp};
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
 #[cfg(feature = "cuda")]
-pub mod cuda_kernels;
-#[cfg(feature = "cuda")]
 pub use cuda_backend::Device as CudaDevice;
 
 pub fn with_avx() -> bool {

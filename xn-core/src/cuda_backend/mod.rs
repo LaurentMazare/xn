@@ -1,4 +1,6 @@
 #![allow(clippy::too_many_arguments)]
+mod kernels;
+
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{
@@ -78,7 +80,7 @@ impl Device {
                 if let Some(ref m) = modules.arithmetic {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::ARITHMETIC.into())?;
+                let m = self.cuda.load_module(kernels::ARITHMETIC.into())?;
                 modules.arithmetic = Some(m.clone());
                 Ok(m)
             }
@@ -86,7 +88,7 @@ impl Device {
                 if let Some(ref m) = modules.broadcast {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::BROADCAST.into())?;
+                let m = self.cuda.load_module(kernels::BROADCAST.into())?;
                 modules.broadcast = Some(m.clone());
                 Ok(m)
             }
@@ -94,7 +96,7 @@ impl Device {
                 if let Some(ref m) = modules.conv {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::CONV.into())?;
+                let m = self.cuda.load_module(kernels::CONV.into())?;
                 modules.conv = Some(m.clone());
                 Ok(m)
             }
@@ -102,7 +104,7 @@ impl Device {
                 if let Some(ref m) = modules.fattn {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::FATTN.into())?;
+                let m = self.cuda.load_module(kernels::FATTN.into())?;
                 modules.fattn = Some(m.clone());
                 Ok(m)
             }
@@ -110,7 +112,7 @@ impl Device {
                 if let Some(ref m) = modules.fill {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::FILL.into())?;
+                let m = self.cuda.load_module(kernels::FILL.into())?;
                 modules.fill = Some(m.clone());
                 Ok(m)
             }
@@ -118,7 +120,7 @@ impl Device {
                 if let Some(ref m) = modules.indexing {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::INDEXING.into())?;
+                let m = self.cuda.load_module(kernels::INDEXING.into())?;
                 modules.indexing = Some(m.clone());
                 Ok(m)
             }
@@ -126,7 +128,7 @@ impl Device {
                 if let Some(ref m) = modules.layout {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::LAYOUT.into())?;
+                let m = self.cuda.load_module(kernels::LAYOUT.into())?;
                 modules.layout = Some(m.clone());
                 Ok(m)
             }
@@ -134,7 +136,7 @@ impl Device {
                 if let Some(ref m) = modules.reduce {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::REDUCE.into())?;
+                let m = self.cuda.load_module(kernels::REDUCE.into())?;
                 modules.reduce = Some(m.clone());
                 Ok(m)
             }
@@ -142,7 +144,7 @@ impl Device {
                 if let Some(ref m) = modules.rope {
                     return Ok(m.clone());
                 }
-                let m = self.cuda.load_module(crate::cuda_kernels::ROPE.into())?;
+                let m = self.cuda.load_module(kernels::ROPE.into())?;
                 modules.rope = Some(m.clone());
                 Ok(m)
             }
