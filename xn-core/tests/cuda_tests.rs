@@ -1808,3 +1808,57 @@ fn test_quantize_fp8_f16() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_fp8_matmul_t() -> Result<()> {
+    use xn::cuda_backend::quantization::Fp8Tensor;
+
+    let device = get_device();
+
+    // cuBLASLt FP8 requires sufficiently large dimensions for tensor core usage.
+    // A[M, K], W[N, K] → C[M, N] = A × W^T
+    const M: usize = 32;
+    const K: usize = 64;
+    const N: usize = 32;
+
+    // Build A: each row i has value (i+1) in every column.
+    let a_data: Vec<half::bf16> =
+        (0..M * K).map(|idx| half::bf16::from_f32((idx / K + 1) as f32)).collect();
+
+    // Build W as a scaled identity-like matrix: W[j, j] = 1.0 for j < N, rest 0.
+    // This means C = A × W^T picks the first N columns of A (all identical per row).
+    // So C[i, j] = (i+1) for all j.
+    let w_data: Vec<half::bf16> = (0..N * K)
+        .map(|idx| {
+            let row = idx / K;
+            let col = idx % K;
+            if row == col { half::bf16::from_f32(1.0) } else { half::bf16::from_f32(0.0) }
+        })
+        .collect();
+
+    let a_t: Tensor<half::bf16, Device> = Tensor::from_vec(a_data, vec![M, K], &device)?;
+    let w_t: Tensor<half::bf16, Device> = Tensor::from_vec(w_data, vec![N, K], &device)?;
+
+    let a_fp8 = Fp8Tensor::quantize(&a_t)?;
+    let w_fp8 = Fp8Tensor::quantize(&w_t)?;
+
+    let c: Tensor<half::bf16, Device> = a_fp8.matmul_t(&w_fp8)?;
+    assert_eq!(c.dims(), &[M, N]);
+
+    let result: Vec<half::bf16> = c.to_vec()?;
+
+    // Expected: C[i, j] ≈ (i+1) for all j.
+    for i in 0..M {
+        let expected = (i + 1) as f32;
+        for j in 0..N {
+            let got = result[i * N + j].to_f32();
+            let tol = f32::max(expected.abs() * 0.15, 1.0);
+            assert!(
+                (got - expected).abs() <= tol,
+                "matmul mismatch at [{i}, {j}]: got {got}, expected {expected}, tol {tol}",
+            );
+        }
+    }
+
+    Ok(())
+}
