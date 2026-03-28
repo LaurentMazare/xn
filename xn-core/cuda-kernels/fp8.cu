@@ -1,13 +1,68 @@
 // Kernels extracted from:
 // https://github.com/vllm-project/vllm/blob/fafca38adc1ce65d2c9e2857138c3c0d65b0905e/csrc/quantization/w8a8/fp8/common.cu#L1
+#include "cuda_utils.cuh"
 #include "vectorization_utils.cuh"
+#include <cuda_fp8.h>
 #include <tuple>
+
+// ---------------------------------------------------------------------------
+// FP8 helpers
+// ---------------------------------------------------------------------------
+
+// We target E4M3 (fp8_e4m3fn) for weights/activations quantization.
+using fp8_e4m3 = __nv_fp8_e4m3;
+
+// Max representable value for FP8 E4M3: 448.0
+template <typename T> struct quant_type_max;
+template <> struct quant_type_max<fp8_e4m3> {
+    static constexpr float value = 448.0f;
+};
+template <typename T>
+inline constexpr float quant_type_max_v = quant_type_max<T>::value;
+
+// Minimum scaling factor to avoid division by zero / denorm issues.
+template <typename T> struct min_scaling_factor;
+template <> struct min_scaling_factor<fp8_e4m3> {
+    __device__ __host__ static constexpr float val() { return 1.0f / (FP8_E4M3_MAX * 512.0f); }
+    static constexpr float FP8_E4M3_MAX = 448.0f;
+};
+
+// Convert a float value to FP8 with a scaling factor.
+// If `is_inverse_scale` is true, `scale` is 1/real_scale (i.e. multiply by it).
+// Otherwise, `scale` is the real scale (divide by it).
+template <bool is_inverse_scale, typename fp8_type>
+__device__ __forceinline__ fp8_type scaled_fp8_conversion(float val, float scale) {
+    float x;
+    if constexpr (is_inverse_scale) {
+        x = val * scale;
+    } else {
+        x = val / scale;
+    }
+    // Clamp to FP8 range before conversion.
+    x = fminf(fmaxf(x, -quant_type_max_v<fp8_type>), quant_type_max_v<fp8_type>);
+    return static_cast<fp8_type>(x);
+}
+
+// atomicMax for float (used in per-tensor absmax reduction).
+__device__ __forceinline__ void atomicMaxFloat(float *addr, float val) {
+    if (val <= 0.0f) return;
+    // Use integer atomicMax on positive floats (IEEE 754 positive floats
+    // have the same ordering as their integer bit patterns).
+    atomicMax(reinterpret_cast<int *>(addr), __float_as_int(val));
+}
+
+// Simple max functor for cub::BlockReduce.
+struct CubMaxOp {
+    __device__ __forceinline__ float operator()(float a, float b) const {
+        return fmaxf(a, b);
+    }
+};
 
 // STRIDE_I_ZERO: true if scale_stride_i == 0 (per-tensor or per-channel)
 // STRIDE_J_ZERO: true if scale_stride_j == 0 (per-tensor or per-token)
 template <typename scalar_t, typename fp8_type, bool STRIDE_I_ZERO,
           bool STRIDE_J_ZERO>
-__global__ void scaled_fp8_quant_kernel_strided_group_shape(
+__device__ void scaled_fp8_quant_kernel_strided_group_shape(
     fp8_type *__restrict__ out, const scalar_t *__restrict__ input,
     const float *__restrict__ scale, int hidden_size, int64_t in_row_stride,
     int64_t out_row_stride, int group_m, int group_n, int64_t scale_stride_i,
@@ -73,7 +128,7 @@ __global__ void scaled_fp8_quant_kernel_strided_group_shape(
 }
 
 template <typename scalar_t, typename fp8_type>
-__global__ void segmented_max_reduction_strided(
+__device__ void segmented_max_reduction_strided(
     float *__restrict__ scale, const scalar_t *__restrict__ input,
     int hidden_size, int64_t in_row_stride, int64_t num_tokens) {
   __shared__ float cache[256];
@@ -112,7 +167,7 @@ __global__ void segmented_max_reduction_strided(
 }
 
 template <typename scalar_t, typename fp8_type>
-__global__ void scaled_fp8_quant_kernel_strided_dynamic(
+__device__ void scaled_fp8_quant_kernel_strided_dynamic(
     fp8_type *__restrict__ out, const scalar_t *__restrict__ input,
     const float *__restrict__ scale, int hidden_size, int64_t in_row_stride,
     int64_t out_row_stride) {
@@ -132,7 +187,7 @@ __global__ void scaled_fp8_quant_kernel_strided_dynamic(
 }
 
 template <typename scalar_t, typename fp8_type>
-__global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(
+__device__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(
     fp8_type *__restrict__ out, float *__restrict__ scale,
     const scalar_t *__restrict__ input, const float *__restrict__ scale_ub,
     int hidden_size, int64_t in_row_stride, int64_t out_row_stride) {
@@ -173,4 +228,36 @@ __global__ void dynamic_per_token_scaled_fp8_quant_kernel_strided(
         dst = scaled_fp8_conversion<false, fp8_type>(static_cast<float>(src),
                                                      token_scale);
       });
+}
+
+// ---------------------------------------------------------------------------
+// extern "C" instantiations for bf16 -> fp8_e4m3
+// ---------------------------------------------------------------------------
+
+// Per-tensor absmax reduction: launch with one block per row, 256 threads.
+// After this kernel, scale[0] = max(absmax_per_row) / FP8_E4M3_MAX.
+// The caller must zero-initialize `scale` before launching.
+extern "C" __global__ void segmented_max_reduction_bf16(
+    float *__restrict__ scale,
+    const __nv_bfloat16 *__restrict__ input,
+    int hidden_size,
+    long long in_row_stride,
+    long long num_tokens
+) {
+    segmented_max_reduction_strided<__nv_bfloat16, fp8_e4m3>(
+        scale, input, hidden_size, in_row_stride, num_tokens);
+}
+
+// Per-tensor quantization: launch with one block per row, 256 threads.
+// `scale` should already contain the computed scale from the reduction kernel.
+extern "C" __global__ void scaled_fp8_quant_dynamic_bf16(
+    __nv_fp8_e4m3 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ input,
+    const float *__restrict__ scale,
+    int hidden_size,
+    long long in_row_stride,
+    long long out_row_stride
+) {
+    scaled_fp8_quant_kernel_strided_dynamic<__nv_bfloat16, fp8_e4m3>(
+        out, input, scale, hidden_size, in_row_stride, out_row_stride);
 }

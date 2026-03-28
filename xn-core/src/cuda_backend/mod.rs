@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 mod kernels;
+pub mod quantization;
 
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
@@ -13,7 +14,7 @@ struct CudaRng(cudarc::curand::CudaRng);
 unsafe impl Send for CudaRng {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum PTXModule {
+pub enum PTXModule {
     Arithmetic,
     Broadcast,
     Conv,
@@ -161,7 +162,7 @@ impl Device {
         }
     }
 
-    fn get_func(&self, name: &str, mdl: PTXModule) -> Result<CudaFunction> {
+    pub fn get_func(&self, name: &str, mdl: PTXModule) -> Result<CudaFunction> {
         let module = self.get_or_load_module(mdl).map_err(|e| e.context(format!("{mdl:?}")))?;
         let func = module
             .load_function(name)

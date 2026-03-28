@@ -1675,3 +1675,63 @@ fn test_conv_transpose1d_f16() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// FP8 quantization
+// =============================================================================
+
+#[test]
+fn test_quantize_fp8() -> Result<()> {
+    use xn::cuda_backend::quantization::quantize_fp8;
+
+    let device = get_device();
+    let num_tokens = 4;
+    let hidden_size = 8;
+    // Values in [-100, 100] range, well within FP8 E4M3 representable range (max 448).
+    let data: Vec<half::bf16> = [
+        1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        -0.5, 0.25, -0.125, 0.0, 1.0, -1.0, 2.0, -2.0, 100.0, -100.0, 50.0, -50.0, 25.0, -25.0,
+        12.5, -12.5,
+    ]
+    .iter()
+    .map(|&v| half::bf16::from_f32(v))
+    .collect();
+
+    let t: Tensor<half::bf16, Device> =
+        Tensor::from_vec(data.clone(), vec![num_tokens, hidden_size], &device)?;
+    let storage = t.storage()?;
+
+    let fp8 = quantize_fp8(&device, &storage.data, num_tokens, hidden_size)?;
+
+    // Read back scale and quantized data.
+    let scale: Vec<f32> = device.stream().clone_dtoh(&fp8.scales)?;
+    let qdata: Vec<u8> = device.stream().clone_dtoh(&fp8.data)?;
+
+    assert_eq!(scale.len(), 1);
+    assert_eq!(qdata.len(), num_tokens * hidden_size);
+
+    // The absmax across all values is 100.0, so scale should be 100.0 / 448.0.
+    let expected_scale = 100.0f32 / 448.0;
+    assert!(
+        (scale[0] - expected_scale).abs() < 1e-5,
+        "scale mismatch: got {} expected {}",
+        scale[0],
+        expected_scale,
+    );
+
+    // Verify that non-zero inputs produce non-zero quantized bytes and vice versa.
+    for (i, &orig_bf16) in data.iter().enumerate() {
+        let orig = orig_bf16.to_f32();
+        // The quantized value is round(orig * inv_scale) clamped to [-448, 448],
+        // stored as FP8 E4M3. We can't easily decode FP8 on CPU without a library,
+        // but we can check that the quantized byte is non-zero for non-zero inputs
+        // and zero for zero inputs.
+        if orig == 0.0 {
+            assert_eq!(qdata[i], 0, "expected zero for zero input at index {i}");
+        } else {
+            assert_ne!(qdata[i], 0, "expected non-zero for non-zero input at index {i}");
+        }
+    }
+
+    Ok(())
+}
