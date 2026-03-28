@@ -19,6 +19,7 @@ enum PTXModule {
     Conv,
     Fattn,
     Fill,
+    Fp8,
     Indexing,
     Layout,
     Reduce,
@@ -32,6 +33,7 @@ struct ModuleCache {
     conv: Option<Arc<cudarc::driver::CudaModule>>,
     fattn: Option<Arc<cudarc::driver::CudaModule>>,
     fill: Option<Arc<cudarc::driver::CudaModule>>,
+    fp8: Option<Arc<cudarc::driver::CudaModule>>,
     indexing: Option<Arc<cudarc::driver::CudaModule>>,
     layout: Option<Arc<cudarc::driver::CudaModule>>,
     reduce: Option<Arc<cudarc::driver::CudaModule>>,
@@ -114,6 +116,14 @@ impl Device {
                 }
                 let m = self.cuda.load_module(kernels::FILL.into())?;
                 modules.fill = Some(m.clone());
+                Ok(m)
+            }
+            PTXModule::Fp8 => {
+                if let Some(ref m) = modules.fp8 {
+                    return Ok(m.clone());
+                }
+                let m = self.cuda.load_module(kernels::FP8.into())?;
+                modules.fp8 = Some(m.clone());
                 Ok(m)
             }
             PTXModule::Indexing => {
