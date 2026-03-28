@@ -1675,3 +1675,136 @@ fn test_conv_transpose1d_f16() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// FP8 quantization
+// =============================================================================
+
+#[test]
+fn test_quantize_fp8_bf16() -> Result<()> {
+    use xn::cuda_backend::quantization::Fp8Tensor;
+
+    let device = get_device();
+    let data: Vec<half::bf16> = [
+        1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        -0.5, 0.25, -0.125, 0.0, 1.0, -1.0, 2.0, -2.0, 100.0, -100.0, 50.0, -50.0, 25.0, -25.0,
+        12.5, -12.5,
+    ]
+    .iter()
+    .map(|&v| half::bf16::from_f32(v))
+    .collect();
+
+    let t: Tensor<half::bf16, Device> = Tensor::from_vec(data.clone(), vec![4, 8], &device)?;
+    let fp8 = Fp8Tensor::quantize(&t)?;
+
+    let scale: Vec<f32> = device.stream().clone_dtoh(&fp8.scales)?;
+    assert_eq!(scale.len(), 1);
+    let expected_scale = 100.0f32 / 448.0;
+    assert!(
+        (scale[0] - expected_scale).abs() < 1e-5,
+        "scale mismatch: got {} expected {}",
+        scale[0],
+        expected_scale,
+    );
+
+    // Dequantize back to bf16 and check round-trip error.
+    let out: Tensor<half::bf16, Device> = fp8.dequantize()?;
+    assert_eq!(out.dims(), &[4, 8]);
+    let result: Vec<half::bf16> = out.to_vec()?;
+
+    for (i, (&orig, &deq)) in data.iter().zip(result.iter()).enumerate() {
+        let o = orig.to_f32();
+        let d = deq.to_f32();
+        let tol = f32::max(o.abs() * 0.1, 0.5);
+        assert!(
+            (o - d).abs() <= tol,
+            "round-trip mismatch at index {i}: original {o}, dequantized {d}, tol {tol}",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_quantize_fp8_f32() -> Result<()> {
+    use xn::cuda_backend::quantization::Fp8Tensor;
+
+    let device = get_device();
+    let data: Vec<f32> = vec![
+        1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        -0.5, 0.25, -0.125, 0.0, 1.0, -1.0, 2.0, -2.0, 100.0, -100.0, 50.0, -50.0, 25.0, -25.0,
+        12.5, -12.5,
+    ];
+
+    let t: Tensor<f32, Device> = Tensor::from_vec(data.clone(), vec![4, 8], &device)?;
+    let fp8 = Fp8Tensor::quantize(&t)?;
+
+    let scale: Vec<f32> = device.stream().clone_dtoh(&fp8.scales)?;
+    assert_eq!(scale.len(), 1);
+    let expected_scale = 100.0f32 / 448.0;
+    assert!(
+        (scale[0] - expected_scale).abs() < 1e-5,
+        "scale mismatch: got {} expected {}",
+        scale[0],
+        expected_scale,
+    );
+
+    // Dequantize back to f32 and check round-trip error.
+    let out: Tensor<f32, Device> = fp8.dequantize()?;
+    assert_eq!(out.dims(), &[4, 8]);
+    let result: Vec<f32> = out.to_vec()?;
+
+    for (i, (&orig, &deq)) in data.iter().zip(result.iter()).enumerate() {
+        let tol = f32::max(orig.abs() * 0.1, 0.5);
+        assert!(
+            (orig - deq).abs() <= tol,
+            "round-trip mismatch at index {i}: original {orig}, dequantized {deq}, tol {tol}",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_quantize_fp8_f16() -> Result<()> {
+    use xn::cuda_backend::quantization::Fp8Tensor;
+
+    let device = get_device();
+    let data: Vec<half::f16> = [
+        1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        -0.5, 0.25, -0.125, 0.0, 1.0, -1.0, 2.0, -2.0, 100.0, -100.0, 50.0, -50.0, 25.0, -25.0,
+        12.5, -12.5,
+    ]
+    .iter()
+    .map(|&v| half::f16::from_f32(v))
+    .collect();
+
+    let t: Tensor<half::f16, Device> = Tensor::from_vec(data.clone(), vec![4, 8], &device)?;
+    let fp8 = Fp8Tensor::quantize(&t)?;
+
+    let scale: Vec<f32> = device.stream().clone_dtoh(&fp8.scales)?;
+    assert_eq!(scale.len(), 1);
+    let expected_scale = 100.0f32 / 448.0;
+    assert!(
+        (scale[0] - expected_scale).abs() < 1e-5,
+        "scale mismatch: got {} expected {}",
+        scale[0],
+        expected_scale,
+    );
+
+    let out: Tensor<half::f16, Device> = fp8.dequantize()?;
+    assert_eq!(out.dims(), &[4, 8]);
+    let result: Vec<half::f16> = out.to_vec()?;
+
+    for (i, (&orig, &deq)) in data.iter().zip(result.iter()).enumerate() {
+        let o = orig.to_f32();
+        let d = deq.to_f32();
+        let tol = f32::max(o.abs() * 0.1, 0.5);
+        assert!(
+            (o - d).abs() <= tol,
+            "round-trip mismatch at index {i}: original {o}, dequantized {d}, tol {tol}",
+        );
+    }
+
+    Ok(())
+}

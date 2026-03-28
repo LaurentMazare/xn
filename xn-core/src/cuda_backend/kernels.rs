@@ -3,6 +3,7 @@ pub const BROADCAST: &str = include_str!(concat!(env!("OUT_DIR"), "/broadcast.pt
 pub const CONV: &str = include_str!(concat!(env!("OUT_DIR"), "/conv.ptx"));
 pub const FATTN: &str = include_str!(concat!(env!("OUT_DIR"), "/fattn.ptx"));
 pub const FILL: &str = include_str!(concat!(env!("OUT_DIR"), "/fill.ptx"));
+pub const FP8: &str = include_str!(concat!(env!("OUT_DIR"), "/fp8.ptx"));
 pub const INDEXING: &str = include_str!(concat!(env!("OUT_DIR"), "/indexing.ptx"));
 pub const LAYOUT: &str = include_str!(concat!(env!("OUT_DIR"), "/layout.ptx"));
 pub const REDUCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce.ptx"));

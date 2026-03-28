@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 mod kernels;
+pub mod quantization;
 
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
 use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
@@ -13,12 +14,13 @@ struct CudaRng(cudarc::curand::CudaRng);
 unsafe impl Send for CudaRng {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum PTXModule {
+pub enum PTXModule {
     Arithmetic,
     Broadcast,
     Conv,
     Fattn,
     Fill,
+    Fp8,
     Indexing,
     Layout,
     Reduce,
@@ -32,6 +34,7 @@ struct ModuleCache {
     conv: Option<Arc<cudarc::driver::CudaModule>>,
     fattn: Option<Arc<cudarc::driver::CudaModule>>,
     fill: Option<Arc<cudarc::driver::CudaModule>>,
+    fp8: Option<Arc<cudarc::driver::CudaModule>>,
     indexing: Option<Arc<cudarc::driver::CudaModule>>,
     layout: Option<Arc<cudarc::driver::CudaModule>>,
     reduce: Option<Arc<cudarc::driver::CudaModule>>,
@@ -116,6 +119,14 @@ impl Device {
                 modules.fill = Some(m.clone());
                 Ok(m)
             }
+            PTXModule::Fp8 => {
+                if let Some(ref m) = modules.fp8 {
+                    return Ok(m.clone());
+                }
+                let m = self.cuda.load_module(kernels::FP8.into())?;
+                modules.fp8 = Some(m.clone());
+                Ok(m)
+            }
             PTXModule::Indexing => {
                 if let Some(ref m) = modules.indexing {
                     return Ok(m.clone());
@@ -151,7 +162,7 @@ impl Device {
         }
     }
 
-    fn get_func(&self, name: &str, mdl: PTXModule) -> Result<CudaFunction> {
+    pub fn get_func(&self, name: &str, mdl: PTXModule) -> Result<CudaFunction> {
         let module = self.get_or_load_module(mdl).map_err(|e| e.context(format!("{mdl:?}")))?;
         let func = module
             .load_function(name)
