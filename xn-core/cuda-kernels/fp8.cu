@@ -261,3 +261,59 @@ extern "C" __global__ void scaled_fp8_quant_dynamic_bf16(
     scaled_fp8_quant_kernel_strided_dynamic<__nv_bfloat16, fp8_e4m3>(
         out, input, scale, hidden_size, in_row_stride, out_row_stride);
 }
+
+// Dequantize FP8 E4M3 -> bf16: out[i] = (float)fp8[i] * scale
+extern "C" __global__ void fp8_dequant_bf16(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_fp8_e4m3 *__restrict__ input,
+    const float *__restrict__ scale,
+    const unsigned int numel
+) {
+    const float s = *scale;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
+         i += blockDim.x * gridDim.x) {
+        float v = static_cast<float>(input[i]) * s;
+        out[i] = __float2bfloat16(v);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// extern "C" instantiations for f32 -> fp8_e4m3
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void segmented_max_reduction_f32(
+    float *__restrict__ scale,
+    const float *__restrict__ input,
+    int hidden_size,
+    long long in_row_stride,
+    long long num_tokens
+) {
+    segmented_max_reduction_strided<float, fp8_e4m3>(
+        scale, input, hidden_size, in_row_stride, num_tokens);
+}
+
+extern "C" __global__ void scaled_fp8_quant_dynamic_f32(
+    __nv_fp8_e4m3 *__restrict__ out,
+    const float *__restrict__ input,
+    const float *__restrict__ scale,
+    int hidden_size,
+    long long in_row_stride,
+    long long out_row_stride
+) {
+    scaled_fp8_quant_kernel_strided_dynamic<float, fp8_e4m3>(
+        out, input, scale, hidden_size, in_row_stride, out_row_stride);
+}
+
+// Dequantize FP8 E4M3 -> f32: out[i] = (float)fp8[i] * scale
+extern "C" __global__ void fp8_dequant_f32(
+    float *__restrict__ out,
+    const __nv_fp8_e4m3 *__restrict__ input,
+    const float *__restrict__ scale,
+    const unsigned int numel
+) {
+    const float s = *scale;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
+         i += blockDim.x * gridDim.x) {
+        out[i] = static_cast<float>(input[i]) * s;
+    }
+}
