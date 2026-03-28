@@ -1,0 +1,145 @@
+//! Benchmark: BF16 matmul vs FP8 matmul vs mixed (quantize-on-the-fly + FP8 matmul).
+//!
+//! Computes C = A × B^T where A is [M, K] and B is [N, K].
+//!
+//! Run with: cargo run --release --features cuda --example cuda_benchmarks
+
+use std::time::Instant;
+use xn::cuda_backend::quantization::Fp8Tensor;
+use xn::{Backend, Result, Tensor, cuda_backend::Device};
+
+const M: usize = 32;
+const K: usize = 2048;
+const N: usize = 11264;
+const WARMUP: usize = 50;
+const ITERS: usize = 2000;
+
+fn random_bf16_vec(n: usize, seed: u64) -> Vec<half::bf16> {
+    let mut s = seed;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            half::bf16::from_f32((s & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0)
+        })
+        .collect()
+}
+
+fn main() -> Result<()> {
+    let device = Device::new(0)?;
+
+    println!("Matrix dimensions: A=[{M}, {K}], B=[{N}, {K}] -> C=[{M}, {N}]");
+    println!("Warmup: {WARMUP}  |  Iterations: {ITERS}");
+
+    let a_bf16: Tensor<half::bf16, Device> =
+        Tensor::from_vec(random_bf16_vec(M * K, 42), (M, K), &device)?;
+    let b_bf16: Tensor<half::bf16, Device> =
+        Tensor::from_vec(random_bf16_vec(N * K, 123), (N, K), &device)?;
+
+    // =====================================================================
+    // 1. BF16 × BF16 -> BF16  (using Tensor::matmul_t)
+    // =====================================================================
+    println!("\n=== BF16 x BF16 -> BF16 ===");
+
+    for _ in 0..WARMUP {
+        let _c = a_bf16.matmul_t(&b_bf16)?;
+    }
+    device.synchronize()?;
+
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let _c = a_bf16.matmul_t(&b_bf16)?;
+    }
+    device.synchronize()?;
+    let bf16_elapsed = t0.elapsed();
+    let bf16_us = bf16_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+    let flops = 2.0 * M as f64 * N as f64 * K as f64;
+    let bf16_tflops = flops * ITERS as f64 / bf16_elapsed.as_secs_f64() / 1e12;
+    println!(
+        "  {ITERS} iters in {:.3} ms  |  {bf16_us:.1} us/iter  |  {bf16_tflops:.2} TFLOP/s",
+        bf16_elapsed.as_secs_f64() * 1e3,
+    );
+
+    // Keep a reference result for accuracy comparison.
+    let c_bf16 = a_bf16.matmul_t(&b_bf16)?;
+    device.synchronize()?;
+
+    // =====================================================================
+    // 2. FP8 × FP8 -> BF16  (both pre-quantized)
+    // =====================================================================
+    println!("\n=== FP8 x FP8 -> BF16 (both pre-quantized) ===");
+
+    let a_fp8 = Fp8Tensor::quantize(&a_bf16)?;
+    let b_fp8 = Fp8Tensor::quantize(&b_bf16)?;
+
+    for _ in 0..WARMUP {
+        let _c = a_fp8.matmul_t(&b_fp8)?;
+    }
+    device.synchronize()?;
+
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let _c = a_fp8.matmul_t(&b_fp8)?;
+    }
+    device.synchronize()?;
+    let fp8_elapsed = t0.elapsed();
+    let fp8_us = fp8_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+    let fp8_tflops = flops * ITERS as f64 / fp8_elapsed.as_secs_f64() / 1e12;
+    println!(
+        "  {ITERS} iters in {:.3} ms  |  {fp8_us:.1} us/iter  |  {fp8_tflops:.2} TFLOP/s",
+        fp8_elapsed.as_secs_f64() * 1e3,
+    );
+
+    let c_fp8 = a_fp8.matmul_t(&b_fp8)?;
+    device.synchronize()?;
+
+    // =====================================================================
+    // 3. Mixed: quantize A on-the-fly + FP8 matmul with pre-quantized B
+    // =====================================================================
+    println!("\n=== Mixed: quantize(A) on-the-fly + FP8 matmul (B pre-quantized) ===");
+
+    for _ in 0..WARMUP {
+        let a_q = Fp8Tensor::quantize(&a_bf16)?;
+        let _c = a_q.matmul_t(&b_fp8)?;
+    }
+    device.synchronize()?;
+
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let a_q = Fp8Tensor::quantize(&a_bf16)?;
+        let _c = a_q.matmul_t(&b_fp8)?;
+    }
+    device.synchronize()?;
+    let mixed_elapsed = t0.elapsed();
+    let mixed_us = mixed_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+    let mixed_tflops = flops * ITERS as f64 / mixed_elapsed.as_secs_f64() / 1e12;
+    println!(
+        "  {ITERS} iters in {:.3} ms  |  {mixed_us:.1} us/iter  |  {mixed_tflops:.2} TFLOP/s",
+        mixed_elapsed.as_secs_f64() * 1e3,
+    );
+
+    // =====================================================================
+    // Comparison
+    // =====================================================================
+    println!("\n=== Comparison ===");
+    println!("  FP8 vs BF16 speedup:   {:.2}x", bf16_us / fp8_us);
+    println!("  Mixed vs BF16 speedup: {:.2}x", bf16_us / mixed_us);
+
+    // Accuracy: compare FP8 result against BF16 reference.
+    let c_bf16_vec = c_bf16.to_vec()?;
+    let c_fp8_vec = c_fp8.to_vec()?;
+
+    let mut max_diff: f32 = 0.0;
+    let mut sum_diff: f64 = 0.0;
+    for (&a, &b) in c_bf16_vec.iter().zip(c_fp8_vec.iter()) {
+        let d = (a.to_f32() - b.to_f32()).abs();
+        max_diff = max_diff.max(d);
+        sum_diff += d as f64;
+    }
+    println!("\n  FP8 vs BF16 accuracy:");
+    println!("    Max abs diff:  {max_diff:.4}");
+    println!("    Mean abs diff: {:.4}", sum_diff / (M * N) as f64);
+
+    Ok(())
+}
