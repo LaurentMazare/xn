@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_arguments)]
+mod cublaslt;
 mod kernels;
 pub mod quantization;
 
@@ -41,25 +42,12 @@ struct ModuleCache {
     rope: Option<Arc<cudarc::driver::CudaModule>>,
 }
 
-pub(crate) struct CublasLtHandle(cudarc::cublaslt::sys::cublasLtHandle_t);
-unsafe impl Send for CublasLtHandle {}
-unsafe impl Sync for CublasLtHandle {}
-
-impl Drop for CublasLtHandle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { cudarc::cublaslt::result::destroy_handle(self.0).ok() };
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Device {
     cuda: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     blas: Arc<cudarc::cublas::CudaBlas>,
-    pub(crate) blas_lt: Arc<CublasLtHandle>,
-    pub(crate) blas_lt_workspace: Arc<CudaSlice<u8>>,
+    pub(crate) blas_lt: Arc<cublaslt::CudaBlasLT>,
     curand: Arc<Mutex<CudaRng>>,
     /// Cache for loaded PTX modules
     modules: Arc<Mutex<ModuleCache>>,
@@ -76,20 +64,13 @@ impl Device {
         let cuda = cudarc::driver::CudaContext::new(ordinal)?;
         let stream = cuda.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone())?;
-        let blas_lt_handle = cudarc::cublaslt::result::create_handle()?;
-        // Workspace: 32 MiB for Hopper (sm_90+), 4 MiB otherwise.
-        let cc_major = cuda.attribute(
-            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        )?;
-        let ws_size = if cc_major >= 9 { 32 << 20 } else { 4 << 20 };
-        let blas_lt_workspace: CudaSlice<u8> = unsafe { stream.alloc::<u8>(ws_size) }?;
+        let blas_lt = cublaslt::CudaBlasLT::new(stream.clone())?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone())?;
         Ok(Self {
             cuda,
             stream,
             blas: Arc::new(blas),
-            blas_lt: Arc::new(CublasLtHandle(blas_lt_handle)),
-            blas_lt_workspace: Arc::new(blas_lt_workspace),
+            blas_lt: Arc::new(blas_lt),
             modules: Arc::new(Mutex::new(Default::default())),
             curand: Arc::new(Mutex::new(CudaRng(curand))),
         })

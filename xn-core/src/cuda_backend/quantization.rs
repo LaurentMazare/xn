@@ -1,10 +1,8 @@
 // Fp8 quantization support.
 use super::{Device, PTXModule, Storage};
 use crate::{Result, Shape, Tensor, WithDType};
-use cudarc::cublaslt::{result as lt, sys as lt_sys};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use half::{bf16, f16};
-use std::ffi::c_void;
 use std::sync::{Arc, RwLock};
 
 /// Trait for types that can be quantized to/from FP8.
@@ -106,120 +104,16 @@ impl Fp8Tensor {
         let stream = self.device.stream();
         let mut out: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * n) }?;
 
-        // cuBLASLt FP8 matmul requires TN layout.
-        // We compute C^T in col-major: D(N,M) = A^T(N,K) × B(K,M)
-        // where A = rhs (row-major [N,K] = col-major [K,N], ld=K)
-        //       B = self (row-major [M,K] = col-major [K,M], ld=K)
-        //       D = out (row-major [M,N] = col-major [N,M], ld=N)
-        let handle = self.device.blas_lt.0;
-
-        // Matmul descriptor: compute in f32, scale type f32.
-        let desc = lt::create_matmul_desc(
-            lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            lt_sys::cudaDataType_t::CUDA_R_32F,
+        self.device.blas_lt.matmul_f8(
+            &rhs.data,
+            &self.data,
+            &rhs.scales,
+            &self.scales,
+            &mut out,
+            m,
+            n,
+            k,
         )?;
-
-        let op_t = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_T;
-        let op_n = cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N;
-        unsafe {
-            set_desc_attr(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-                &op_t,
-            )?;
-            set_desc_attr(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-                &op_n,
-            )?;
-        }
-
-        // Set per-tensor scale pointers.
-        let (a_sc_ptr, _ga) = rhs.scales.device_ptr(stream);
-        let (b_sc_ptr, _gb) = self.scales.device_ptr(stream);
-        let a_sc_p = a_sc_ptr as *const c_void;
-        let b_sc_p = b_sc_ptr as *const c_void;
-        unsafe {
-            set_desc_attr(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-                &a_sc_p,
-            )?;
-            set_desc_attr(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                &b_sc_p,
-            )?;
-        }
-
-        // Matrix layouts (FP8 E4M3 for A and B, BF16 for C and D).
-        let fp8_type = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
-        let bf16_type = lt_sys::cudaDataType_t::CUDA_R_16BF;
-
-        // A = rhs: stored as [K, N] col-major, ld = K
-        let a_lay = lt::create_matrix_layout(fp8_type, k as u64, n as u64, k as i64)?;
-        // B = self: stored as [K, M] col-major, ld = K
-        let b_lay = lt::create_matrix_layout(fp8_type, k as u64, m as u64, k as i64)?;
-        // C and D: [N, M] col-major, ld = N
-        let c_lay = lt::create_matrix_layout(bf16_type, n as u64, m as u64, n as i64)?;
-        let d_lay = lt::create_matrix_layout(bf16_type, n as u64, m as u64, n as i64)?;
-
-        // Algorithm selection.
-        let pref = lt::create_matmul_pref()?;
-        let ws_size = self.device.blas_lt_workspace.len();
-        unsafe {
-            lt::set_matmul_pref_attribute(
-                pref,
-                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                &ws_size as *const _ as *const c_void,
-                std::mem::size_of::<usize>(),
-            )?;
-        }
-
-        let heuristic = unsafe {
-            lt::get_matmul_algo_heuristic(handle, desc, a_lay, b_lay, c_lay, d_lay, pref)?
-        };
-
-        // Launch (scoped to drop borrow guards before moving `out`).
-        {
-            let alpha: f32 = 1.0;
-            let beta: f32 = 0.0;
-            let (a_ptr, _ra) = rhs.data.device_ptr(stream);
-            let (b_ptr, _rb) = self.data.device_ptr(stream);
-            let (d_ptr, _rd) = out.device_ptr_mut(stream);
-            let (w_ptr, _rw) = self.device.blas_lt_workspace.device_ptr(stream);
-
-            unsafe {
-                lt::matmul(
-                    handle,
-                    desc,
-                    &alpha as *const f32 as *const c_void,
-                    &beta as *const f32 as *const c_void,
-                    a_ptr as *const c_void,
-                    a_lay,
-                    b_ptr as *const c_void,
-                    b_lay,
-                    d_ptr as *const c_void, // C input (unused, beta=0)
-                    c_lay,
-                    d_ptr as *mut c_void, // D output
-                    d_lay,
-                    &heuristic.algo as *const _,
-                    w_ptr as *mut c_void,
-                    ws_size,
-                    stream.cu_stream() as *mut _,
-                )?;
-            }
-        }
-
-        // Cleanup cuBLASLt resources.
-        unsafe {
-            lt::destroy_matmul_pref(pref)?;
-            lt::destroy_matrix_layout(d_lay)?;
-            lt::destroy_matrix_layout(c_lay)?;
-            lt::destroy_matrix_layout(b_lay)?;
-            lt::destroy_matrix_layout(a_lay)?;
-            lt::destroy_matmul_desc(desc)?;
-        }
 
         let out_shape: Shape = (m, n).into();
         let storage = Storage { data: out, device: self.device.clone() };
@@ -230,23 +124,6 @@ impl Fp8Tensor {
             _marker: std::marker::PhantomData,
         })
     }
-}
-
-/// Helper to set a matmul descriptor attribute.
-unsafe fn set_desc_attr<T>(
-    desc: lt_sys::cublasLtMatmulDesc_t,
-    attr: lt_sys::cublasLtMatmulDescAttributes_t,
-    val: &T,
-) -> Result<()> {
-    unsafe {
-        lt::set_matmul_desc_attribute(
-            desc,
-            attr,
-            val as *const T as *const c_void,
-            std::mem::size_of::<T>(),
-        )?;
-    }
-    Ok(())
 }
 
 /// Quantize a contiguous buffer to FP8 E4M3 using dynamic per-tensor scaling.
