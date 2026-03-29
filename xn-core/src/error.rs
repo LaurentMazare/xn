@@ -79,6 +79,10 @@ pub enum Error {
     #[cfg(feature = "cuda")]
     #[error(transparent)]
     CudaDriver(cudarc::driver::DriverError),
+
+    #[cfg(feature = "cuda")]
+    #[error(transparent)]
+    CublasLt(cudarc::cublaslt::result::CublasError),
 }
 
 #[cfg(feature = "cuda")]
@@ -99,6 +103,13 @@ impl From<cudarc::curand::result::CurandError> for Error {
 impl From<cudarc::cublas::result::CublasError> for Error {
     fn from(value: cudarc::cublas::result::CublasError) -> Self {
         Self::Cublas(value).bt()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::cublaslt::result::CublasError> for Error {
+    fn from(value: cudarc::cublaslt::result::CublasError) -> Self {
+        Self::CublasLt(value).bt()
     }
 }
 
