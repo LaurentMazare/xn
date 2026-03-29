@@ -41,7 +41,7 @@ tracing-chrome = { workspace = true }
 bindgen_cuda = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["cuda"]
 accelerate = ["dep:libc"]
 audio = ["dep:kaudio"]
 cuda = ["dep:cudarc", "dep:bindgen_cuda"]

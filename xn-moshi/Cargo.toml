@@ -9,6 +9,7 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
+half = { workspace = true }
 kaudio = { workspace = true, optional = true }
 rand = { workspace = true, features = ["thread_rng"] }
 serde = { workspace = true }

@@ -185,7 +185,49 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
             text_in_vocab_size: cfg.text_in_vocab_size,
         })
     }
+}
 
+#[cfg(feature = "cuda")]
+impl LmModel<half::bf16, xn::cuda_backend::Device> {
+    pub fn load_fp8(vb: &Path<xn::cuda_backend::Device>, cfg: &Config) -> Result<Self> {
+        let d_model = cfg.transformer.d_model;
+
+        let text_emb = Embedding::load(vb.pp("text_emb"), cfg.text_in_vocab_size, d_model)?;
+        let out_norm = Norm::load(vb.pp("out_norm"), d_model, cfg.transformer.norm)?;
+        let text_linear = Linear::load(vb.pp("text_linear"), d_model, cfg.text_out_vocab_size)?;
+
+        let transformer =
+            bt::BatchedTransformer::load_fp8(&vb.pp("transformer"), &cfg.transformer)?;
+
+        let vb_e = vb.pp("emb");
+        let mut audio_embs = Vec::with_capacity(cfg.audio_codebooks);
+        for i in 0..cfg.audio_codebooks {
+            let emb = Embedding::load(vb_e.pp(i), cfg.audio_vocab_size, d_model)?;
+            audio_embs.push(emb);
+        }
+
+        let mut extra_heads = vec![];
+        if let Some(ExtraHeadsConfig { num_heads, dim }) = &cfg.extra_heads {
+            for i in 0..*num_heads {
+                let head = Linear::load(vb.pp("extra_heads").pp(i), d_model, *dim)?;
+                extra_heads.push(head);
+            }
+        }
+
+        Ok(Self {
+            transformer,
+            text_emb,
+            audio_embs,
+            text_linear,
+            out_norm,
+            extra_heads,
+            audio_vocab_size: cfg.audio_vocab_size,
+            text_in_vocab_size: cfg.text_in_vocab_size,
+        })
+    }
+}
+
+impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
     pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<LmState<T, B>> {
         Ok(LmState { model: self.clone(), transformer: self.transformer.init_state(batch_size)? })
     }

@@ -227,7 +227,35 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
 
         Ok(Self { self_attn, mlp, norm1, norm2, layer_scale_1, layer_scale_2 })
     }
+}
 
+#[cfg(feature = "cuda")]
+impl BatchedTransformerLayer<half::bf16, xn::cuda_backend::Device> {
+    fn load_fp8(vb: &Path<xn::cuda_backend::Device>, cfg: &Config) -> Result<Self> {
+        if cfg.use_conv_block {
+            xn::bail!("conv-block is not supported")
+        }
+        let self_attn = BatchedMultiheadAttention::load(vb, cfg)?;
+        let mlp = Mlp::load_fp8(vb, cfg)?;
+        let norm1 = Norm::load(vb.pp("norm1"), cfg.d_model, cfg.norm)?;
+        let norm2 = Norm::load(vb.pp("norm2"), cfg.d_model, cfg.norm)?;
+
+        let layer_scale_1 = if cfg.layer_scale.is_some() {
+            Some(LayerScale::load(&vb.pp("layer_scale_1"), cfg.d_model)?)
+        } else {
+            None
+        };
+        let layer_scale_2 = if cfg.layer_scale.is_some() {
+            Some(LayerScale::load(&vb.pp("layer_scale_2"), cfg.d_model)?)
+        } else {
+            None
+        };
+
+        Ok(Self { self_attn, mlp, norm1, norm2, layer_scale_1, layer_scale_2 })
+    }
+}
+
+impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
     fn forward(
         &self,
         xs: &Tensor<T, B>,
@@ -304,7 +332,50 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
             device: vb.device().clone(),
         })
     }
+}
 
+#[cfg(feature = "cuda")]
+impl BatchedTransformer<half::bf16, xn::cuda_backend::Device> {
+    pub fn load_fp8(vb: &Path<xn::cuda_backend::Device>, cfg: &Config) -> Result<Self> {
+        if !cfg.causal {
+            xn::bail!("only causal mode is supported")
+        }
+        if !cfg.norm_first {
+            xn::bail!("only norm_first = true is supported")
+        }
+        if cfg.kv_repeat != 1 {
+            xn::bail!("only kv_repeat = 1 is supported")
+        }
+
+        let vb_layers = vb.pp("layers");
+        let mut layers = Vec::with_capacity(cfg.num_layers);
+        for i in 0..cfg.num_layers {
+            layers.push(BatchedTransformerLayer::load_fp8(&vb_layers.pp(i), cfg)?);
+        }
+
+        let rope = if cfg.positional_embedding == PositionalEmbedding::Rope {
+            let head_dim = cfg.d_model / cfg.num_heads;
+            Some(RotaryEmbedding::new(head_dim, cfg.max_period as f32, vb.device())?)
+        } else {
+            None
+        };
+
+        let num_kv = cfg.num_heads / cfg.kv_repeat;
+        let head_dim = cfg.d_model / cfg.num_heads;
+
+        Ok(Self {
+            layers,
+            rope,
+            positional_embedding: cfg.positional_embedding,
+            num_kv,
+            head_dim,
+            context: cfg.context,
+            device: vb.device().clone(),
+        })
+    }
+}
+
+impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
     pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<T, B>> {
         let builder = ScatteredCacheBuilder::new(batch_size, self.context, &self.device)?;
         let mut kv_caches = Vec::with_capacity(self.layers.len());

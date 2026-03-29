@@ -166,8 +166,8 @@ fn main() -> Result<()> {
                         println!("Using CUDA (f32)");
                         run_asr::<f32, _>(input, temperature, batch_size, verbose, dev)?;
                     } else {
-                        println!("Using CUDA (bf16)");
-                        run_asr::<half::bf16, _>(input, temperature, batch_size, verbose, dev)?;
+                        println!("Using CUDA (bf16, FP8 MLP)");
+                        run_asr_fp8(input, temperature, batch_size, verbose, dev)?;
                     }
                 }
             }
@@ -327,6 +327,142 @@ fn audio_to_audio<Dev: Backend>(
         "  Total:    {:.2}s ({:.1}x realtime)",
         total.as_secs_f64(),
         audio_duration / total.as_secs_f64()
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn run_asr_fp8(
+    input: std::path::PathBuf,
+    temperature: f64,
+    batch_size: usize,
+    verbose: bool,
+    dev: xn::cuda_backend::Device,
+) -> Result<()> {
+    use std::io::Write;
+    use xn::cuda_backend::Device;
+
+    let target_sample_rate: usize = 24000;
+    let frame_size: usize = 1920;
+    let asr_delay_in_seconds = 2.5;
+
+    // --- Load audio ---
+    println!("Loading audio from {}...", input.display());
+    let (pcm_data, sample_rate) = kaudio::pcm_decode(&input)?;
+    let audio_duration = pcm_data.len() as f64 / sample_rate as f64;
+    println!("  {} samples at {} Hz ({:.2}s)", pcm_data.len(), sample_rate, audio_duration);
+
+    let pcm_data = if sample_rate as usize != target_sample_rate {
+        println!("  Resampling {} Hz -> {} Hz", sample_rate, target_sample_rate);
+        kaudio::resample(&pcm_data, sample_rate as usize, target_sample_rate)?
+    } else {
+        pcm_data
+    };
+
+    // --- Download models ---
+    let files = download_asr_model()?;
+
+    // --- Load tokenizer ---
+    let tokenizer_path = files.tokenizer.to_str().context("invalid tokenizer path")?;
+    let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("failed to open tokenizer: {e}"))?;
+
+    // --- Load mimi ---
+    println!("Loading mimi weights...");
+    let mimi_vb = VB::load(&[files.mimi], dev.clone())?;
+    let mimi_config = mimi::Config::v0_1(Some(32));
+    let mimi: Mimi<f32, Device> = Mimi::load(&mimi_vb.root(), mimi_config)?;
+    println!("  Mimi loaded");
+
+    // --- Load LM with FP8 MLP weights ---
+    println!("Loading LM weights (FP8 MLP)...");
+    let lm_vb = VB::load(&[files.lm], dev.clone())?;
+    let lm_config = lm::Config::stt_2_6b();
+    let lm: LmModel<half::bf16, Device> = LmModel::load_fp8(&lm_vb.root(), &lm_config)?;
+    println!("  LM loaded");
+
+    // --- Create ASR ---
+    let asr_delay_in_tokens =
+        (asr_delay_in_seconds * target_sample_rate as f64 / frame_size as f64) as usize;
+    let asr = xn_moshi::asr::Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
+    let mut state = asr.init_state(batch_size)?;
+    let mask = StreamMask::all_active(batch_size);
+
+    // --- Process audio ---
+    let pcm_data = [
+        vec![0.0; frame_size * 2],
+        pcm_data,
+        vec![0.0; (target_sample_rate as f64 * asr_delay_in_seconds) as usize],
+    ]
+    .concat();
+    let num_chunks = pcm_data.len().div_ceil(frame_size);
+    let start_time = std::time::Instant::now();
+
+    println!(
+        "\nProcessing ({} chunks of {} samples, batch_size={})...",
+        num_chunks, frame_size, batch_size
+    );
+    println!("---");
+
+    let mut all_text_tokens: Vec<u32> = vec![];
+    let mut last_decoded_len = 0;
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * frame_size;
+        let end = (start + frame_size).min(pcm_data.len());
+        let mut chunk: Vec<f32> = pcm_data[start..end].to_vec();
+        if chunk.len() < frame_size {
+            chunk.resize(frame_size, 0.0);
+        }
+
+        let chunk_batched: Vec<f32> = chunk.repeat(batch_size);
+        let audio: Tensor<f32, Device> =
+            Tensor::from_vec(chunk_batched, (batch_size, 1, frame_size), &dev)?;
+        let pcm = StreamTensor::from_tensor(audio);
+        let start_time = std::time::Instant::now();
+        let step_results = state.step_pcm(&pcm, &mask, |_, _, _| {})?;
+        if verbose {
+            println!(
+                "  chunk {}/{} processed in {:.2}ms",
+                chunk_idx + 1,
+                num_chunks,
+                start_time.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+
+        for sr in step_results {
+            for word in sr.words {
+                if let xn_moshi::asr::AsrWord::Word { tokens, batch_idx, .. } = word
+                    && batch_idx == 0
+                {
+                    all_text_tokens.push(3);
+                    all_text_tokens.extend_from_slice(&tokens);
+                    let text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
+                    let new_chars = text.len() - last_decoded_len;
+                    if new_chars > 0 && !verbose {
+                        print!("{}", &text[last_decoded_len..]);
+                        std::io::stdout().flush()?;
+                    }
+                    last_decoded_len = text.len();
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("---");
+    if verbose {
+        let decoded_text = sp.decode_piece_ids(&all_text_tokens).unwrap_or_default();
+        println!("{decoded_text}\n---");
+    }
+
+    let elapsed = start_time.elapsed();
+    let audio_duration = pcm_data.len() as f64 / target_sample_rate as f64;
+    println!(
+        "Done in {:.2}s ({:.1}x realtime)",
+        elapsed.as_secs_f64(),
+        audio_duration / elapsed.as_secs_f64()
     );
 
     Ok(())

@@ -1,6 +1,9 @@
 use xn::nn::{Linear, var_builder::Path};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
+#[cfg(feature = "cuda")]
+use xn::cuda_backend::{Device as CudaDevice, quantization::Fp8Linear};
+
 // ============================================================================
 // Config
 // ============================================================================
@@ -142,6 +145,14 @@ pub(crate) enum Mlp<T: WithDTypeF, B: Backend> {
         linear_out: Linear<T, B>,
         activation: crate::seanet::Activation,
     },
+    #[cfg(feature = "cuda")]
+    Fp8Gating {
+        linear_in: Fp8Linear,
+        linear_out: Fp8Linear,
+        activation: crate::seanet::Activation,
+        hidden: usize,
+        _phantom: std::marker::PhantomData<(T, B)>,
+    },
 }
 
 impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
@@ -187,6 +198,56 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
                 let xs = activation.apply(&x1)?.mul(&x2)?;
                 let xs = linear_out.forward(&xs)?;
                 Ok(xs)
+            }
+            #[cfg(feature = "cuda")]
+            Self::Fp8Gating { linear_in, linear_out, activation, hidden, .. } => {
+                use std::any::Any;
+                let xs_any: &dyn Any = xs;
+                let xs_bf16: &Tensor<half::bf16, CudaDevice> =
+                    xs_any.downcast_ref().expect("Fp8Gating requires bf16 CUDA tensors");
+
+                let (b, t, _) = xs_bf16.dims3()?;
+                let xs = linear_in.forward(xs_bf16)?;
+                let xs = xs.reshape((b, t, 2, *hidden))?;
+                let x1 = xs.narrow(2, ..1)?.contiguous()?.reshape((b, t, *hidden))?;
+                let x2 = xs.narrow(2, 1..2)?.contiguous()?.reshape((b, t, *hidden))?;
+                let xs = activation.apply(&x1)?.mul(&x2)?;
+                let xs = linear_out.forward(&xs)?;
+
+                let result_any: Box<dyn Any> = Box::new(xs);
+                Ok(*result_any.downcast::<Tensor<T, B>>().expect("type mismatch"))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Mlp<half::bf16, CudaDevice> {
+    pub(crate) fn load_fp8(vb: &Path<CudaDevice>, cfg: &Config) -> Result<Self> {
+        let d_model = cfg.d_model;
+        match cfg.gating {
+            None => {
+                // No FP8 variant for NoGating, fall back to standard
+                Mlp::load(vb, cfg)
+            }
+            Some(activation) => {
+                let hidden = if cfg.dim_feedforward == 4 * d_model {
+                    11 * d_model / 4
+                } else {
+                    2 * cfg.dim_feedforward / 3
+                };
+                let vb = vb.pp("gating");
+                let linear_in =
+                    Fp8Linear::load(&vb.pp("linear_in"), d_model, 2 * hidden, cfg.bias_ff)?;
+                let linear_out =
+                    Fp8Linear::load(&vb.pp("linear_out"), hidden, d_model, cfg.bias_ff)?;
+                Ok(Self::Fp8Gating {
+                    linear_in,
+                    linear_out,
+                    activation,
+                    hidden,
+                    _phantom: std::marker::PhantomData,
+                })
             }
         }
     }
