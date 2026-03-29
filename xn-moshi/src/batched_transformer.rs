@@ -83,6 +83,10 @@ struct BatchedMultiheadAttention<T: WithDTypeF, B: Backend> {
     in_proj_weight: Tensor<T, B>,
     in_proj_bias: Option<Tensor<T, B>>,
     out_proj: Linear<T, B>,
+    #[cfg(feature = "cuda")]
+    fp8_in_proj: Option<xn::cuda_backend::quantization::Fp8Linear>,
+    #[cfg(feature = "cuda")]
+    fp8_out_proj: Option<xn::cuda_backend::quantization::Fp8Linear>,
     num_heads: usize,
     head_dim: usize,
     context: usize,
@@ -106,10 +110,90 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
             in_proj_weight,
             in_proj_bias,
             out_proj,
+            #[cfg(feature = "cuda")]
+            fp8_in_proj: None,
+            #[cfg(feature = "cuda")]
+            fp8_out_proj: None,
             num_heads,
             head_dim,
             context: cfg.context,
         })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl BatchedMultiheadAttention<half::bf16, xn::cuda_backend::Device> {
+    fn load_fp8(vb: &Path<xn::cuda_backend::Device>, cfg: &Config) -> Result<Self> {
+        use xn::cuda_backend::quantization::{Fp8Linear, Fp8Tensor};
+
+        let d_model = cfg.d_model;
+        let num_heads = cfg.num_heads;
+        let head_dim = d_model / num_heads;
+        let num_kv = num_heads / cfg.kv_repeat;
+        let out_dim = d_model + 2 * num_kv * head_dim;
+
+        let vb_attn = vb.pp("self_attn");
+
+        // Load QKV proj as FP8.
+        let in_proj_weight: Tensor<half::bf16, xn::cuda_backend::Device> =
+            vb_attn.tensor("in_proj_weight", (out_dim, d_model))?;
+        let in_proj_bias =
+            if cfg.bias_attn { Some(vb_attn.tensor("in_proj_bias", (out_dim,))?) } else { None };
+        let fp8_in_proj =
+            Fp8Linear::from_parts(Fp8Tensor::quantize(&in_proj_weight)?, in_proj_bias.clone());
+
+        // Load out_proj as FP8.
+        let fp8_out_proj =
+            Fp8Linear::load(&vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
+
+        // Keep the standard fields populated (unused when FP8 is active, but
+        // the struct requires them).
+        let out_proj = Linear::load_o(vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
+
+        Ok(Self {
+            in_proj_weight,
+            in_proj_bias,
+            out_proj,
+            fp8_in_proj: Some(fp8_in_proj),
+            fp8_out_proj: Some(fp8_out_proj),
+            num_heads,
+            head_dim,
+            context: cfg.context,
+        })
+    }
+}
+
+impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
+    fn qkv_proj(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        #[cfg(feature = "cuda")]
+        if let Some(fp8_proj) = &self.fp8_in_proj {
+            use std::any::Any;
+            let xs_any: &dyn Any = xs;
+            let xs_bf16: &Tensor<half::bf16, xn::cuda_backend::Device> =
+                xs_any.downcast_ref().expect("FP8 attention requires bf16 CUDA tensors");
+            let result = fp8_proj.forward(xs_bf16)?;
+            let result_any: Box<dyn Any> = Box::new(result);
+            return Ok(*result_any.downcast::<Tensor<T, B>>().expect("type mismatch"));
+        }
+        let mut qkv = xs.matmul_t(&self.in_proj_weight)?;
+        if let Some(bias) = &self.in_proj_bias {
+            qkv = qkv.broadcast_add(bias)?;
+        }
+        Ok(qkv)
+    }
+
+    fn out_proj_forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        #[cfg(feature = "cuda")]
+        if let Some(fp8_proj) = &self.fp8_out_proj {
+            use std::any::Any;
+            let xs_any: &dyn Any = xs;
+            let xs_bf16: &Tensor<half::bf16, xn::cuda_backend::Device> =
+                xs_any.downcast_ref().expect("FP8 attention requires bf16 CUDA tensors");
+            let result = fp8_proj.forward(xs_bf16)?;
+            let result_any: Box<dyn Any> = Box::new(result);
+            return Ok(*result_any.downcast::<Tensor<T, B>>().expect("type mismatch"));
+        }
+        self.out_proj.forward(xs)
     }
 
     #[tracing::instrument(name = "batched-mha", skip_all)]
@@ -124,10 +208,7 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
         let (b, t) = (dims[0], dims[1]);
         let d_model = self.num_heads * self.head_dim;
 
-        let mut qkv = xs.matmul_t(&self.in_proj_weight)?;
-        if let Some(bias) = &self.in_proj_bias {
-            qkv = qkv.broadcast_add(bias)?;
-        }
+        let qkv = self.qkv_proj(xs)?;
 
         let q = qkv
             .narrow(2, ..d_model)?
@@ -186,8 +267,7 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
 
         let attn_output = attn_output.transpose(1, 2)?.contiguous()?.reshape((b, t, d_model))?;
 
-        let out = self.out_proj.forward(&attn_output)?;
-        Ok(out)
+        self.out_proj_forward(&attn_output)
     }
 }
 
@@ -235,7 +315,7 @@ impl BatchedTransformerLayer<half::bf16, xn::cuda_backend::Device> {
         if cfg.use_conv_block {
             xn::bail!("conv-block is not supported")
         }
-        let self_attn = BatchedMultiheadAttention::load(vb, cfg)?;
+        let self_attn = BatchedMultiheadAttention::load_fp8(vb, cfg)?;
         let mlp = Mlp::load_fp8(vb, cfg)?;
         let norm1 = Norm::load(vb.pp("norm1"), cfg.d_model, cfg.norm)?;
         let norm2 = Norm::load(vb.pp("norm2"), cfg.d_model, cfg.norm)?;

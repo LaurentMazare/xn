@@ -138,6 +138,11 @@ pub struct Fp8Linear {
 }
 
 impl Fp8Linear {
+    /// Build from pre-quantized weight and optional bias.
+    pub fn from_parts(weight: Fp8Tensor, bias: Option<Tensor<bf16, Device>>) -> Self {
+        Self { weight, bias }
+    }
+
     /// Load a linear layer from safetensors and quantize the weight to FP8.
     pub fn load(
         vb: &Path<Device>,
