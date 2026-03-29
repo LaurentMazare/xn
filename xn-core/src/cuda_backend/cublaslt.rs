@@ -99,10 +99,10 @@ impl Drop for MatrixLayout {
     }
 }
 
+#[allow(dead_code)]
 enum Matrix {
     A,
     B,
-    #[allow(dead_code)]
     C,
 }
 
@@ -205,6 +205,18 @@ impl Drop for MatmulPref {
     }
 }
 
+/// Configuration for batched FP8 matmul.
+pub(crate) struct BatchConfig {
+    /// Number of matrices in the batch.
+    pub count: i32,
+    /// Stride between consecutive A matrices (in elements). 0 to broadcast.
+    pub stride_a: i64,
+    /// Stride between consecutive B matrices (in elements). 0 to broadcast.
+    pub stride_b: i64,
+    /// Stride between consecutive output matrices (in elements).
+    pub stride_out: i64,
+}
+
 impl CudaBlasLT {
     /// FP8 matrix multiplication: computes `C = A^T × B` where A and B are FP8 E4M3.
     ///
@@ -214,6 +226,7 @@ impl CudaBlasLT {
     /// - `a_scale`, `b_scale`: per-tensor f32 scales on device
     /// - `out`: output bf16 buffer, row-major `[M, N]` (= col-major `[N, M]`)
     /// - `m`, `n`, `k`: matrix dimensions
+    /// - `batch`: optional batch configuration
     pub fn matmul_f8(
         &self,
         a_data: &CudaSlice<u8>,
@@ -224,6 +237,7 @@ impl CudaBlasLT {
         m: usize,
         n: usize,
         k: usize,
+        batch: Option<&BatchConfig>,
     ) -> crate::Result<()> {
         let stream = &self.stream;
         let fp8_type = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
@@ -257,6 +271,12 @@ impl CudaBlasLT {
         let b_layout = MatrixLayout::new(fp8_type, k as u64, m as u64, k as i64)?;
         // C and D: [N, M] col-major, ld = N
         let c_layout = MatrixLayout::new(bf16_type, n as u64, m as u64, n as i64)?;
+
+        if let Some(batch) = batch {
+            a_layout.set_batch(batch.count, batch.stride_a)?;
+            b_layout.set_batch(batch.count, batch.stride_b)?;
+            c_layout.set_batch(batch.count, batch.stride_out)?;
+        }
 
         // Algorithm selection.
         let matmul_pref = MatmulPref::new()?;

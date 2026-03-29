@@ -113,6 +113,7 @@ impl Fp8Tensor {
             m,
             n,
             k,
+            None,
         )?;
 
         let out_shape: Shape = (m, n).into();
