@@ -207,3 +207,58 @@ pub fn quantize_fp8<T: Fp8Quantizable>(
 
     Ok(Fp8Tensor { data: out, scales: scale, device: device.clone(), shape })
 }
+
+// A linear layer with FP8-quantized weights.
+///
+/// Weights are stored as `Fp8Tensor` (quantized once at load time).
+/// Activations are quantized on-the-fly during forward.
+pub struct Fp8Linear {
+    weight: Fp8Tensor,
+    bias: Option<Tensor<bf16, Device>>,
+}
+
+impl Fp8Linear {
+    /// Build from pre-quantized weight and optional bias.
+    pub fn new(weight: Fp8Tensor, bias: Option<Tensor<bf16, Device>>) -> Self {
+        Self { weight, bias }
+    }
+
+    /// Load a linear layer from safetensors and quantize the weight to FP8.
+    pub fn load(
+        vb: &crate::nn::Path<Device>,
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+    ) -> Result<Self> {
+        let weight: Tensor<bf16, Device> = vb.tensor("weight", (out_features, in_features))?;
+        let weight = Fp8Tensor::quantize(&weight)?;
+        let bias = if bias { Some(vb.tensor("bias", (out_features,))?) } else { None };
+        Ok(Self { weight, bias })
+    }
+
+    /// Forward: quantize activation on-the-fly, FP8 matmul, add bias.
+    ///
+    /// Supports batched inputs: `xs` can be `[..batch, M, K]`. Batch dims are
+    /// flattened into M for the FP8 matmul and restored on output.
+    pub fn forward(&self, xs: &Tensor<bf16, Device>) -> Result<Tensor<bf16, Device>> {
+        let dims = xs.dims();
+        let rank = dims.len();
+        let k = dims[rank - 1];
+        let batch_dims = &dims[..rank - 1];
+        // Flatten batch dims into M for 2D matmul.
+        let xs = xs.reshape(((), k))?;
+        let xs_fp8 = Fp8Tensor::quantize(&xs)?;
+        let out = xs_fp8.matmul_t(&self.weight)?;
+
+        // Restore batch dims: [...batch, N].
+        let (_m, n) = out.dims2()?;
+        let mut out_shape: Vec<usize> = batch_dims.to_vec();
+        out_shape.push(n);
+        let out = out.reshape(out_shape)?;
+
+        match &self.bias {
+            Some(b) => out.broadcast_add(b),
+            None => Ok(out),
+        }
+    }
+}
