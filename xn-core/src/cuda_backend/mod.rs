@@ -42,15 +42,24 @@ struct ModuleCache {
     rope: Option<Arc<cudarc::driver::CudaModule>>,
 }
 
-#[derive(Clone)]
-pub struct Device {
+pub struct DeviceInner {
     cuda: Arc<CudaContext>,
     stream: Arc<CudaStream>,
-    blas: Arc<cudarc::cublas::CudaBlas>,
-    pub(crate) blas_lt: Arc<cublaslt::CudaBlasLT>,
-    curand: Arc<Mutex<CudaRng>>,
+    blas: cudarc::cublas::CudaBlas,
+    pub(crate) blas_lt: cublaslt::CudaBlasLT,
+    curand: Mutex<CudaRng>,
     /// Cache for loaded PTX modules
-    modules: Arc<Mutex<ModuleCache>>,
+    modules: Mutex<ModuleCache>,
+}
+
+#[derive(Clone)]
+pub struct Device(Arc<DeviceInner>);
+
+impl std::ops::Deref for Device {
+    type Target = DeviceInner;
+    fn deref(&self) -> &DeviceInner {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for Device {
@@ -66,14 +75,14 @@ impl Device {
         let blas = cudarc::cublas::CudaBlas::new(stream.clone())?;
         let blas_lt = cublaslt::CudaBlasLT::new(stream.clone())?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone())?;
-        Ok(Self {
+        Ok(Self(Arc::new(DeviceInner {
             cuda,
             stream,
-            blas: Arc::new(blas),
-            blas_lt: Arc::new(blas_lt),
-            modules: Arc::new(Mutex::new(Default::default())),
-            curand: Arc::new(Mutex::new(CudaRng(curand))),
-        })
+            blas,
+            blas_lt,
+            modules: Mutex::new(Default::default()),
+            curand: Mutex::new(CudaRng(curand)),
+        })))
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
