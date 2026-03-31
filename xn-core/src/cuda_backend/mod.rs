@@ -52,6 +52,32 @@ pub struct DeviceInner {
     modules: Mutex<ModuleCache>,
 }
 
+pub struct CudaEvent {
+    event: cudarc::driver::CudaEvent,
+    stream: Arc<CudaStream>,
+}
+
+impl CudaEvent {
+    pub fn record(&self) -> Result<()> {
+        self.event.record(&self.stream)?;
+        Ok(())
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.event.is_complete()
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        self.event.synchronize()?;
+        Ok(())
+    }
+
+    pub fn elapsed_ms(&self, other: &CudaEvent) -> Result<f32> {
+        let ms = self.event.elapsed_ms(&other.event)?;
+        Ok(ms)
+    }
+}
+
 #[derive(Clone)]
 pub struct Device(Arc<DeviceInner>);
 
@@ -87,6 +113,13 @@ impl Device {
 
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    pub fn event(&self) -> Result<CudaEvent> {
+        let flags = cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT;
+        let event = self.cuda.new_event(Some(flags))?;
+        let event = CudaEvent { event, stream: self.stream.clone() };
+        Ok(event)
     }
 
     fn get_or_load_module(&self, ptx: PTXModule) -> Result<Arc<cudarc::driver::CudaModule>> {
