@@ -9,6 +9,23 @@ pub enum DType {
     U8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DTypeF {
+    F16,
+    BF16,
+    F32,
+}
+
+impl From<DTypeF> for DType {
+    fn from(dtype_f: DTypeF) -> Self {
+        match dtype_f {
+            DTypeF::F16 => DType::F16,
+            DTypeF::BF16 => DType::BF16,
+            DTypeF::F32 => DType::F32,
+        }
+    }
+}
+
 impl DType {
     /// Returns the CUDA kernel name suffix for this dtype.
     pub fn cuda_name(&self) -> &'static str {
