@@ -103,6 +103,10 @@ jobs:
             target: aarch64
     steps:
       - uses: actions/checkout@v4
+      - name: Remove local cargo config
+        shell: bash
+        # Remove the target-arch=native as it breaks some dependencies.
+        run: rm -f .cargo/config.toml
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
@@ -112,6 +116,8 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter --manifest-path pocket-tts-pyo3/Cargo.toml
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          RUSTFLAGS: "-C target-cpu=apple-m1"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
