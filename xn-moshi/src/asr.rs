@@ -46,7 +46,6 @@ pub struct ItemState {
     unended_word: bool,
     last_stop_time: f64,
     audio_pad_token: u32,
-    next_codebooks: Vec<u32>,
 }
 
 impl ItemState {
@@ -56,7 +55,6 @@ impl ItemState {
         self.word_tokens.clear();
         self.unended_word = false;
         self.last_stop_time = 0.;
-        self.next_codebooks.fill(self.audio_pad_token);
     }
 
     pub fn text_token(&self) -> u32 {
@@ -65,12 +63,6 @@ impl ItemState {
 
     pub fn is_first_step(&self) -> bool {
         self.step_idx == 0
-    }
-
-    pub fn next_token(&mut self, codebook_idx: usize, token: u32) -> u32 {
-        let v = self.next_codebooks[codebook_idx];
-        self.next_codebooks[codebook_idx] = token;
-        if self.is_first_step() { self.audio_pad_token } else { v }
     }
 
     pub fn flush_tokens(&mut self) -> Option<AsrWord> {
@@ -138,8 +130,6 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
     pub fn init_state(&self, batch_size: usize) -> Result<AsrState<MimiT, LmT, B>> {
         let text_start_token = self.lm.text_start_token();
         let audio_pad_token = self.lm.audio_pad_token();
-        let in_audio_codebooks = self.lm.in_audio_codebooks();
-
         let batch = (0..batch_size)
             .map(|batch_idx| ItemState {
                 batch_idx,
@@ -149,7 +139,6 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
                 step_idx: 0,
                 last_stop_time: 0.,
                 audio_pad_token,
-                next_codebooks: vec![audio_pad_token; in_audio_codebooks],
             })
             .collect();
         let temperature =
@@ -381,8 +370,13 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
                         .map(|(batch_idx, (tokens, item))| {
                             if !mask.is_active(batch_idx) {
                                 0u32
+                            } else if item.is_first_step() {
+                                // The first slice is dropped and replace with pad tokens. Note
+                                // that we do not shift the audio slices and just discard this
+                                // first slice.
+                                item.audio_pad_token
                             } else {
-                                item.next_token(codebook_idx, tokens[codebook_idx])
+                                tokens[codebook_idx]
                             }
                         })
                         .collect()
