@@ -12,6 +12,10 @@ jobs:
         rust: [stable, nightly]
     steps:
       - uses: actions/checkout@v2
+      - name: Remove local cargo config
+        shell: bash
+        # Remove the target-arch=native as it breaks some dependencies.
+        run: rm -f .cargo/config.toml
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -30,6 +34,10 @@ jobs:
         rust: [stable, nightly]
     steps:
       - uses: actions/checkout@v2
+      - name: Remove local cargo config
+        shell: bash
+        # Remove the target-arch=native as it breaks some dependencies.
+        run: rm -f .cargo/config.toml
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -60,6 +68,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+      - name: Remove local cargo config
+        shell: bash
+        # Remove the target-arch=native as it breaks some dependencies.
+        run: rm -f .cargo/config.toml
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
