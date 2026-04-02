@@ -23,7 +23,6 @@ pub struct Config {
     pub norm: crate::NormType,
     pub context: usize,
     pub max_period: usize,
-    pub max_seq_len: usize,
     pub kv_repeat: usize,
     pub dim_feedforward: usize,
     pub conv_layout: bool,

@@ -91,7 +91,6 @@ impl Config {
             positional_embedding: crate::transformer::PositionalEmbedding::Rope,
             conv_layout: false,
             kv_repeat: 1,
-            max_seq_len: 4096,
         };
         crate::lm::Config {
             transformer,
