@@ -49,7 +49,7 @@ thiserror = "2.0.17"
 tokenizers = "0.21"
 tracing = "0.1.44"
 tracing-chrome = "0.7.2"
-tracing-subscriber = "0.3.22"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 wasm-bindgen = "0.2"
 yoke = { version = "0.8.1", features = ["derive"] }
 
