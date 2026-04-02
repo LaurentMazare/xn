@@ -213,19 +213,6 @@ pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
     pub layer_states: Vec<LayerAttentionState<T, B>>,
 }
 
-impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
-    pub fn current_seq_len(&self) -> Result<usize> {
-        if self.layer_states.is_empty() {
-            return Ok(0);
-        }
-        let v = match &self.layer_states[0] {
-            LayerAttentionState::Mimi(cache) => cache.current_seq_len()?,
-            LayerAttentionState::FlowLm(state) => state.current_end,
-        };
-        Ok(v)
-    }
-}
-
 // ---- MimiStreamingMultiheadAttention ----
 // Uses KV cache with context window.
 
@@ -493,13 +480,16 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
             }
             _ => None,
         };
-        let rope = RotaryEmbedding::new(
-            self.head_dim,
-            state.current_seq_len()?,
-            seq_len,
-            self.max_period,
-            x.device(),
-        )?;
+        let offset = state
+            .layer_states
+            .first()
+            .map(|s| match s {
+                LayerAttentionState::Mimi(kv_cache) => kv_cache.absolute_offset,
+                LayerAttentionState::FlowLm(mha_state) => mha_state.current_end,
+            })
+            .unwrap_or(0);
+        let rope =
+            RotaryEmbedding::new(self.head_dim, offset, seq_len, self.max_period, x.device())?;
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
             x = layer.forward(&x, &rope, layer_state, mask.as_ref())?;
         }
