@@ -128,10 +128,9 @@ fn remap_key(name: &str) -> Option<String> {
 }
 
 fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
-    use tracing_subscriber::{prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, prelude::*};
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if chrome_tracing {
         let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new().build();
