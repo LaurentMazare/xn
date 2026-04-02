@@ -113,7 +113,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         ))?;
 
         // Apply RoPE: q, k are [b, t, h, d]
-        let (q, k) = rope.forward(&q, &k, state.current_end)?;
+        let (q, k) = rope.forward(&q, &k)?;
         let (k, v) = state.complete_kv(&k, &v)?;
 
         // Transpose to [b, h, t, d] for attention
@@ -143,13 +143,13 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
 pub struct KvCache<T: WithDTypeF, B: Backend> {
     k: Option<Tensor<T, B>>,
     v: Option<Tensor<T, B>>,
-    max_seq_len: usize,
+    context: usize,
     absolute_offset: usize,
 }
 
 impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
-    pub fn new(max_seq_len: usize) -> Self {
-        Self { k: None, v: None, max_seq_len, absolute_offset: 0 }
+    pub fn new(context: usize) -> Self {
+        Self { k: None, v: None, context, absolute_offset: 0 }
     }
 
     pub fn current_seq_len(&self) -> Result<usize> {
@@ -161,7 +161,7 @@ impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
     }
 
     /// Append new k, v (shape [b, h, t, d]) and return full (k, v).
-    /// Trims to max_seq_len if exceeded.
+    /// Trims to context if exceeded.
     pub fn append(
         &mut self,
         new_k: &Tensor<T, B>,
@@ -189,10 +189,10 @@ impl<T: WithDTypeF, B: Backend> KvCache<T, B> {
             _ => return Ok(()),
         };
         let seq_len = k.dim(2)?;
-        if seq_len > self.max_seq_len {
-            let trim = seq_len - self.max_seq_len;
-            let k = k.narrow(2, trim..trim + self.max_seq_len)?.contiguous()?;
-            let v = v.narrow(2, trim..trim + self.max_seq_len)?.contiguous()?;
+        if seq_len > self.context {
+            let trim = seq_len - self.context;
+            let k = k.narrow(2, trim..trim + self.context)?.contiguous()?;
+            let v = v.narrow(2, trim..trim + self.context)?.contiguous()?;
             self.k = Some(k);
             self.v = Some(v);
         };
@@ -211,19 +211,6 @@ pub enum LayerAttentionState<T: WithDTypeF, B: Backend> {
 #[derive(Clone, Debug)]
 pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
     pub layer_states: Vec<LayerAttentionState<T, B>>,
-}
-
-impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
-    pub fn current_seq_len(&self) -> Result<usize> {
-        if self.layer_states.is_empty() {
-            return Ok(0);
-        }
-        let v = match &self.layer_states[0] {
-            LayerAttentionState::Mimi(cache) => cache.current_seq_len()?,
-            LayerAttentionState::FlowLm(state) => state.current_end,
-        };
-        Ok(v)
-    }
 }
 
 // ---- MimiStreamingMultiheadAttention ----
@@ -258,7 +245,6 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
     ) -> Result<Tensor<T, B>> {
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
-        let offset = state.absolute_offset;
 
         let projected = self.in_proj.forward(query)?;
         let packed = projected.reshape((b, t, 3, self.num_heads, d))?;
@@ -267,7 +253,7 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
         let v = packed.narrow(2, 2..3)?.contiguous()?.reshape((b, t, self.num_heads, d))?;
 
         // RoPE on [b, t, h, d]
-        let (q, k) = rope.forward(&q, &k, offset)?;
+        let (q, k) = rope.forward(&q, &k)?;
 
         // To [b, h, t, d]
         let q = q.transpose(1, 2)?.contiguous()?;
@@ -414,7 +400,8 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
 
 pub struct StreamingTransformer<T: WithDTypeF, B: Backend> {
     pub layers: Vec<StreamingTransformerLayer<T, B>>,
-    rope: RotaryEmbedding<T, B>,
+    max_period: f32,
+    head_dim: usize,
 }
 
 impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
@@ -431,9 +418,6 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
         kind: Kind,
     ) -> Result<Self> {
         let head_dim = d_model / num_heads;
-        let max_seq_len = 8192;
-        let rope = RotaryEmbedding::new(head_dim, max_seq_len, max_period, vb.device())?;
-
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(StreamingTransformerLayer::load(
@@ -447,7 +431,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
             )?);
         }
 
-        Ok(Self { layers, rope })
+        Ok(Self { layers, head_dim, max_period })
     }
 
     pub fn init_state(
@@ -473,7 +457,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
         let mask = match state.layer_states.first() {
             Some(LayerAttentionState::Mimi(kv_cache)) => {
                 let kv_seq_len = kv_cache.current_seq_len()?;
-                let context = kv_cache.max_seq_len;
+                let context = kv_cache.context;
                 // Causal mask of shape (1, 1, seq_len, kv_seq_len + seq_len) with -inf in upper triangle
                 let mask_data = (0..seq_len)
                     .flat_map(|seq_idx| {
@@ -496,8 +480,18 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
             }
             _ => None,
         };
+        let offset = state
+            .layer_states
+            .first()
+            .map(|s| match s {
+                LayerAttentionState::Mimi(kv_cache) => kv_cache.absolute_offset,
+                LayerAttentionState::FlowLm(mha_state) => mha_state.current_end,
+            })
+            .unwrap_or(0);
+        let rope =
+            RotaryEmbedding::new(self.head_dim, offset, seq_len, self.max_period, x.device())?;
         for (layer, layer_state) in self.layers.iter().zip(state.layer_states.iter_mut()) {
-            x = layer.forward(&x, &self.rope, layer_state, mask.as_ref())?;
+            x = layer.forward(&x, &rope, layer_state, mask.as_ref())?;
         }
         Ok(x)
     }
