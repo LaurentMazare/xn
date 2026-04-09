@@ -61,7 +61,7 @@ impl TTSConfig {
             mimi: MimiConfig {
                 channels: 1,
                 sample_rate: 24000,
-                frame_rate: 12,
+                frame_rate: 12.5,
                 dimension: 512,
                 quantizer_dimension: 32,
                 quantizer_output_dimension: 512,

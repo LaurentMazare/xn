@@ -11,7 +11,7 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 pub struct MimiConfig {
     pub channels: usize,
     pub sample_rate: usize,
-    pub frame_rate: usize,
+    pub frame_rate: f64,
     pub dimension: usize,
     pub quantizer_dimension: usize,
     pub quantizer_output_dimension: usize,
@@ -41,7 +41,7 @@ pub struct MimiModel<T: WithDTypeF, B: Backend> {
     pub quantizer: DummyQuantizer<T, B>,
     downsample: Option<ConvDownsample1d<T, B>>,
     upsample: Option<ConvTrUpsample1d<T, B>>,
-    frame_rate: usize,
+    frame_rate: f64,
     _encoder_frame_rate: f64,
     pub sample_rate: usize,
     _dimension: usize,
@@ -127,8 +127,8 @@ impl<T: WithDTypeF, B: Backend> MimiModel<T, B> {
         let hop_length: usize = cfg.ratios.iter().product();
         let encoder_frame_rate = cfg.sample_rate as f64 / hop_length as f64;
 
-        let (downsample, upsample) = if (encoder_frame_rate - cfg.frame_rate as f64).abs() > 0.01 {
-            let downsample_stride = (encoder_frame_rate / cfg.frame_rate as f64) as usize;
+        let (downsample, upsample) = if (encoder_frame_rate - cfg.frame_rate).abs() > 0.01 {
+            let downsample_stride = (encoder_frame_rate / cfg.frame_rate) as usize;
             let ds =
                 ConvDownsample1d::load(&vb.pp("downsample"), downsample_stride, cfg.dimension)?;
             let us = ConvTrUpsample1d::load(&vb.pp("upsample"), downsample_stride, cfg.dimension)?;
@@ -153,7 +153,7 @@ impl<T: WithDTypeF, B: Backend> MimiModel<T, B> {
     }
 
     pub fn frame_size(&self) -> usize {
-        self.sample_rate / self.frame_rate
+        (self.sample_rate as f64 / self.frame_rate).round() as usize
     }
 
     pub fn init_state(&self, batch_size: usize, sequence_length: usize) -> Result<MimiState<T, B>> {
