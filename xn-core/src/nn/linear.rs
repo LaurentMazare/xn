@@ -69,3 +69,11 @@ impl<T: WithDTypeF, B: Backend> Linear<T, B> {
         self.weight.device()
     }
 }
+
+impl<T: WithDTypeF, B: Backend> crate::ModuleT for Linear<T, B> {
+    type T = T;
+    type B = B;
+    fn forward(&self, xs: &Tensor<Self::T, Self::B>) -> Result<Tensor<Self::T, Self::B>> {
+        self.forward(xs)
+    }
+}

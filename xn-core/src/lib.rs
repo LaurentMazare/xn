@@ -67,6 +67,45 @@ impl<M: Module> Module for Option<&M> {
     }
 }
 
+pub trait ModuleT {
+    type T: WithDTypeF;
+    type B: Backend;
+
+    fn forward(&self, xs: &Tensor<Self::T, Self::B>) -> Result<Tensor<Self::T, Self::B>>;
+}
+
+impl<M: ModuleT> ModuleT for Option<&M> {
+    type T = M::T;
+    type B = M::B;
+    fn forward(&self, xs: &Tensor<Self::T, Self::B>) -> Result<Tensor<Self::T, Self::B>> {
+        match self {
+            None => Ok(xs.clone()),
+            Some(m) => m.forward(xs),
+        }
+    }
+}
+
+pub trait BackendQ {
+    type T: WithDTypeF;
+    type B: Backend;
+    type LinearQ: ModuleT<T = Self::T, B = Self::B>;
+
+    fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ>;
+}
+
+pub struct Unquantized<T: WithDTypeF, B: Backend> {
+    _marker1: std::marker::PhantomData<(T, B)>,
+}
+
+impl<T: WithDTypeF, B: Backend> BackendQ for Unquantized<T, B> {
+    type T = T;
+    type B = B;
+    type LinearQ = nn::Linear<T, B>;
+    fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
+        Ok(l)
+    }
+}
+
 pub trait WithDevice {
     fn run<T: WithDTypeF, B: Backend>(self, dev: B) -> Result<()>;
 }
