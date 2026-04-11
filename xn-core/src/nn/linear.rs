@@ -11,6 +11,14 @@ impl<T: WithDTypeF, B: Backend> Linear<T, B> {
         Self { weight, bias: None }
     }
 
+    pub fn weight(&self) -> &Tensor<T, B> {
+        &self.weight
+    }
+
+    pub fn bias(&self) -> Option<&Tensor<T, B>> {
+        self.bias.as_ref()
+    }
+
     pub fn with_bias(self, bias: Tensor<T, B>) -> Self {
         Self { bias: Some(bias), ..self }
     }
