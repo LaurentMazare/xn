@@ -85,7 +85,7 @@ impl<M: ModuleT> ModuleT for Option<&M> {
     }
 }
 
-pub trait BackendQ {
+pub trait BackendQ: Clone {
     type T: WithDTypeF;
     type B: Backend;
     type LinearQ: ModuleT<T = Self::T, B = Self::B>;
@@ -93,6 +93,7 @@ pub trait BackendQ {
     fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ>;
 }
 
+#[derive(Clone)]
 pub struct Unquantized<T: WithDTypeF, B: Backend> {
     _marker1: std::marker::PhantomData<(T, B)>,
 }

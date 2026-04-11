@@ -3,7 +3,7 @@ use crate::lm::{LmModel, LmState};
 use crate::mimi::{Mimi, MimiEncodeState};
 use crate::moshi;
 use xn::streaming::{StreamMask, StreamTensor};
-use xn::{Backend, Result, Tensor, WithDTypeF};
+use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
 
 const TOKEN_EOP: u32 = 0;
 const TOKEN_PAD: u32 = 3;
@@ -86,32 +86,32 @@ impl ItemState {
 // ASR State
 // ============================================================================
 
-pub struct AsrState<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
-    model: Asr<MimiT, LmT, B>,
-    pub lm: LmState<LmT, B>,
-    pub audio_tokenizer: MimiEncodeState<MimiT, B>,
+pub struct AsrState<Q: BackendQ> {
+    model: Asr<Q>,
+    pub lm: LmState<Q>,
+    pub audio_tokenizer: MimiEncodeState<f32, Q::B>,
     pub batch: Vec<ItemState>,
     model_step_idx: usize,
-    temperature: Tensor<f32, B>,
-    condition: Option<Tensor<LmT, B>>,
+    temperature: Tensor<f32, Q::B>,
+    condition: Option<Tensor<Q::T, Q::B>>,
 }
 
 #[derive(Clone)]
-pub struct Asr<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> {
+pub struct Asr<Q: BackendQ> {
     asr_delay_in_tokens: usize,
     default_temperature: f64,
-    lm: std::sync::Arc<LmModel<LmT, B>>,
-    audio_tokenizer: std::sync::Arc<Mimi<MimiT, B>>,
-    conditioners: Option<std::sync::Arc<Conditioners<LmT, B>>>,
-    default_condition: Option<Tensor<LmT, B>>,
+    lm: std::sync::Arc<LmModel<Q>>,
+    audio_tokenizer: std::sync::Arc<Mimi<f32, Q::B>>,
+    conditioners: Option<std::sync::Arc<Conditioners<Q::T, Q::B>>>,
+    default_condition: Option<Tensor<Q::T, Q::B>>,
 }
 
-impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
+impl<Q: BackendQ> Asr<Q> {
     pub fn new(
         asr_delay_in_tokens: usize,
         default_temperature: f64,
-        audio_tokenizer: Mimi<MimiT, B>,
-        lm: LmModel<LmT, B>,
+        audio_tokenizer: Mimi<f32, Q::B>,
+        lm: LmModel<Q>,
     ) -> Self {
         Self {
             asr_delay_in_tokens,
@@ -123,11 +123,11 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         }
     }
 
-    pub fn conditioners(&self) -> Option<&Conditioners<LmT, B>> {
+    pub fn conditioners(&self) -> Option<&Conditioners<Q::T, Q::B>> {
         self.conditioners.as_deref()
     }
 
-    pub fn init_state(&self, batch_size: usize) -> Result<AsrState<MimiT, LmT, B>> {
+    pub fn init_state(&self, batch_size: usize) -> Result<AsrState<Q>> {
         let text_start_token = self.lm.text_start_token();
         let audio_pad_token = self.lm.audio_pad_token();
         let batch = (0..batch_size)
@@ -162,7 +162,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         })
     }
 
-    pub fn device(&self) -> &B {
+    pub fn device(&self) -> &Q::B {
         self.lm.device()
     }
 
@@ -172,7 +172,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
 
     pub fn warmup(&self, frame_size: usize) -> Result<()> {
         let mut state = self.init_state(1)?;
-        let audio: Tensor<MimiT, _> = Tensor::zeros((1, 1, frame_size), self.device())?;
+        let audio: Tensor<f32, _> = Tensor::zeros((1, 1, frame_size), self.device())?;
         let pcm = StreamTensor::from_tensor(audio);
         let mask = StreamMask::all_active(1);
         for _ in 0..3 {
@@ -183,14 +183,14 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
 }
 
 /// Loading from weight files.
-impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
+impl<Q: BackendQ> Asr<Q> {
     pub fn load(
         mimi_weight: &str,
         lm_weight: &str,
         config: Option<&str>,
         asr_delay_in_tokens: usize,
         default_temperature: f64,
-        dev: B,
+        dev: Q::B,
     ) -> Result<Self> {
         use crate::lm;
         use crate::mimi;
@@ -214,7 +214,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
 
         let mimi_vb = VB::load(&[mimi_weight], dev.clone())?.root();
         let mimi_config = mimi::Config::v0_1(Some(32));
-        let mimi_model: Mimi<MimiT, B> = Mimi::load(&mimi_vb, mimi_config)?;
+        let mimi_model: Mimi<f32, Q::B> = Mimi::load(&mimi_vb, mimi_config)?;
         mimi_vb.check_all_used_with_ignore(|s| {
             s.ends_with("_codebook._initialized")
                 || s.ends_with("_codebook.cluster_usage")
@@ -222,9 +222,9 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> Asr<MimiT, LmT, B> {
         })?;
 
         let lm_vb = VB::load(&[lm_weight], dev)?.root();
-        let lm_model: LmModel<LmT, B> = LmModel::load(&lm_vb, &lm_config)?;
+        let lm_model: LmModel<Q> = LmModel::load(&lm_vb, &lm_config)?;
         let conditioners = match &moshi_config {
-            Some(c) => Some(c.load_conditioners::<LmT, _>(&lm_vb)?),
+            Some(c) => Some(c.load_conditioners::<Q::T, _>(&lm_vb)?),
             None => None,
         };
         lm_vb.check_all_used()?;
@@ -261,7 +261,7 @@ fn gumbel_max<T: WithDTypeF, B: Backend>(
     adjusted_logits.argmax(xn::D::Minus1)
 }
 
-impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
+impl<Q: BackendQ> AsrState<Q> {
     pub fn model_step_idx(&self) -> usize {
         self.model_step_idx
     }
@@ -282,11 +282,15 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         Ok(())
     }
 
-    pub fn device(&self) -> &B {
+    pub fn device(&self) -> &Q::B {
         self.model.device()
     }
 
-    pub fn condition_sum(&self, lang: Option<&str>, delay: f64) -> Result<Option<Tensor<LmT, B>>> {
+    pub fn condition_sum(
+        &self,
+        lang: Option<&str>,
+        delay: f64,
+    ) -> Result<Option<Tensor<Q::T, Q::B>>> {
         let conds = match self.model.conditioners.as_ref() {
             Some(conds) => {
                 let mut values =
@@ -304,7 +308,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
 
     pub fn step_pcm<F>(
         &mut self,
-        pcm: &StreamTensor<MimiT, B>,
+        pcm: &StreamTensor<f32, Q::B>,
         mask: &StreamMask,
         f: F,
     ) -> Result<Vec<StepResult>>
@@ -330,7 +334,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
     /// Process audio tokens (shape: batch, codebooks, steps as i64) and return ASR messages.
     pub fn step_tokens<F>(
         &mut self,
-        audio_tokens: &Tensor<i64, B>,
+        audio_tokens: &Tensor<i64, Q::B>,
         mask: &StreamMask,
         f: F,
     ) -> Result<Vec<StepResult>>
@@ -406,12 +410,12 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
             for extra_head in extra_heads.iter() {
                 // softmax on last dim, shape (batch, 1, dim) -> take (:, 0, 0)
                 let eh = extra_head.softmax()?;
-                let eh_data: Vec<LmT> = eh.to_vec()?;
+                let eh_data: Vec<Q::T> = eh.to_vec()?;
                 let eh_dims = eh.dims();
                 let dim = eh_dims[2];
                 // Extract first element per batch (index 0 of seq=0)
                 let prs_: Vec<f32> = (0..batch_size)
-                    .map(|b| <LmT as WithDTypeF>::to_f32(eh_data[b * dim]))
+                    .map(|b| <Q::T as WithDTypeF>::to_f32(eh_data[b * dim]))
                     .collect();
                 prs.push(prs_);
             }
@@ -463,7 +467,7 @@ impl<MimiT: WithDTypeF, LmT: WithDTypeF, B: Backend> AsrState<MimiT, LmT, B> {
         &mut self,
         batch_idx: usize,
         temp: Option<f64>,
-        cond: Option<&Tensor<LmT, B>>,
+        cond: Option<&Tensor<Q::T, Q::B>>,
     ) -> Result<()> {
         if batch_idx >= self.batch.len() {
             xn::bail!("batch index out of range: {batch_idx} >= {}", self.batch.len());

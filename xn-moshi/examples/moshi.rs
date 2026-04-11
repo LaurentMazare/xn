@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use xn::nn::VB;
 use xn::streaming::{StreamMask, StreamTensor};
-use xn::{Backend, Tensor, WithDTypeF};
+use xn::{Backend, Tensor};
 use xn_moshi::asr::{Asr, AsrWord};
 use xn_moshi::lm::{self, LmModel};
 use xn_moshi::mimi::{self, Mimi};
@@ -156,7 +156,13 @@ fn main() -> Result<()> {
             {
                 if cpu {
                     println!("Using CPU");
-                    run_asr::<f32, _>(input, temperature, batch_size, verbose, xn::CPU)?;
+                    run_asr::<xn::Unquantized<f32, _>>(
+                        input,
+                        temperature,
+                        batch_size,
+                        verbose,
+                        xn::CPU,
+                    )?;
                 } else {
                     let dev = xn::cuda_backend::Device::new(0)?;
                     unsafe {
@@ -164,10 +170,22 @@ fn main() -> Result<()> {
                     }
                     if use_f32 {
                         println!("Using CUDA (f32)");
-                        run_asr::<f32, _>(input, temperature, batch_size, verbose, dev)?;
+                        run_asr::<xn::Unquantized<f32, _>>(
+                            input,
+                            temperature,
+                            batch_size,
+                            verbose,
+                            dev,
+                        )?;
                     } else {
                         println!("Using CUDA (bf16)");
-                        run_asr::<half::bf16, _>(input, temperature, batch_size, verbose, dev)?;
+                        run_asr::<xn::Unquantized<half::bf16, _>>(
+                            input,
+                            temperature,
+                            batch_size,
+                            verbose,
+                            dev,
+                        )?;
                     }
                 }
             }
@@ -176,7 +194,13 @@ fn main() -> Result<()> {
                 let _ = cpu;
                 let _ = use_f32;
                 println!("Using CPU");
-                run_asr::<f32, _>(input, temperature, batch_size, verbose, xn::CPU)?;
+                run_asr::<xn::Unquantized<f32, _>>(
+                    input,
+                    temperature,
+                    batch_size,
+                    verbose,
+                    xn::CPU,
+                )?;
             }
         }
     }
@@ -332,12 +356,12 @@ fn audio_to_audio<Dev: Backend>(
     Ok(())
 }
 
-fn run_asr<LmT: WithDTypeF, Dev: Backend>(
+fn run_asr<Q: xn::BackendQ>(
     input: std::path::PathBuf,
     temperature: f64,
     batch_size: usize,
     verbose: bool,
-    dev: Dev,
+    dev: Q::B,
 ) -> Result<()> {
     use std::io::Write;
 
@@ -370,20 +394,20 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
     println!("Loading mimi weights...");
     let mimi_vb = VB::load(&[files.mimi], dev.clone())?;
     let mimi_config = mimi::Config::v0_1(Some(32));
-    let mimi: Mimi<f32, Dev> = Mimi::load(&mimi_vb.root(), mimi_config)?;
+    let mimi: Mimi<f32, Q::B> = Mimi::load(&mimi_vb.root(), mimi_config)?;
     println!("  Mimi loaded");
 
     // --- Load LM ---
     println!("Loading LM weights...");
     let lm_vb = VB::load(&[files.lm], dev.clone())?;
     let lm_config = lm::Config::stt_2_6b();
-    let lm: LmModel<LmT, Dev> = LmModel::load(&lm_vb.root(), &lm_config)?;
+    let lm: LmModel<Q> = LmModel::load(&lm_vb.root(), &lm_config)?;
     println!("  LM loaded");
 
     // --- Create ASR ---
     let asr_delay_in_tokens =
         (asr_delay_in_seconds * target_sample_rate as f64 / frame_size as f64) as usize;
-    let asr = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
+    let asr: Asr<Q> = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
     let mut state = asr.init_state(batch_size)?;
     let mask = StreamMask::all_active(batch_size);
 
@@ -420,7 +444,7 @@ fn run_asr<LmT: WithDTypeF, Dev: Backend>(
 
         // Replicate the same audio chunk across the batch.
         let chunk_batched: Vec<f32> = chunk.repeat(batch_size);
-        let audio: Tensor<f32, Dev> =
+        let audio: Tensor<f32, Q::B> =
             Tensor::from_vec(chunk_batched, (batch_size, 1, frame_size), &dev)?;
         let pcm = StreamTensor::from_tensor(audio);
         let start_time = std::time::Instant::now();
