@@ -52,9 +52,9 @@ enum Command {
         #[arg(long, default_value_t = false)]
         cpu: bool,
 
-        /// Use f32 for the LM instead of bf16 (bf16 is the default on CUDA).
-        #[arg(long, default_value_t = false)]
-        f32: bool,
+        /// The dtype to be used, can be f32, bf16, or fp8 when using CUDA.
+        #[arg(long, default_value = "bf16")]
+        dtype: String,
 
         /// Batch size for computation (ASR output uses first element only).
         #[arg(short, long, default_value_t = 1)]
@@ -141,15 +141,7 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Asr {
-            input,
-            temperature,
-            cpu,
-            f32: use_f32,
-            batch_size,
-            chrome_tracing,
-            verbose,
-        } => {
+        Command::Asr { input, temperature, cpu, dtype, batch_size, chrome_tracing, verbose } => {
             let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
 
             #[cfg(feature = "cuda")]
@@ -168,24 +160,36 @@ fn main() -> Result<()> {
                     unsafe {
                         dev.disable_event_tracking();
                     }
-                    if use_f32 {
-                        println!("Using CUDA (f32)");
-                        run_asr::<xn::Unquantized<f32, _>>(
-                            input,
-                            temperature,
-                            batch_size,
-                            verbose,
-                            dev,
-                        )?;
-                    } else {
-                        println!("Using CUDA (bf16)");
-                        run_asr::<xn::Unquantized<half::bf16, _>>(
-                            input,
-                            temperature,
-                            batch_size,
-                            verbose,
-                            dev,
-                        )?;
+                    println!("Using CUDA {dtype}");
+                    match dtype.as_str() {
+                        "f32" => {
+                            run_asr::<xn::Unquantized<f32, _>>(
+                                input,
+                                temperature,
+                                batch_size,
+                                verbose,
+                                dev,
+                            )?;
+                        }
+                        "bf16" => {
+                            run_asr::<xn::Unquantized<half::bf16, _>>(
+                                input,
+                                temperature,
+                                batch_size,
+                                verbose,
+                                dev,
+                            )?;
+                        }
+                        "fp8" => {
+                            run_asr::<xn::cuda_backend::quantization::Fp8Linear>(
+                                input,
+                                temperature,
+                                batch_size,
+                                verbose,
+                                dev,
+                            )?;
+                        }
+                        dtype => anyhow::bail!("unsupported dtype: {dtype}"),
                     }
                 }
             }
