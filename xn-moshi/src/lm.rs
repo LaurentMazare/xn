@@ -1,5 +1,4 @@
-use crate::batched_transformer::{self as bt, BatchedTransformerState};
-use crate::transformer::{self, Config as TransformerConfig, Norm};
+use crate::transformer::{self, BatchedTransformerState, Config as TransformerConfig, Norm};
 use xn::nn::{Embedding, Linear, var_builder::Path};
 use xn::streaming::StreamMask;
 use xn::{Backend, Result, Tensor, WithDTypeF};
@@ -136,7 +135,7 @@ pub struct LmState<T: WithDTypeF, B: Backend> {
 // ============================================================================
 
 pub struct LmModel<T: WithDTypeF, B: Backend> {
-    transformer: bt::BatchedTransformer<T, B>,
+    transformer: transformer::BatchedTransformer<T, B>,
     text_emb: Embedding<T, B>,        // (text_in_vocab_size, d_model)
     audio_embs: Vec<Embedding<T, B>>, // each (audio_vocab_size, d_model)
     text_linear: Linear<T, B>,        // (text_out_vocab_size, d_model)
@@ -154,7 +153,8 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         let out_norm = Norm::load(vb.pp("out_norm"), d_model, cfg.transformer.norm)?;
         let text_linear = Linear::load(vb.pp("text_linear"), d_model, cfg.text_out_vocab_size)?;
 
-        let transformer = bt::BatchedTransformer::load(&vb.pp("transformer"), &cfg.transformer)?;
+        let transformer =
+            transformer::BatchedTransformer::load(&vb.pp("transformer"), &cfg.transformer)?;
 
         let vb_e = vb.pp("emb");
         let mut audio_embs = Vec::with_capacity(cfg.audio_codebooks);

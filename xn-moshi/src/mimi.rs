@@ -1,4 +1,4 @@
-use crate::{batched_transformer as bt, conv, quantization, seanet, transformer};
+use crate::{conv, quantization, seanet, transformer as bt, transformer};
 use xn::nn::var_builder::Path;
 use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
