@@ -112,6 +112,22 @@ fn init_tracing() -> tracing_chrome::FlushGuard {
     guard
 }
 
+struct AsrQ {
+    input: std::path::PathBuf,
+    temperature: f64,
+    batch_size: usize,
+    verbose: bool,
+}
+
+impl xn::WithQ for AsrQ {
+    fn run<Q: xn::BackendQ>(self, dev: Q::B) -> xn::Result<()> {
+        match run_asr::<Q>(self.input, self.temperature, self.batch_size, self.verbose, dev) {
+            Ok(()) => Ok(()),
+            Err(e) => xn::bail!("ASR failed: {e}"),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -142,70 +158,11 @@ fn main() -> Result<()> {
         }
 
         Command::Asr { input, temperature, cpu, dtype, batch_size, chrome_tracing, verbose } => {
+            use std::str::FromStr;
             let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
-
-            #[cfg(feature = "cuda")]
-            {
-                if cpu {
-                    println!("Using CPU");
-                    run_asr::<xn::Unquantized<f32, _>>(
-                        input,
-                        temperature,
-                        batch_size,
-                        verbose,
-                        xn::CPU,
-                    )?;
-                } else {
-                    let dev = xn::cuda_backend::Device::new(0)?;
-                    unsafe {
-                        dev.disable_event_tracking();
-                    }
-                    println!("Using CUDA {dtype}");
-                    match dtype.as_str() {
-                        "f32" => {
-                            run_asr::<xn::Unquantized<f32, _>>(
-                                input,
-                                temperature,
-                                batch_size,
-                                verbose,
-                                dev,
-                            )?;
-                        }
-                        "bf16" => {
-                            run_asr::<xn::Unquantized<half::bf16, _>>(
-                                input,
-                                temperature,
-                                batch_size,
-                                verbose,
-                                dev,
-                            )?;
-                        }
-                        "fp8" => {
-                            run_asr::<xn::cuda_backend::quantization::Fp8Linear>(
-                                input,
-                                temperature,
-                                batch_size,
-                                verbose,
-                                dev,
-                            )?;
-                        }
-                        dtype => anyhow::bail!("unsupported dtype: {dtype}"),
-                    }
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = cpu;
-                let _ = use_f32;
-                println!("Using CPU");
-                run_asr::<xn::Unquantized<f32, _>>(
-                    input,
-                    temperature,
-                    batch_size,
-                    verbose,
-                    xn::CPU,
-                )?;
-            }
+            let dtype = xn::DTypeQ::from_str(&dtype)?;
+            let asr = AsrQ { input, temperature, batch_size, verbose };
+            xn::Runner::new().cpu_only(cpu).dtype(dtype).run(asr, 0)?;
         }
     }
 

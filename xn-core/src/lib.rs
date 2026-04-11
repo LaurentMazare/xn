@@ -18,7 +18,7 @@ pub mod tensor_view;
 pub mod utils;
 
 pub use backend::Backend;
-pub use dtype::{DType, DTypeF, WithDType, WithDTypeF};
+pub use dtype::{DType, DTypeQ, WithDType, WithDTypeF};
 pub use error::{Error, Result};
 pub use shape::{D, Dim, Shape};
 pub use tensor::{Tensor, TypedTensor};
@@ -107,39 +107,35 @@ impl<T: WithDTypeF, B: Backend> BackendQ for Unquantized<T, B> {
     }
 }
 
-pub trait WithDevice {
-    fn run<T: WithDTypeF, B: Backend>(self, dev: B) -> Result<()>;
+pub trait WithQ {
+    fn run<Q: BackendQ>(self, dev: Q::B) -> Result<()>;
 }
 
-pub fn run_with_device<W: WithDevice>(
-    w: impl WithDevice,
-    _cpu_only: bool,
-    _device_id: usize,
-) -> Result<()> {
+pub fn run_with_device<W: WithQ>(w: W, _cpu_only: bool, _device_id: usize) -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         if _cpu_only {
-            w.run::<f32, _>(CpuDevice)?;
+            w.run::<Unquantized<f32, _>>(CpuDevice)?;
         } else {
             let dev = cuda_backend::Device::new(_device_id)?;
-            w.run::<half::bf16, _>(dev)?;
+            w.run::<Unquantized<half::bf16, _>>(dev)?;
         }
     }
     #[cfg(not(feature = "cuda"))]
     {
-        w.run::<f32, _>(CpuDevice)?;
+        w.run::<Unquantized<f32, _>>(CpuDevice)?;
     }
     Ok(())
 }
 
 pub struct Runner {
     cpu_only: bool,
-    dtype: DTypeF,
+    dtype: DTypeQ,
 }
 
 impl Runner {
     pub fn new() -> Self {
-        Self { cpu_only: false, dtype: DTypeF::BF16 }
+        Self { cpu_only: false, dtype: DTypeQ::BF16 }
     }
 
     pub fn cpu_only(mut self, cpu_only: bool) -> Self {
@@ -147,28 +143,29 @@ impl Runner {
         self
     }
 
-    pub fn dtype(mut self, dtype: DTypeF) -> Self {
+    pub fn dtype(mut self, dtype: DTypeQ) -> Self {
         self.dtype = dtype;
         self
     }
 
-    pub fn run<W: WithDevice>(self, w: impl WithDevice, _device_id: usize) -> Result<()> {
+    pub fn run<W: WithQ>(self, w: W, _device_id: usize) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
             if self.cpu_only {
-                w.run::<f32, _>(CpuDevice)?;
+                w.run::<Unquantized<f32, _>>(CpuDevice)?;
             } else {
                 let dev = cuda_backend::Device::new(_device_id)?;
                 match self.dtype {
-                    DTypeF::F16 => w.run::<half::f16, _>(dev)?,
-                    DTypeF::BF16 => w.run::<half::bf16, _>(dev)?,
-                    DTypeF::F32 => w.run::<f32, _>(dev)?,
+                    DTypeQ::Fp8 => w.run::<cuda_backend::quantization::Fp8Linear>(dev)?,
+                    DTypeQ::F16 => w.run::<Unquantized<half::f16, _>>(dev)?,
+                    DTypeQ::BF16 => w.run::<Unquantized<half::bf16, _>>(dev)?,
+                    DTypeQ::F32 => w.run::<Unquantized<f32, _>>(dev)?,
                 }
             }
         }
         #[cfg(not(feature = "cuda"))]
         {
-            w.run::<f32, _>(CpuDevice)?;
+            w.run::<Unquantized<f32, _>>(CpuDevice)?;
         }
         Ok(())
     }
