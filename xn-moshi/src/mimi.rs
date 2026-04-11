@@ -124,8 +124,8 @@ impl<T: WithDTypeF, B: Backend> MimiDecodeState<T, B> {
 pub struct Mimi<T: WithDTypeF, B: Backend> {
     encoder: seanet::SeaNetEncoder<T, B>,
     decoder: seanet::SeaNetDecoder<T, B>,
-    encoder_transformer: bt::BatchedProjectedTransformer<T, B>,
-    decoder_transformer: bt::BatchedProjectedTransformer<T, B>,
+    encoder_transformer: bt::BatchedProjectedTransformer<xn::Unquantized<T, B>>,
+    decoder_transformer: bt::BatchedProjectedTransformer<xn::Unquantized<T, B>>,
     downsample: conv::ConvDownsample1d<T, B>,
     upsample: conv::ConvTrUpsample1d<T, B>,
     quantizer: quantization::SplitResidualVectorQuantizer<T, B>,

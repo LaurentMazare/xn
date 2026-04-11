@@ -135,7 +135,7 @@ pub struct LmState<T: WithDTypeF, B: Backend> {
 // ============================================================================
 
 pub struct LmModel<T: WithDTypeF, B: Backend> {
-    transformer: transformer::BatchedTransformer<T, B>,
+    transformer: transformer::BatchedTransformer<xn::Unquantized<T, B>>,
     text_emb: Embedding<T, B>,        // (text_in_vocab_size, d_model)
     audio_embs: Vec<Embedding<T, B>>, // each (audio_vocab_size, d_model)
     text_linear: Linear<T, B>,        // (text_out_vocab_size, d_model)

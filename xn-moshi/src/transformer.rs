@@ -1,3 +1,4 @@
+use xn::BackendQ;
 use xn::models::kv_cache::{IndicesAndMask, ScatteredCacheBuilder, ScatteredKvCache};
 use xn::nn::{Linear, var_builder::Path};
 use xn::streaming::{StreamMask, StreamTensor};
@@ -41,16 +42,16 @@ pub enum PositionalEmbedding {
 // Streaming State Types
 // ============================================================================
 
-pub struct KvCacheState<T: WithDTypeF, B: Backend> {
-    pub k: Option<Tensor<T, B>>,
-    pub v: Option<Tensor<T, B>>,
+pub struct KvCacheState<Q: BackendQ> {
+    pub k: Option<Tensor<Q::T, Q::B>>,
+    pub v: Option<Tensor<Q::T, Q::B>>,
 }
 
-pub struct TransformerState<T: WithDTypeF, B: Backend> {
-    pub layers: Vec<KvCacheState<T, B>>,
+pub struct TransformerState<Q: BackendQ> {
+    pub layers: Vec<KvCacheState<Q>>,
 }
 
-impl<T: WithDTypeF, B: Backend> KvCacheState<T, B> {
+impl<Q: BackendQ> KvCacheState<Q> {
     pub fn new() -> Self {
         Self { k: None, v: None }
     }
@@ -63,7 +64,7 @@ impl<T: WithDTypeF, B: Backend> KvCacheState<T, B> {
     }
 }
 
-impl<T: WithDTypeF, B: Backend> Default for KvCacheState<T, B> {
+impl<Q: BackendQ> Default for KvCacheState<Q> {
     fn default() -> Self {
         Self::new()
     }
@@ -133,27 +134,22 @@ impl<T: WithDTypeF, B: Backend> Norm<T, B> {
 // MLP
 // ============================================================================
 
-pub(crate) enum Mlp<T: WithDTypeF, B: Backend> {
-    NoGating {
-        linear1: Linear<T, B>,
-        linear2: Linear<T, B>,
-    },
-    Gating {
-        linear_in: Linear<T, B>,
-        linear_out: Linear<T, B>,
-        activation: crate::seanet::Activation,
-    },
+pub(crate) enum Mlp<Q: BackendQ> {
+    NoGating { linear1: Q::LinearQ, linear2: Q::LinearQ },
+    Gating { linear_in: Q::LinearQ, linear_out: Q::LinearQ, activation: crate::seanet::Activation },
 }
 
-impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
-    pub(crate) fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
+impl<Q: BackendQ> Mlp<Q> {
+    pub(crate) fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         let d_model = cfg.d_model;
         match cfg.gating {
             None => {
                 let linear1 =
                     Linear::load_o(vb.pp("linear1"), d_model, cfg.dim_feedforward, cfg.bias_ff)?;
+                let linear1 = Q::from_linear(linear1)?;
                 let linear2 =
                     Linear::load_o(vb.pp("linear2"), cfg.dim_feedforward, d_model, cfg.bias_ff)?;
+                let linear2 = Q::from_linear(linear2)?;
                 Ok(Self::NoGating { linear1, linear2 })
             }
             Some(activation) => {
@@ -165,14 +161,17 @@ impl<T: WithDTypeF, B: Backend> Mlp<T, B> {
                 let vb = vb.pp("gating");
                 let linear_in =
                     Linear::load_o(vb.pp("linear_in"), d_model, 2 * hidden, cfg.bias_ff)?;
+                let linear_in = Q::from_linear(linear_in)?;
                 let linear_out = Linear::load_o(vb.pp("linear_out"), hidden, d_model, cfg.bias_ff)?;
+                let linear_out = Q::from_linear(linear_out)?;
                 Ok(Self::Gating { linear_in, linear_out, activation })
             }
         }
     }
 
     #[tracing::instrument(name = "mlp-forward", skip_all)]
-    pub(crate) fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    pub(crate) fn forward(&self, xs: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
+        use xn::ModuleT;
         match self {
             Self::NoGating { linear1, linear2 } => {
                 let xs = linear1.forward(xs)?.gelu_erf()?;
@@ -268,17 +267,16 @@ impl<B: Backend> Rope<B> {
 // Multi-head Self-Attention (with ScatteredKvCache)
 // ============================================================================
 
-struct BatchedMultiheadAttention<T: WithDTypeF, B: Backend> {
-    in_proj_weight: Tensor<T, B>,
-    in_proj_bias: Option<Tensor<T, B>>,
-    out_proj: Linear<T, B>,
+struct BatchedMultiheadAttention<Q: BackendQ> {
+    in_proj: Q::LinearQ,
+    out_proj: Q::LinearQ,
     num_heads: usize,
     head_dim: usize,
     context: usize,
 }
 
-impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
-    fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
+impl<Q: BackendQ> BatchedMultiheadAttention<Q> {
+    fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         let d_model = cfg.d_model;
         let num_heads = cfg.num_heads;
         let head_dim = d_model / num_heads;
@@ -287,36 +285,35 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
 
         let vb_attn = vb.pp("self_attn");
         let in_proj_weight = vb_attn.tensor("in_proj_weight", (out_dim, d_model))?;
-        let in_proj_bias =
-            if cfg.bias_attn { Some(vb_attn.tensor("in_proj_bias", (out_dim,))?) } else { None };
+        let in_proj = Linear::new(in_proj_weight);
+        let in_proj = if cfg.bias_attn {
+            let bias = vb_attn.tensor("in_proj_bias", (out_dim,))?;
+            in_proj.with_bias(bias)
+        } else {
+            in_proj
+        };
+        let in_proj = Q::from_linear(in_proj)?;
 
         let out_proj = Linear::load_o(vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
-        Ok(Self {
-            in_proj_weight,
-            in_proj_bias,
-            out_proj,
-            num_heads,
-            head_dim,
-            context: cfg.context,
-        })
+        let out_proj = Q::from_linear(out_proj)?;
+        Ok(Self { in_proj, out_proj, num_heads, head_dim, context: cfg.context })
     }
 
     #[tracing::instrument(name = "batched-mha", skip_all)]
     fn forward(
         &self,
-        xs: &Tensor<T, B>,
-        rope: Option<&Rope<B>>,
-        kv_cache: &mut ScatteredKvCache<T, B>,
-        iam: &IndicesAndMask<T, B>,
-    ) -> Result<Tensor<T, B>> {
+        xs: &Tensor<Q::T, Q::B>,
+        rope: Option<&Rope<Q::B>>,
+        kv_cache: &mut ScatteredKvCache<Q::T, Q::B>,
+        iam: &IndicesAndMask<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        use xn::ModuleT;
+
         let dims = xs.dims();
         let (b, t) = (dims[0], dims[1]);
         let d_model = self.num_heads * self.head_dim;
 
-        let mut qkv = xs.matmul_t(&self.in_proj_weight)?;
-        if let Some(bias) = &self.in_proj_bias {
-            qkv = qkv.broadcast_add(bias)?;
-        }
+        let qkv = self.in_proj.forward(xs)?;
 
         let q = qkv
             .narrow(2, ..d_model)?
@@ -356,7 +353,7 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
         };
 
         // Attention: q @ k^T * scale + mask -> softmax -> @ v
-        let scale = T::from_f32(1.0 / (self.head_dim as f32).sqrt());
+        let scale = Q::T::from_f32(1.0 / (self.head_dim as f32).sqrt());
         let attn_weights = q.matmul_t(&k)?.scale(scale)?; // (b, h, t, k)
 
         let mask = iam.mask(); // &Tensor<T, B>, shape (b, 1, t, context)
@@ -384,17 +381,17 @@ impl<T: WithDTypeF, B: Backend> BatchedMultiheadAttention<T, B> {
 // Transformer Layer
 // ============================================================================
 
-struct BatchedTransformerLayer<T: WithDTypeF, B: Backend> {
-    self_attn: BatchedMultiheadAttention<T, B>,
-    mlp: Mlp<T, B>,
-    norm1: Norm<T, B>,
-    norm2: Norm<T, B>,
-    layer_scale_1: Option<LayerScale<T, B>>,
-    layer_scale_2: Option<LayerScale<T, B>>,
+struct BatchedTransformerLayer<Q: BackendQ> {
+    self_attn: BatchedMultiheadAttention<Q>,
+    mlp: Mlp<Q>,
+    norm1: Norm<Q::T, Q::B>,
+    norm2: Norm<Q::T, Q::B>,
+    layer_scale_1: Option<LayerScale<Q::T, Q::B>>,
+    layer_scale_2: Option<LayerScale<Q::T, Q::B>>,
 }
 
-impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
-    fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
+impl<Q: BackendQ> BatchedTransformerLayer<Q> {
+    fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         if cfg.use_conv_block {
             xn::bail!("conv-block is not supported")
         }
@@ -419,11 +416,11 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
 
     fn forward(
         &self,
-        xs: &Tensor<T, B>,
-        rope: Option<&Rope<B>>,
-        kv_cache: &mut ScatteredKvCache<T, B>,
-        iam: &IndicesAndMask<T, B>,
-    ) -> Result<Tensor<T, B>> {
+        xs: &Tensor<Q::T, Q::B>,
+        rope: Option<&Rope<Q::B>>,
+        kv_cache: &mut ScatteredKvCache<Q::T, Q::B>,
+        iam: &IndicesAndMask<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
         // norm_first path only
         let norm1_out = self.norm1.forward(xs)?;
         let mut attn_out = self.self_attn.forward(&norm1_out, rope, kv_cache, iam)?;
@@ -445,18 +442,18 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerLayer<T, B> {
 // Batched Streaming Transformer
 // ============================================================================
 
-pub struct BatchedTransformer<T: WithDTypeF, B: Backend> {
-    layers: Vec<BatchedTransformerLayer<T, B>>,
-    rope: Option<RotaryEmbedding<B>>,
+pub struct BatchedTransformer<Q: BackendQ> {
+    layers: Vec<BatchedTransformerLayer<Q>>,
+    rope: Option<RotaryEmbedding<Q::B>>,
     positional_embedding: PositionalEmbedding,
     num_kv: usize,
     head_dim: usize,
     context: usize,
-    device: B,
+    device: Q::B,
 }
 
-impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
-    pub fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
+impl<Q: BackendQ> BatchedTransformer<Q> {
+    pub fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         if !cfg.causal {
             xn::bail!("only causal mode is supported")
         }
@@ -494,7 +491,7 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
         })
     }
 
-    pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<T, B>> {
+    pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<Q::T, Q::B>> {
         let builder = ScatteredCacheBuilder::new(batch_size, self.context, &self.device)?;
         let mut kv_caches = Vec::with_capacity(self.layers.len());
         for _ in &self.layers {
@@ -505,10 +502,10 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
 
     pub fn forward(
         &self,
-        xs: &Tensor<T, B>,
-        state: &mut BatchedTransformerState<T, B>,
+        xs: &Tensor<Q::T, Q::B>,
+        state: &mut BatchedTransformerState<Q::T, Q::B>,
         mask: &StreamMask,
-    ) -> Result<Tensor<T, B>> {
+    ) -> Result<Tensor<Q::T, Q::B>> {
         let dims = xs.dims();
         let (b, t) = (dims[0], dims[1]);
         if b != state.batch_size() {
@@ -554,22 +551,24 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformer<T, B> {
 // Projected Batched Transformer (public)
 // ============================================================================
 
-pub struct BatchedProjectedTransformer<T: WithDTypeF, B: Backend> {
-    input_proj: Option<Linear<T, B>>,
-    output_proj: Option<Linear<T, B>>,
-    transformer: BatchedTransformer<T, B>,
+pub struct BatchedProjectedTransformer<Q: BackendQ> {
+    input_proj: Option<Q::LinearQ>,
+    output_proj: Option<Q::LinearQ>,
+    transformer: BatchedTransformer<Q>,
     conv_layout: bool,
 }
 
-impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
-    pub fn load(vb: &Path<B>, input_dim: usize, cfg: &Config) -> Result<Self> {
+impl<Q: BackendQ> BatchedProjectedTransformer<Q> {
+    pub fn load(vb: &Path<Q::B>, input_dim: usize, cfg: &Config) -> Result<Self> {
         let input_proj = if input_dim != cfg.d_model {
-            Some(Linear::load(vb.pp("input_proj"), input_dim, cfg.d_model)?)
+            let linear = Linear::load(vb.pp("input_proj"), input_dim, cfg.d_model)?;
+            Some(Q::from_linear(linear)?)
         } else {
             None
         };
         let output_proj = if input_dim != cfg.d_model {
-            Some(Linear::load(vb.pp("output_proj").pp(0), cfg.d_model, input_dim)?)
+            let linear = Linear::load(vb.pp("output_proj").pp(0), cfg.d_model, input_dim)?;
+            Some(Q::from_linear(linear)?)
         } else {
             None
         };
@@ -579,16 +578,18 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
         Ok(Self { input_proj, output_proj, transformer, conv_layout: cfg.conv_layout })
     }
 
-    pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<T, B>> {
+    pub fn init_state(&self, batch_size: usize) -> Result<BatchedTransformerState<Q::T, Q::B>> {
         self.transformer.init_state(batch_size)
     }
 
     pub fn forward(
         &self,
-        xs: &Tensor<T, B>,
-        state: &mut BatchedTransformerState<T, B>,
+        xs: &Tensor<Q::T, Q::B>,
+        state: &mut BatchedTransformerState<Q::T, Q::B>,
         mask: &StreamMask,
-    ) -> Result<Vec<Tensor<T, B>>> {
+    ) -> Result<Vec<Tensor<Q::T, Q::B>>> {
+        use xn::ModuleT;
+
         let xs = if self.conv_layout { xs.transpose(1, 2)?.contiguous()? } else { xs.clone() };
         let xs = match &self.input_proj {
             Some(proj) => proj.forward(&xs)?,
@@ -605,10 +606,10 @@ impl<T: WithDTypeF, B: Backend> BatchedProjectedTransformer<T, B> {
 
     pub fn step(
         &self,
-        xs: &StreamTensor<T, B>,
-        state: &mut BatchedTransformerState<T, B>,
+        xs: &StreamTensor<Q::T, Q::B>,
+        state: &mut BatchedTransformerState<Q::T, Q::B>,
         mask: &StreamMask,
-    ) -> Result<StreamTensor<T, B>> {
+    ) -> Result<StreamTensor<Q::T, Q::B>> {
         let xs = match xs.as_option() {
             None => return Ok(StreamTensor::empty()),
             Some(xs) => xs,
