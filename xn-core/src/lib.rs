@@ -89,7 +89,7 @@ impl<M: ModuleT> ModuleT for Option<&M> {
 pub trait BackendQ: Clone {
     type T: WithDTypeF;
     type B: Backend;
-    type LinearQ: ModuleT<T = Self::T, B = Self::B>;
+    type LinearQ: ModuleT<T = Self::T, B = Self::B> + Send + Sync;
 
     fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ>;
 }
@@ -105,6 +105,18 @@ impl<T: WithDTypeF, B: Backend> BackendQ for Unquantized<T, B> {
     type LinearQ = nn::Linear<T, B>;
     fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
         Ok(l)
+    }
+}
+
+#[derive(Clone)]
+pub struct CpuQ8;
+
+impl BackendQ for CpuQ8 {
+    type T = f32;
+    type B = CpuDevice;
+    type LinearQ = quantized::QLinear;
+    fn from_linear(l: nn::Linear<f32, CpuDevice>) -> Result<quantized::QLinear> {
+        quantized::QLinear::from_linear(l, quantized::GgmlDType::Q8_0)
     }
 }
 

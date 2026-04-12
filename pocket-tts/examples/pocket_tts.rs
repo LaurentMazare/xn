@@ -4,8 +4,8 @@ mod audio_helpers;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences};
+use xn::Tensor;
 use xn::nn::VB;
-use xn::{Backend, Tensor, Unquantized};
 
 struct SpTokenizer(sentencepiece::SentencePieceProcessor);
 
@@ -52,6 +52,9 @@ struct Args {
     /// Use the cpu device even if cuda is available
     #[arg(long, default_value_t = false)]
     cpu: bool,
+
+    #[arg(long, default_value_t = false)]
+    q8: bool,
 
     #[arg(long)]
     chrome_tracing: bool,
@@ -149,6 +152,15 @@ fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
     }
 }
 
+fn run_cpu(args: Args) -> Result<()> {
+    if args.q8 {
+        tracing::info!("using cpu q8 backend");
+        run_for_device::<xn::CpuQ8>(args, xn::CPU)
+    } else {
+        tracing::info!("using cpu backend");
+        run_for_device::<xn::Unquantized<f32, _>>(args, xn::CPU)
+    }
+}
 fn main() -> Result<()> {
     let args = Args::parse();
     let _guard = init_tracing(args.chrome_tracing);
@@ -156,8 +168,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         if args.cpu {
-            tracing::info!("using cpu backend");
-            run_for_device(args, xn::CPU)?;
+            run_cpu(args)?;
         } else {
             tracing::info!("using cuda backend");
             let dev = xn::cuda_backend::Device::new(0)?;
@@ -169,8 +180,7 @@ fn main() -> Result<()> {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        tracing::info!("using cpu backend");
-        run_for_device(args, xn::CPU)?;
+        run_cpu(args)?;
     }
 
     Ok(())
@@ -231,7 +241,7 @@ where
     })
 }
 
-fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
+fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> Result<()> {
     let (model_path, tokenizer_path, voice, cfg) = match args.config.as_ref() {
         Some(config) => {
             let config = std::fs::canonicalize(config)?;
@@ -274,7 +284,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     );
 
     let vb = VB::load_with_key_map(&[&model_path], dev.clone(), remap_key)?.root();
-    let model: TTSModel<Unquantized<f32, Dev>> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
+    let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
             || v.starts_with("mimi.quantizer")
@@ -318,7 +328,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
                 let voice_dims = voice_shape.dims();
 
                 // Load as raw tensor and reshape to [1, T, dim]
-                let voice_emb: Tensor<f32, Dev> =
+                let voice_emb: Tensor<f32, Q::B> =
                     voice_vb.tensor(voice_key, voice_shape.clone())?;
                 let voice_emb = if voice_dims.len() == 2 {
                     voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?
@@ -395,7 +405,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         // BOS marker: NaN tensor [1, 1, ldim]
         let ldim = cfg.flow_lm.ldim;
         let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-        let mut prev_latent: Tensor<f32, Dev> = Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?;
+        let mut prev_latent: Tensor<f32, Q::B> = Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?;
 
         let mut eos_countdown: Option<usize> = None;
 
@@ -406,7 +416,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
             let model = model.clone();
             let is_done = is_done.clone();
             move || {
-                let mut audio_chunks: Vec<Tensor<f32, Dev>> = Vec::new();
+                let mut audio_chunks: Vec<Tensor<f32, Q::B>> = Vec::new();
                 if wait_to_decode {
                     tracing::info!("waiting for generation to finish before decoding...");
                     while !is_done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -419,7 +429,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
                     audio_chunks.push(audio_chunk);
                 }
                 // Concatenate audio
-                let audio_refs: Vec<&Tensor<f32, Dev>> = audio_chunks.iter().collect();
+                let audio_refs: Vec<&Tensor<f32, Q::B>> = audio_chunks.iter().collect();
                 let audio = Tensor::cat(&audio_refs, 2)?;
                 let audio = audio.narrow(0, ..1)?.contiguous()?;
                 Ok::<_, anyhow::Error>(audio)
@@ -462,7 +472,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         let audio = jh.join().map_err(|_| anyhow::anyhow!("cannot join thread"))?;
         all_audios.push(audio);
     }
-    let all_audios = all_audios.iter().collect::<Vec<&Tensor<f32, Dev>>>();
+    let all_audios = all_audios.iter().collect::<Vec<&Tensor<f32, Q::B>>>();
     let audio = Tensor::cat(&all_audios, 2)?;
     let pcm = audio.to_vec()?;
     let duration = pcm.len() as f64 / cfg.mimi.sample_rate as f64;
