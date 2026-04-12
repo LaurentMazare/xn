@@ -10,6 +10,7 @@ pub mod inplace_ops;
 pub mod models;
 pub mod nn;
 pub mod ops;
+pub mod quantized;
 pub mod safetensors;
 pub mod shape;
 pub mod streaming;
