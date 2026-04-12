@@ -357,3 +357,24 @@ impl crate::ModuleT for QLinear {
         Ok(dst_t)
     }
 }
+
+impl QLinear {
+    pub fn new(weight: QTensor) -> Self {
+        Self { weight, bias: None }
+    }
+
+    pub fn with_bias(mut self, bias: crate::Tensor<f32, crate::CpuDevice>) -> Self {
+        self.bias = Some(bias);
+        self
+    }
+
+    pub fn from_linear(
+        linear: crate::nn::Linear<f32, crate::CpuDevice>,
+        ggml_dtype: GgmlDType,
+    ) -> Result<Self> {
+        let weight = linear.weight();
+        let src = weight.storage()?;
+        let weight = QTensor::quantize_f32(&src, weight.shape(), ggml_dtype)?;
+        Ok(Self { weight, bias: linear.bias().cloned() })
+    }
+}
