@@ -385,6 +385,7 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
     let start = std::time::Instant::now();
     tracing::info!("starting generation...");
     let mut all_audios = vec![];
+    let mut backbone_step_timings_ms = vec![];
     let model = std::sync::Arc::new(model);
     for (tokens, max_frames, frames_after_eos) in all_tokens.into_iter() {
         tracing::info!("prompting with text conditioning ({} tokens)...", tokens.len());
@@ -437,6 +438,7 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
         });
 
         for step in 0..max_frames {
+            let step_start = std::time::Instant::now();
             let (next_latent, is_eos) = match cfg_state.as_mut() {
                 Some((coef, null_state)) => model.generate_step_cfg(
                     &mut tts_state,
@@ -447,6 +449,7 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
                 )?,
                 None => model.generate_step(&mut tts_state, &prev_latent, &mut rng)?,
             };
+            backbone_step_timings_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
             latent_tx.send(next_latent.clone())?;
 
             if is_eos && eos_countdown.is_none() {
@@ -480,6 +483,12 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
     let elapsed = start.elapsed().as_secs_f64();
     let rtf = duration / elapsed;
     tracing::info!("generated {duration:.2}s in {elapsed:.2}s (RTF={rtf:.3})");
+    let nsteps = backbone_step_timings_ms.len();
+    tracing::info!(
+        ?nsteps,
+        "average backbone step time: {:.2}ms",
+        backbone_step_timings_ms.iter().sum::<f64>() / nsteps as f64
+    );
 
     // Write WAV
     let output_file = std::fs::File::create(&args.output)?;
