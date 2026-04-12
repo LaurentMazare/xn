@@ -9,6 +9,7 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
+byteorder = { workspace = true }
 cudarc = { workspace = true, optional = true }
 gemm = { workspace = true }
 half = { workspace = true }

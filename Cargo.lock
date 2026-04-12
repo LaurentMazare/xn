@@ -3080,6 +3080,7 @@ version = "0.1.7"
 dependencies = [
  "anyhow",
  "bindgen_cuda",
+ "byteorder",
  "clap",
  "cudarc",
  "gemm",
