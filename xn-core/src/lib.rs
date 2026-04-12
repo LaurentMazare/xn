@@ -108,18 +108,6 @@ impl<T: WithDTypeF, B: Backend> BackendQ for Unquantized<T, B> {
     }
 }
 
-#[derive(Clone)]
-pub struct CpuQ8;
-
-impl BackendQ for CpuQ8 {
-    type T = f32;
-    type B = CpuDevice;
-    type LinearQ = quantized::QLinear;
-    fn from_linear(l: nn::Linear<f32, CpuDevice>) -> Result<quantized::QLinear> {
-        quantized::QLinear::from_linear(l, quantized::GgmlDType::Q8_0)
-    }
-}
-
 pub trait WithQ {
     fn run<Q: BackendQ>(self, dev: Q::B) -> Result<()>;
 }

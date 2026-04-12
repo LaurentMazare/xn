@@ -380,14 +380,40 @@ impl QLinear {
 }
 
 #[derive(Clone)]
-pub struct Q8F32;
+pub struct Q80F32;
 
-impl crate::BackendQ for Q8F32 {
+impl crate::BackendQ for Q80F32 {
     type T = f32;
     type B = crate::CpuDevice;
     type LinearQ = QLinear;
 
     fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
         QLinear::from_linear(l, GgmlDType::Q8_0)
+    }
+}
+
+#[derive(Clone)]
+pub struct Q8kF32;
+
+impl crate::BackendQ for Q8kF32 {
+    type T = f32;
+    type B = crate::CpuDevice;
+    type LinearQ = QLinear;
+
+    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
+        QLinear::from_linear(l, GgmlDType::Q8K)
+    }
+}
+
+#[derive(Clone)]
+pub struct Q6kF32;
+
+impl crate::BackendQ for Q6kF32 {
+    type T = f32;
+    type B = crate::CpuDevice;
+    type LinearQ = QLinear;
+
+    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
+        QLinear::from_linear(l, GgmlDType::Q6K)
     }
 }

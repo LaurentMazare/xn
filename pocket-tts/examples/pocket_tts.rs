@@ -155,7 +155,7 @@ fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
 fn run_cpu(args: Args) -> Result<()> {
     if args.q8 {
         tracing::info!("using cpu q8 backend");
-        run_for_device::<xn::CpuQ8>(args, xn::CPU)
+        run_for_device::<xn::quantized::Q80F32>(args, xn::CPU)
     } else {
         tracing::info!("using cpu backend");
         run_for_device::<xn::Unquantized<f32, _>>(args, xn::CPU)
