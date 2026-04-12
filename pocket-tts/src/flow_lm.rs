@@ -2,7 +2,7 @@ use crate::conditioners::LUTConditioner;
 use crate::mlp::SimpleMLPAdaLN;
 use crate::transformer::{StreamingTransformer, StreamingTransformerState};
 use xn::nn::{Linear, var_builder::Path};
-use xn::{Backend, Result, Tensor, WithDTypeF};
+use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
 
 pub trait Rng {
     fn sample(&mut self) -> f32;
@@ -51,30 +51,30 @@ pub struct FlowLMConfig {
 }
 
 /// Transformer-based flow language model.
-pub struct FlowLM<T: WithDTypeF, B: Backend> {
-    pub conditioner: LUTConditioner<T, B>,
-    pub num_speakers: Option<Tensor<T, B>>,
-    flow_net: SimpleMLPAdaLN<T, B>,
-    pub transformer: StreamingTransformer<T, B>,
-    pub emb_std: Tensor<T, B>,
-    pub emb_mean: Tensor<T, B>,
-    bos_emb: Tensor<T, B>,
-    pub input_linear: Linear<T, B>,
-    out_norm_weight: Tensor<T, B>,
-    out_norm_bias: Tensor<T, B>,
-    out_eos: Linear<T, B>,
+pub struct FlowLM<Q: BackendQ> {
+    pub conditioner: LUTConditioner<Q::T, Q::B>,
+    pub num_speakers: Option<Tensor<Q::T, Q::B>>,
+    flow_net: SimpleMLPAdaLN<Q::T, Q::B>,
+    pub transformer: StreamingTransformer<Q>,
+    pub emb_std: Tensor<Q::T, Q::B>,
+    pub emb_mean: Tensor<Q::T, Q::B>,
+    bos_emb: Tensor<Q::T, Q::B>,
+    pub input_linear: Linear<Q::T, Q::B>,
+    out_norm_weight: Tensor<Q::T, Q::B>,
+    out_norm_bias: Tensor<Q::T, Q::B>,
+    out_eos: Linear<Q::T, Q::B>,
     pub dim: usize,
     pub ldim: usize,
 }
 
 #[derive(Clone, Debug)]
-pub struct FlowLMState<T: WithDTypeF, B: Backend> {
-    pub transformer_state: StreamingTransformerState<T, B>,
+pub struct FlowLMState<Q: BackendQ> {
+    pub transformer_state: StreamingTransformerState<Q::T, Q::B>,
 }
 
-impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
+impl<Q: BackendQ> FlowLM<Q> {
     pub fn load(
-        vb: &Path<B>,
+        vb: &Path<Q::B>,
         tokenizer: Box<dyn crate::Tokenizer + Send + Sync>,
         cfg: &FlowLMConfig,
     ) -> Result<Self> {
@@ -143,11 +143,7 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
         })
     }
 
-    pub fn init_state(
-        &self,
-        batch_size: usize,
-        sequence_length: usize,
-    ) -> Result<FlowLMState<T, B>> {
+    pub fn init_state(&self, batch_size: usize, sequence_length: usize) -> Result<FlowLMState<Q>> {
         let transformer_state = self.transformer.init_state(batch_size, sequence_length)?;
         Ok(FlowLMState { transformer_state })
     }
@@ -155,11 +151,11 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
     /// Run the backbone: concat text_embeddings + input, run transformer, strip prefix.
     fn backbone(
         &self,
-        input: &Tensor<T, B>,
-        text_embeddings: &Tensor<T, B>,
+        input: &Tensor<Q::T, Q::B>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
         seq_len: usize,
-        state: &mut FlowLMState<T, B>,
-    ) -> Result<Tensor<T, B>> {
+        state: &mut FlowLMState<Q>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
         let input = match self.num_speakers.as_ref() {
             Some(ns) => input.broadcast_add(ns)?,
             None => input.clone(),
@@ -175,16 +171,16 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
 
     /// Sample next latent using flow matching.
     /// Returns (next_latent [B, 1, ldim], is_eos [B, 1]).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn sample_next_latent(
         &self,
-        sequence: &Tensor<T, B>,
-        text_embeddings: &Tensor<T, B>,
-        state: &mut FlowLMState<T, B>,
+        sequence: &Tensor<Q::T, Q::B>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        state: &mut FlowLMState<Q>,
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
         eos_threshold: f32,
-    ) -> Result<(Tensor<T, B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
         let (b, s, _) = sequence.dims3()?;
         let dev = sequence.device();
 
@@ -198,25 +194,26 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
         let eos_logit = self.out_eos.forward(&transformer_out)?;
         let eos_val = eos_logit.to_vec()?;
         let is_eos = eos_val[0].to_f32() > eos_threshold;
-        let noise_data: Vec<T> = (0..b * self.ldim).map(|_| T::from_f32(rng.sample())).collect();
+        let noise_data: Vec<Q::T> =
+            (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
         let latent = lsd_decode(&self.flow_net, &transformer_out, &noise, lsd_decode_steps)?;
         let latent = latent.reshape((b, 1, self.ldim))?;
         Ok((latent, is_eos))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn sample_next_latent_cfg(
         &self,
-        sequence: &Tensor<T, B>,
-        text_embeddings: &Tensor<T, B>,
-        state: &mut FlowLMState<T, B>,
-        null_state: &mut FlowLMState<T, B>,
+        sequence: &Tensor<Q::T, Q::B>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        state: &mut FlowLMState<Q>,
+        null_state: &mut FlowLMState<Q>,
         cfg_coef: f32,
         lsd_decode_steps: usize,
         rng: &mut impl Rng,
         eos_threshold: f32,
-    ) -> Result<(Tensor<T, B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
         let (b, s, _) = sequence.dims3()?;
         let dev = sequence.device();
 
@@ -229,12 +226,13 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
         let null_out = self.backbone(&input, text_embeddings, s, null_state)?;
         let null_out =
             null_out.narrow(1, t_len - 1..t_len)?.contiguous()?.reshape((b, self.dim))?;
-        let s = T::from_f32(cfg_coef);
+        let s = Q::T::from_f32(cfg_coef);
         let t_out = t_out.sub(&null_out)?.scale(s)?.add(&null_out)?;
         let eos_logit = self.out_eos.forward(&t_out)?;
         let eos_val = eos_logit.to_vec()?;
         let is_eos = eos_val[0].to_f32() > eos_threshold;
-        let noise_data: Vec<T> = (0..b * self.ldim).map(|_| T::from_f32(rng.sample())).collect();
+        let noise_data: Vec<Q::T> =
+            (0..b * self.ldim).map(|_| Q::T::from_f32(rng.sample())).collect();
         let noise = Tensor::from_vec(noise_data, (b, self.ldim), dev)?;
         let latent = lsd_decode(&self.flow_net, &t_out, &noise, lsd_decode_steps)?;
         let latent = latent.reshape((b, 1, self.ldim))?;
@@ -242,7 +240,7 @@ impl<T: WithDTypeF, B: Backend> FlowLM<T, B> {
     }
 
     /// Replace NaN values in sequence with bos_emb.
-    fn replace_nan_with_bos(&self, sequence: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    fn replace_nan_with_bos(&self, sequence: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
         let data = sequence.to_vec()?;
         // TODO(laurent): avoid the `to_vec` below. For this, we could introduce
         // something like torch.where.

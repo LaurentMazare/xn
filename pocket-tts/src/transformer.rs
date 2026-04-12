@@ -1,7 +1,7 @@
 use crate::layer_scale::LayerScale;
 use crate::rope::RotaryEmbedding;
 use xn::nn::{LayerNorm, Linear, var_builder::Path};
-use xn::{Backend, Result, Tensor, WithDTypeF};
+use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
 
 /// State for StreamingMultiheadAttention.
 #[derive(Debug, Clone)]
@@ -55,21 +55,25 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
 }
 
 /// Streaming multi-head attention (used by the flow LM transformer).
-pub struct StreamingMultiheadAttention<T: WithDTypeF, B: Backend> {
-    in_proj: Linear<T, B>,
-    out_proj: Linear<T, B>,
+pub struct StreamingMultiheadAttention<Q: BackendQ> {
+    in_proj: Q::LinearQ,
+    out_proj: Q::LinearQ,
     pub embed_dim: usize,
     pub num_heads: usize,
     name: String,
+    device: Q::B,
 }
 
-impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
-    pub fn load(vb: &Path<B>, embed_dim: usize, num_heads: usize) -> Result<Self> {
+impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
+    pub fn load(vb: &Path<Q::B>, embed_dim: usize, num_heads: usize) -> Result<Self> {
         let out_dim = 3 * embed_dim;
         let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
+        let in_proj = Q::from_linear(in_proj)?;
         let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
+        let out_proj = Q::from_linear(out_proj)?;
         let name = vb.prefix();
-        Ok(Self { in_proj, out_proj, embed_dim, num_heads, name })
+        let device = vb.device().clone();
+        Ok(Self { in_proj, out_proj, embed_dim, num_heads, name, device })
     }
 
     pub fn name(&self) -> &str {
@@ -80,10 +84,10 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         &self,
         batch_size: usize,
         sequence_length: usize,
-    ) -> Result<StreamingMHAState<T, B>> {
+    ) -> Result<StreamingMHAState<Q::T, Q::B>> {
         let dim_per_head = self.embed_dim / self.num_heads;
         let shape = (batch_size, sequence_length, self.num_heads, dim_per_head);
-        let dev = self.in_proj.device();
+        let dev = &self.device;
         let k_cache = Tensor::zeros(shape, dev)?;
         let v_cache = Tensor::zeros(shape, dev)?;
         Ok(StreamingMHAState { k_cache, v_cache, current_end: 0 })
@@ -92,11 +96,12 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
     #[tracing::instrument(name = "attn", skip_all)]
     pub fn forward(
         &self,
-        query: &Tensor<T, B>,
-        rope: &RotaryEmbedding<T, B>,
-        state: &mut StreamingMHAState<T, B>,
-        mask: Option<&Tensor<T, B>>,
-    ) -> Result<Tensor<T, B>> {
+        query: &Tensor<Q::T, Q::B>,
+        rope: &RotaryEmbedding<Q::T, Q::B>,
+        state: &mut StreamingMHAState<Q::T, Q::B>,
+        mask: Option<&Tensor<Q::T, Q::B>>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        use xn::ModuleT;
         let (b, t, _) = query.dims3()?;
         let d = self.embed_dim / self.num_heads;
         let projected = self.in_proj.forward(query)?;
@@ -122,7 +127,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         let v = v.transpose(1, 2)?;
 
         // Scaled dot-product attention
-        let scale = T::from_f32(1.0 / (d as f32).sqrt());
+        let scale = Q::T::from_f32(1.0 / (d as f32).sqrt());
         let attn = q.matmul_t(&k)?.scale(scale)?;
         let attn = match mask {
             Some(m) => attn.broadcast_add(m)?,
@@ -132,7 +137,7 @@ impl<T: WithDTypeF, B: Backend> StreamingMultiheadAttention<T, B> {
         let x = attn.matmul(&v)?;
 
         // Back to [b, t, h*d]
-        let x = x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?;
+        let x = x.transpose(1, 2)?.reshape((b, t, self.embed_dim))?.contiguous()?;
         self.out_proj.forward(&x)
     }
 }
@@ -282,9 +287,9 @@ impl<T: WithDTypeF, B: Backend> MimiStreamingMultiheadAttention<T, B> {
 
 // ---- StreamingTransformerLayer ----
 
-enum AttentionKind<T: WithDTypeF, B: Backend> {
-    Mimi(MimiStreamingMultiheadAttention<T, B>),
-    FlowLm(StreamingMultiheadAttention<T, B>),
+enum AttentionKind<Q: BackendQ> {
+    Mimi(MimiStreamingMultiheadAttention<Q::T, Q::B>),
+    FlowLm(StreamingMultiheadAttention<Q>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,19 +298,19 @@ pub enum Kind {
     FlowLm,
 }
 
-pub struct StreamingTransformerLayer<T: WithDTypeF, B: Backend> {
-    self_attn: AttentionKind<T, B>,
-    norm1: LayerNorm<T, B>,
-    norm2: LayerNorm<T, B>,
-    linear1: Linear<T, B>,
-    linear2: Linear<T, B>,
-    layer_scale_1: Option<LayerScale<T, B>>,
-    layer_scale_2: Option<LayerScale<T, B>>,
+pub struct StreamingTransformerLayer<Q: BackendQ> {
+    self_attn: AttentionKind<Q>,
+    norm1: LayerNorm<Q::T, Q::B>,
+    norm2: LayerNorm<Q::T, Q::B>,
+    linear1: Q::LinearQ,
+    linear2: Q::LinearQ,
+    layer_scale_1: Option<LayerScale<Q::T, Q::B>>,
+    layer_scale_2: Option<LayerScale<Q::T, Q::B>>,
 }
 
-impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
+impl<Q: BackendQ> StreamingTransformerLayer<Q> {
     pub fn load(
-        vb: &Path<B>,
+        vb: &Path<Q::B>,
         d_model: usize,
         num_heads: usize,
         dim_feedforward: usize,
@@ -330,7 +335,9 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
         let norm1 = LayerNorm::load(vb.pp("norm1"), d_model, 1e-5)?;
         let norm2 = LayerNorm::load(vb.pp("norm2"), d_model, 1e-5)?;
         let linear1 = Linear::load(vb.pp("linear1"), d_model, dim_feedforward)?;
+        let linear1 = Q::from_linear(linear1)?;
         let linear2 = Linear::load(vb.pp("linear2"), dim_feedforward, d_model)?;
+        let linear2 = Q::from_linear(linear2)?;
 
         let layer_scale_1 = if layer_scale.is_some() {
             Some(LayerScale::load(&vb.pp("layer_scale_1"), d_model)?)
@@ -350,7 +357,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
         &self,
         batch_size: usize,
         sequence_length: usize,
-    ) -> Result<LayerAttentionState<T, B>> {
+    ) -> Result<LayerAttentionState<Q::T, Q::B>> {
         let s = match &self.self_attn {
             AttentionKind::Mimi(attn) => LayerAttentionState::Mimi(attn.init_state()?),
             AttentionKind::FlowLm(attn) => {
@@ -363,11 +370,13 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
     #[tracing::instrument(name = "transformer-layer", skip_all)]
     pub fn forward(
         &self,
-        x: &Tensor<T, B>,
-        rope: &RotaryEmbedding<T, B>,
-        state: &mut LayerAttentionState<T, B>,
-        mask: Option<&Tensor<T, B>>,
-    ) -> Result<Tensor<T, B>> {
+        x: &Tensor<Q::T, Q::B>,
+        rope: &RotaryEmbedding<Q::T, Q::B>,
+        state: &mut LayerAttentionState<Q::T, Q::B>,
+        mask: Option<&Tensor<Q::T, Q::B>>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        use xn::ModuleT;
+
         // Self-attention block: x + layer_scale_1(attn(norm1(x)))
         let norm1 = self.norm1.forward(x)?;
         let mut attn_out = match (&self.self_attn, state) {
@@ -398,16 +407,16 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformerLayer<T, B> {
 
 // ---- StreamingTransformer ----
 
-pub struct StreamingTransformer<T: WithDTypeF, B: Backend> {
-    pub layers: Vec<StreamingTransformerLayer<T, B>>,
+pub struct StreamingTransformer<Q: BackendQ> {
+    pub layers: Vec<StreamingTransformerLayer<Q>>,
     max_period: f32,
     head_dim: usize,
 }
 
-impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
+impl<Q: BackendQ> StreamingTransformer<Q> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        vb: &Path<B>,
+        vb: &Path<Q::B>,
         d_model: usize,
         num_heads: usize,
         num_layers: usize,
@@ -438,7 +447,7 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
         &self,
         batch_size: usize,
         sequence_length: usize,
-    ) -> Result<StreamingTransformerState<T, B>> {
+    ) -> Result<StreamingTransformerState<Q::T, Q::B>> {
         let layer_states = self
             .layers
             .iter()
@@ -449,9 +458,9 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
 
     pub fn forward(
         &self,
-        x: &Tensor<T, B>,
-        state: &mut StreamingTransformerState<T, B>,
-    ) -> Result<Tensor<T, B>> {
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
         let mut x = x.clone();
         let (_, seq_len, _) = x.dims3()?;
         let mask = match state.layer_states.first() {
@@ -464,9 +473,9 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
                         let seq_idx = seq_idx + kv_seq_len;
                         (0..kv_seq_len + seq_len).map(move |attn_idx| {
                             if seq_idx.saturating_sub(context) <= attn_idx && attn_idx <= seq_idx {
-                                T::from_f32(0.0)
+                                Q::T::from_f32(0.0)
                             } else {
-                                T::from_f32(f32::NEG_INFINITY)
+                                Q::T::from_f32(f32::NEG_INFINITY)
                             }
                         })
                     })
@@ -499,16 +508,16 @@ impl<T: WithDTypeF, B: Backend> StreamingTransformer<T, B> {
 
 // ---- ProjectedTransformer ----
 
-pub struct ProjectedTransformer<T: WithDTypeF, B: Backend> {
-    pub transformer: StreamingTransformer<T, B>,
-    input_proj: Option<Linear<T, B>>,
-    output_projs: Vec<Option<Linear<T, B>>>,
+pub struct ProjectedTransformer<Q: BackendQ> {
+    pub transformer: StreamingTransformer<Q>,
+    input_proj: Option<Linear<Q::T, Q::B>>,
+    output_projs: Vec<Option<Linear<Q::T, Q::B>>>,
 }
 
-impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
+impl<Q: BackendQ> ProjectedTransformer<Q> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        vb: &Path<B>,
+        vb: &Path<Q::B>,
         input_dimension: usize,
         output_dimensions: &[usize],
         d_model: usize,
@@ -554,7 +563,7 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
         &self,
         batch_size: usize,
         sequence_length: usize,
-    ) -> Result<StreamingTransformerState<T, B>> {
+    ) -> Result<StreamingTransformerState<Q::T, Q::B>> {
         self.transformer.init_state(batch_size, sequence_length)
     }
 
@@ -562,9 +571,9 @@ impl<T: WithDTypeF, B: Backend> ProjectedTransformer<T, B> {
     #[tracing::instrument(name = "transformer", skip_all)]
     pub fn forward(
         &self,
-        x: &Tensor<T, B>,
-        state: &mut StreamingTransformerState<T, B>,
-    ) -> Result<Vec<Tensor<T, B>>> {
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut StreamingTransformerState<Q::T, Q::B>,
+    ) -> Result<Vec<Tensor<Q::T, Q::B>>> {
         // [B, C, T] -> [B, T, C]
         let x = x.transpose(1, 2)?.contiguous()?;
 

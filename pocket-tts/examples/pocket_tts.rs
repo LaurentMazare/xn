@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences};
 use xn::nn::VB;
-use xn::{Backend, Tensor};
+use xn::{Backend, Tensor, Unquantized};
 
 struct SpTokenizer(sentencepiece::SentencePieceProcessor);
 
@@ -274,7 +274,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     );
 
     let vb = VB::load_with_key_map(&[&model_path], dev.clone(), remap_key)?.root();
-    let model: TTSModel<f32, Dev> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
+    let model: TTSModel<Unquantized<f32, Dev>> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
             || v.starts_with("mimi.quantizer")

@@ -1,7 +1,7 @@
 use crate::flow_lm::{FlowLM, FlowLMConfig, FlowLMState};
 use crate::mimi::{MimiConfig, MimiModel, MimiState};
 use xn::nn::{Linear, var_builder::Path};
-use xn::{Backend, Result, Tensor, WithDTypeF};
+use xn::{BackendQ, Result, Tensor, Unquantized};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FuserConfig {
@@ -95,22 +95,22 @@ impl TTSConfig {
     }
 }
 
-pub struct TTSModel<T: WithDTypeF, B: Backend> {
-    pub flow_lm: FlowLM<T, B>,
-    pub mimi: MimiModel<T, B>,
-    speaker_proj: Option<Linear<T, B>>,
+pub struct TTSModel<Q: BackendQ> {
+    pub flow_lm: FlowLM<Q>,
+    pub mimi: MimiModel<Unquantized<f32, Q::B>>,
+    speaker_proj: Option<Linear<Q::T, Q::B>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
 }
 
 #[derive(Clone, Debug)]
-pub struct TTSState<T: WithDTypeF, B: Backend> {
-    pub flow_lm_state: FlowLMState<T, B>,
+pub struct TTSState<Q: BackendQ> {
+    pub flow_lm_state: FlowLMState<Q>,
 }
 
-impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
+impl<Q: BackendQ> TTSModel<Q> {
     pub fn load(
-        vb: &Path<B>,
+        vb: &Path<Q::B>,
         tokenizer: Box<dyn crate::Tokenizer + Send + Sync>,
         cfg: &TTSConfig,
     ) -> Result<Self> {
@@ -147,15 +147,17 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
         &self,
         batch_size: usize,
         sequence_length: usize,
-    ) -> Result<TTSState<T, B>> {
+    ) -> Result<TTSState<Q>> {
         Ok(TTSState { flow_lm_state: self.flow_lm.init_state(batch_size, sequence_length)? })
     }
 
     /// Encode audio for voice conditioning. Returns [1, T', dim].
-    pub fn encode_audio(&self, audio: &Tensor<T, B>) -> Result<Tensor<T, B>> {
-        let encoded = self.mimi.encode_to_latent(audio)?;
+    pub fn encode_audio(&self, audio: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
+        let f32_audio = audio.to::<f32>()?;
+        let encoded = self.mimi.encode_to_latent(&f32_audio)?;
         // [B, C, T] -> [B, T, C]
         let latents = encoded.transpose(1, 2)?.contiguous()?;
+        let latents = latents.to::<Q::T>()?;
         match self.speaker_proj.as_ref() {
             Some(p) => p.forward(&latents),
             None => Ok(latents),
@@ -163,7 +165,7 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
     }
 
     /// Run flow LM step with text tokens. Increments state.
-    pub fn prompt_text(&self, state: &mut TTSState<T, B>, text_tokens: &[u32]) -> Result<()> {
+    pub fn prompt_text(&self, state: &mut TTSState<Q>, text_tokens: &[u32]) -> Result<()> {
         let text_embeddings = self.flow_lm.conditioner.embed_tokens(text_tokens)?;
         let dev = text_embeddings.device();
         let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
@@ -174,7 +176,7 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
     /// Run flow LM step with text tokens. Increments state.
     pub fn prompt_text_with_padding(
         &self,
-        state: &mut TTSState<T, B>,
+        state: &mut TTSState<Q>,
         text_tokens: &[u32],
         pad_to: usize,
     ) -> Result<()> {
@@ -196,7 +198,7 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
         Ok(())
     }
 
-    pub fn prompt_text_null(&self, state: &mut TTSState<T, B>) -> Result<()> {
+    pub fn prompt_text_null(&self, state: &mut TTSState<Q>) -> Result<()> {
         let empty_text = match self.flow_lm.conditioner.learnt_padding() {
             None => xn::bail!("Model does not support null text prompt"),
             Some(p) => p,
@@ -210,8 +212,8 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
     /// Run flow LM step with audio conditioning. Increments state.
     pub fn prompt_audio(
         &self,
-        state: &mut TTSState<T, B>,
-        audio_conditioning: &Tensor<T, B>,
+        state: &mut TTSState<Q>,
+        audio_conditioning: &Tensor<Q::T, Q::B>,
     ) -> Result<()> {
         let dev = audio_conditioning.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
@@ -223,12 +225,13 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
 
     /// Run one autoregressive generation step.
     /// Returns (next_latent [B, 1, ldim], is_eos).
+    #[allow(clippy::type_complexity)]
     pub fn generate_step(
         &self,
-        state: &mut TTSState<T, B>,
-        backbone_input: &Tensor<T, B>,
+        state: &mut TTSState<Q>,
+        backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<T, B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
         let dev = backbone_input.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
 
@@ -244,14 +247,15 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
         Ok((latent, is_eos))
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn generate_step_cfg(
         &self,
-        state: &mut TTSState<T, B>,
-        null_state: &mut TTSState<T, B>,
+        state: &mut TTSState<Q>,
+        null_state: &mut TTSState<Q>,
         cfg_coef: f32,
-        backbone_input: &Tensor<T, B>,
+        backbone_input: &Tensor<Q::T, Q::B>,
         rng: &mut impl crate::flow_lm::Rng,
-    ) -> Result<(Tensor<T, B>, bool)> {
+    ) -> Result<(Tensor<Q::T, Q::B>, bool)> {
         let dev = backbone_input.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
 
@@ -272,28 +276,34 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
     /// Decode latent to audio using mimi (streaming).
     pub fn decode_latent(
         &self,
-        latent: &Tensor<T, B>,
-        mimi_state: &mut MimiState<T, B>,
-    ) -> Result<Tensor<T, B>> {
+        latent: &Tensor<Q::T, Q::B>,
+        mimi_state: &mut MimiState<f32, Q::B>,
+    ) -> Result<Tensor<f32, Q::B>> {
         let denorm =
             latent.broadcast_mul(&self.flow_lm.emb_std)?.broadcast_add(&self.flow_lm.emb_mean)?;
 
         // [B, T, C] -> [B, C, T]
         let transposed = denorm.transpose(1, 2)?.contiguous()?;
-        let quantized = self.mimi.quantizer.forward(&transposed)?;
+        // Convert from Q::T to f32 for mimi
+        let f32_transposed = transposed.to()?;
+        let quantized = self.mimi.quantizer.forward(&f32_transposed)?;
         self.mimi.decode_from_latent(&quantized, mimi_state)
     }
 
     /// Initialize mimi streaming state.
-    pub fn init_mimi_state(&self, batch_size: usize, context: usize) -> Result<MimiState<T, B>> {
+    pub fn init_mimi_state(
+        &self,
+        batch_size: usize,
+        context: usize,
+    ) -> Result<MimiState<f32, Q::B>> {
         self.mimi.init_state(batch_size, context)
     }
 
     fn run_backbone_and_increment(
         &self,
-        state: &mut TTSState<T, B>,
-        text_embeddings: &Tensor<T, B>,
-        backbone_input_latents: &Tensor<T, B>,
+        state: &mut TTSState<Q>,
+        text_embeddings: &Tensor<Q::T, Q::B>,
+        backbone_input_latents: &Tensor<Q::T, Q::B>,
     ) -> Result<()> {
         let input = self.flow_lm.input_linear.forward(backbone_input_latents)?;
         let input = Tensor::cat(&[text_embeddings, &input], 1)?;
@@ -302,7 +312,7 @@ impl<T: WithDTypeF, B: Backend> TTSModel<T, B> {
         Ok(())
     }
 
-    pub fn device(&self) -> &B {
+    pub fn device(&self) -> &Q::B {
         self.flow_lm.input_linear.device()
     }
 }

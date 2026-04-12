@@ -16,7 +16,7 @@ use ptts::mimi::MimiState;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
-use xn::{CPU, CpuDevice, Tensor, TypedTensor};
+use xn::{CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
 struct PresetTokenizer {
@@ -106,9 +106,9 @@ fn remap_key(name: &str) -> Option<String> {
 /// Creates a new TTSState with a larger seq_budget, copying the used KV entries
 /// from a cached state (which was allocated with a smaller budget).
 fn resize_tts_state(
-    cached: &TTSState<f32, CpuDevice>,
+    cached: &TTSState<Unquantized<f32, CpuDevice>>,
     new_seq_budget: usize,
-) -> xn::Result<TTSState<f32, CpuDevice>> {
+) -> xn::Result<TTSState<Unquantized<f32, CpuDevice>>> {
     console_log!("[resize_tts_state] resizing to seq_budget={new_seq_budget}");
     let mut new_layer_states = Vec::new();
     for layer_state in cached.flow_lm_state.transformer_state.layer_states.iter() {
@@ -145,7 +145,7 @@ fn resize_tts_state(
 }
 
 struct GenState {
-    tts_state: TTSState<f32, CpuDevice>,
+    tts_state: TTSState<Unquantized<f32, CpuDevice>>,
     mimi_state: MimiState<f32, CpuDevice>,
     prev_latent: Tensor<f32, CpuDevice>,
     rng: WasmRng,
@@ -157,11 +157,11 @@ struct GenState {
 
 #[wasm_bindgen]
 pub struct Model {
-    inner: TTSModel<f32, CpuDevice>,
+    inner: TTSModel<Unquantized<f32, CpuDevice>>,
     tokenizer: std::sync::Arc<PresetTokenizer>,
     cfg: TTSConfig,
     gen_state: Option<GenState>,
-    voice_states: Vec<TTSState<f32, CpuDevice>>,
+    voice_states: Vec<TTSState<Unquantized<f32, CpuDevice>>>,
 }
 
 impl Model {
@@ -173,7 +173,8 @@ impl Model {
         let tokenizer = std::sync::Arc::new(PresetTokenizer::new());
         let tokenizer_box: Box<dyn ptts::Tokenizer + Send + Sync> =
             Box::new(SharedTokenizer(std::sync::Arc::clone(&tokenizer)));
-        let model: TTSModel<f32, CpuDevice> = TTSModel::load(&root, tokenizer_box, &cfg)?;
+        let model: TTSModel<Unquantized<f32, CpuDevice>> =
+            TTSModel::load(&root, tokenizer_box, &cfg)?;
 
         Ok(Model { inner: model, tokenizer, cfg, gen_state: None, voice_states: Vec::new() })
     }
