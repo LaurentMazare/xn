@@ -313,3 +313,47 @@ impl QTensor {
         }
     }
 }
+
+pub struct QLinear {
+    weight: QTensor,
+    bias: Option<crate::Tensor<f32, crate::CpuDevice>>,
+}
+
+impl crate::ModuleT for QLinear {
+    type T = f32;
+    type B = crate::CpuDevice;
+
+    fn forward(
+        &self,
+        xs: &crate::Tensor<Self::T, Self::B>,
+    ) -> Result<crate::Tensor<Self::T, Self::B>> {
+        use crate::error::Context;
+
+        let weight = &self.weight;
+        let bias = &self.bias;
+        let (n, k) = self.weight.shape.dims2()?;
+        let src_shape = xs.shape();
+
+        if src_shape.rank() < 2 {
+            crate::bail!("input tensor has only one dimension {src_shape:?}")
+        }
+        let mut dst_shape = src_shape.dims().to_vec();
+        let last_k = dst_shape.pop().context("empty dst_shape")?;
+        if last_k != k {
+            crate::bail!("input tensor {src_shape:?} incompatible with {:?}", weight.shape)
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let mut dst = vec![0.0f32; dst_shape.elem_count()];
+        {
+            let xs = xs.storage()?;
+            self.weight.matmul_t((dst_shape.elem_count() / n, k, n), &xs, &mut dst)?;
+        }
+
+        let mut dst_t = crate::Tensor::from_vec(dst, dst_shape, &crate::CpuDevice)?;
+        if let Some(bias) = bias {
+            dst_t = dst_t.broadcast_add(bias)?;
+        }
+        Ok(dst_t)
+    }
+}
