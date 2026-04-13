@@ -379,41 +379,32 @@ impl QLinear {
     }
 }
 
-#[derive(Clone)]
-pub struct Q80F32;
+macro_rules! backend_q_f32 {
+    ($name:ident, $dtype:expr) => {
+        #[derive(Clone)]
+        pub struct $name;
 
-impl crate::BackendQ for Q80F32 {
-    type T = f32;
-    type B = crate::CpuDevice;
-    type LinearQ = QLinear;
+        impl crate::BackendQ for $name {
+            type T = f32;
+            type B = crate::CpuDevice;
+            type LinearQ = QLinear;
 
-    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
-        QLinear::from_linear(l, GgmlDType::Q8_0)
-    }
+            fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
+                QLinear::from_linear(l, $dtype)
+            }
+        }
+    };
 }
 
-#[derive(Clone)]
-pub struct Q8kF32;
-
-impl crate::BackendQ for Q8kF32 {
-    type T = f32;
-    type B = crate::CpuDevice;
-    type LinearQ = QLinear;
-
-    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
-        QLinear::from_linear(l, GgmlDType::Q8K)
-    }
-}
-
-#[derive(Clone)]
-pub struct Q6kF32;
-
-impl crate::BackendQ for Q6kF32 {
-    type T = f32;
-    type B = crate::CpuDevice;
-    type LinearQ = QLinear;
-
-    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
-        QLinear::from_linear(l, GgmlDType::Q6K)
-    }
-}
+backend_q_f32!(Q40F32, GgmlDType::Q4_0);
+backend_q_f32!(Q41F32, GgmlDType::Q4_1);
+backend_q_f32!(Q50F32, GgmlDType::Q5_0);
+backend_q_f32!(Q51F32, GgmlDType::Q5_1);
+backend_q_f32!(Q80F32, GgmlDType::Q8_0);
+backend_q_f32!(Q81F32, GgmlDType::Q8_1);
+backend_q_f32!(Q2kF32, GgmlDType::Q2K);
+backend_q_f32!(Q3kF32, GgmlDType::Q3K);
+backend_q_f32!(Q4kF32, GgmlDType::Q4K);
+backend_q_f32!(Q5kF32, GgmlDType::Q5K);
+backend_q_f32!(Q6kF32, GgmlDType::Q6K);
+backend_q_f32!(Q8kF32, GgmlDType::Q8K);

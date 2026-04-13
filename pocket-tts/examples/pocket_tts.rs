@@ -53,8 +53,8 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cpu: bool,
 
-    #[arg(long, default_value_t = false)]
-    q8: bool,
+    #[arg(long)]
+    quant: Option<String>,
 
     #[arg(long)]
     chrome_tracing: bool,
@@ -153,12 +153,52 @@ fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
 }
 
 fn run_cpu(args: Args) -> Result<()> {
-    if args.q8 {
-        tracing::info!("using cpu q8 backend");
-        run_for_device::<xn::quantized::Q80F32>(args, xn::CPU)
-    } else {
-        tracing::info!("using cpu backend");
-        run_for_device::<xn::Unquantized<f32, _>>(args, xn::CPU)
+    match args.quant.as_deref() {
+        None => {
+            tracing::info!("using cpu backend");
+            run_for_device::<xn::Unquantized<f32, _>>(args, xn::CPU)
+        }
+        Some("q8" | "q8_0") => {
+            tracing::info!("using cpu q8 backend");
+            run_for_device::<xn::quantized::Q80F32>(args, xn::CPU)
+        }
+        Some("q8_1") => {
+            tracing::info!("using cpu q8_1 backend");
+            run_for_device::<xn::quantized::Q81F32>(args, xn::CPU)
+        }
+        Some("q8k") => {
+            tracing::info!("using cpu q8k backend");
+            run_for_device::<xn::quantized::Q8kF32>(args, xn::CPU)
+        }
+        Some("q6k") => {
+            tracing::info!("using cpu q6k backend");
+            run_for_device::<xn::quantized::Q6kF32>(args, xn::CPU)
+        }
+        Some("q5" | "q5_0") => {
+            tracing::info!("using cpu q5 backend");
+            run_for_device::<xn::quantized::Q50F32>(args, xn::CPU)
+        }
+        Some("q5_1") => {
+            tracing::info!("using cpu q5_1 backend");
+            run_for_device::<xn::quantized::Q51F32>(args, xn::CPU)
+        }
+        Some("q5k") => {
+            tracing::info!("using cpu q5k backend");
+            run_for_device::<xn::quantized::Q5kF32>(args, xn::CPU)
+        }
+        Some("q4" | "q4_0") => {
+            tracing::info!("using cpu q4 backend");
+            run_for_device::<xn::quantized::Q40F32>(args, xn::CPU)
+        }
+        Some("q4_1") => {
+            tracing::info!("using cpu q4_1 backend");
+            run_for_device::<xn::quantized::Q41F32>(args, xn::CPU)
+        }
+        Some("q4k") => {
+            tracing::info!("using cpu q4k backend");
+            run_for_device::<xn::quantized::Q4kF32>(args, xn::CPU)
+        }
+        Some(other) => anyhow::bail!("unsupported quantization option '{other}'"),
     }
 }
 fn main() -> Result<()> {
