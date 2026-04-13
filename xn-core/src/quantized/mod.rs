@@ -20,11 +20,6 @@ use half::f16;
 
 pub use k_quants::GgmlType;
 
-pub enum CpuStorage {
-    F16(Vec<f16>),
-    F32(Vec<f32>),
-}
-
 pub struct QTensor {
     storage: QStorage,
     shape: Shape,
@@ -62,7 +57,7 @@ impl QStorage {
         Ok(())
     }
 
-    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+    fn dequantize(&self, elem_count: usize) -> Result<Vec<f32>> {
         match self {
             QStorage::Cpu(storage) => storage.dequantize(elem_count),
         }
@@ -199,7 +194,7 @@ impl GgmlDType {
 pub trait QuantizedType: Send + Sync {
     fn dtype(&self) -> GgmlDType;
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()>;
-    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage>;
+    fn dequantize(&self, elem_count: usize) -> Result<Vec<f32>>;
     fn storage_size_in_bytes(&self) -> usize;
     fn as_ptr(&self) -> *const u8;
     fn block_size(&self) -> usize;
@@ -229,10 +224,10 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
         T::BLCK_SIZE
     }
 
-    fn dequantize(&self, elem_count: usize) -> Result<CpuStorage> {
+    fn dequantize(&self, elem_count: usize) -> Result<Vec<f32>> {
         let mut ys = vec![0.0f32; elem_count];
         T::to_float(self.as_slice(), &mut ys)?;
-        Ok(CpuStorage::F32(ys))
+        Ok(ys)
     }
 
     fn storage_size_in_bytes(&self) -> usize {
@@ -295,7 +290,7 @@ impl QTensor {
         &self.shape
     }
 
-    pub fn dequantize(&self) -> Result<CpuStorage> {
+    pub fn dequantize(&self) -> Result<Vec<f32>> {
         self.storage.dequantize(self.shape.elem_count())
     }
 
