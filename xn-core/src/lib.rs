@@ -86,7 +86,7 @@ impl<M: ModuleT> ModuleT for Option<&M> {
     }
 }
 
-pub trait BackendQ: Clone {
+pub trait BackendQ: Clone + 'static {
     type T: WithDTypeF;
     type B: Backend;
     type LinearQ: ModuleT<T = Self::T, B = Self::B> + Send + Sync;
