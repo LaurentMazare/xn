@@ -3,6 +3,7 @@
 #include "cuda_utils.cuh"
 #include "vectorization_utils.cuh"
 #include <cuda_fp8.h>
+#include <cub/cub.cuh>
 #include <tuple>
 
 // ---------------------------------------------------------------------------
@@ -356,5 +357,96 @@ extern "C" __global__ void fp8_dequant_f32(
     for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
          i += blockDim.x * gridDim.x) {
         out[i] = static_cast<float>(input[i]) * s;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-token quantization: extern "C" instantiations
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void dynamic_per_token_scaled_fp8_quant_bf16(
+    __nv_fp8_e4m3 *__restrict__ out,
+    float *__restrict__ scale,
+    const __nv_bfloat16 *__restrict__ input,
+    const float *__restrict__ scale_ub,
+    int hidden_size,
+    long long in_row_stride,
+    long long out_row_stride
+) {
+    dynamic_per_token_scaled_fp8_quant_kernel_strided<__nv_bfloat16, fp8_e4m3>(
+        out, scale, input, scale_ub, hidden_size, in_row_stride, out_row_stride);
+}
+
+extern "C" __global__ void dynamic_per_token_scaled_fp8_quant_f16(
+    __nv_fp8_e4m3 *__restrict__ out,
+    float *__restrict__ scale,
+    const __half *__restrict__ input,
+    const float *__restrict__ scale_ub,
+    int hidden_size,
+    long long in_row_stride,
+    long long out_row_stride
+) {
+    dynamic_per_token_scaled_fp8_quant_kernel_strided<__half, fp8_e4m3>(
+        out, scale, input, scale_ub, hidden_size, in_row_stride, out_row_stride);
+}
+
+extern "C" __global__ void dynamic_per_token_scaled_fp8_quant_f32(
+    __nv_fp8_e4m3 *__restrict__ out,
+    float *__restrict__ scale,
+    const float *__restrict__ input,
+    const float *__restrict__ scale_ub,
+    int hidden_size,
+    long long in_row_stride,
+    long long out_row_stride
+) {
+    dynamic_per_token_scaled_fp8_quant_kernel_strided<float, fp8_e4m3>(
+        out, scale, input, scale_ub, hidden_size, in_row_stride, out_row_stride);
+}
+
+// ---------------------------------------------------------------------------
+// Per-token dequantization
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void fp8_dequant_per_token_bf16(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_fp8_e4m3 *__restrict__ input,
+    const float *__restrict__ scale,
+    const unsigned int numel,
+    const int hidden_size
+) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
+         i += blockDim.x * gridDim.x) {
+        int token_idx = i / hidden_size;
+        float v = static_cast<float>(input[i]) * scale[token_idx];
+        out[i] = __float2bfloat16(v);
+    }
+}
+
+extern "C" __global__ void fp8_dequant_per_token_f16(
+    __half *__restrict__ out,
+    const __nv_fp8_e4m3 *__restrict__ input,
+    const float *__restrict__ scale,
+    const unsigned int numel,
+    const int hidden_size
+) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
+         i += blockDim.x * gridDim.x) {
+        int token_idx = i / hidden_size;
+        float v = static_cast<float>(input[i]) * scale[token_idx];
+        out[i] = __float2half(v);
+    }
+}
+
+extern "C" __global__ void fp8_dequant_per_token_f32(
+    float *__restrict__ out,
+    const __nv_fp8_e4m3 *__restrict__ input,
+    const float *__restrict__ scale,
+    const unsigned int numel,
+    const int hidden_size
+) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < numel;
+         i += blockDim.x * gridDim.x) {
+        int token_idx = i / hidden_size;
+        out[i] = static_cast<float>(input[i]) * scale[token_idx];
     }
 }
