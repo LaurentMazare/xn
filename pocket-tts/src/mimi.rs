@@ -5,7 +5,7 @@ use crate::resample::{ConvDownsample1d, ConvTrUpsample1d};
 use crate::seanet::{SEANetDecoder, SEANetDecoderState, SEANetEncoder, SEANetEncoderState};
 use crate::transformer::{ProjectedTransformer, StreamingTransformerState};
 use xn::nn::var_builder::Path;
-use xn::{Backend, Result, Tensor, WithDTypeF};
+use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MimiConfig {
@@ -33,14 +33,14 @@ pub struct MimiConfig {
     pub transformer_dim_feedforward: usize,
 }
 
-pub struct MimiModel<T: WithDTypeF, B: Backend> {
-    encoder: SEANetEncoder<T, B>,
-    decoder: SEANetDecoder<T, B>,
-    encoder_transformer: ProjectedTransformer<T, B>,
-    decoder_transformer: ProjectedTransformer<T, B>,
-    pub quantizer: DummyQuantizer<T, B>,
-    downsample: Option<ConvDownsample1d<T, B>>,
-    upsample: Option<ConvTrUpsample1d<T, B>>,
+pub struct MimiModel<Q: BackendQ> {
+    encoder: SEANetEncoder<Q::T, Q::B>,
+    decoder: SEANetDecoder<Q::T, Q::B>,
+    encoder_transformer: ProjectedTransformer<Q>,
+    decoder_transformer: ProjectedTransformer<Q>,
+    pub quantizer: DummyQuantizer<Q::T, Q::B>,
+    downsample: Option<ConvDownsample1d<Q::T, Q::B>>,
+    upsample: Option<ConvTrUpsample1d<Q::T, Q::B>>,
     frame_rate: f64,
     _encoder_frame_rate: f64,
     pub sample_rate: usize,
@@ -57,8 +57,8 @@ pub struct MimiState<T: WithDTypeF, B: Backend> {
     upsample_state: Option<StreamingConvTr1dState<T, B>>,
 }
 
-impl<T: WithDTypeF, B: Backend> MimiModel<T, B> {
-    pub fn load(vb: &Path<B>, cfg: &MimiConfig) -> Result<Self> {
+impl<Q: BackendQ> MimiModel<Q> {
+    pub fn load(vb: &Path<Q::B>, cfg: &MimiConfig) -> Result<Self> {
         let pad_mode = crate::conv::PadMode::Constant;
 
         let encoder = SEANetEncoder::load(
@@ -156,7 +156,11 @@ impl<T: WithDTypeF, B: Backend> MimiModel<T, B> {
         (self.sample_rate as f64 / self.frame_rate).round() as usize
     }
 
-    pub fn init_state(&self, batch_size: usize, sequence_length: usize) -> Result<MimiState<T, B>> {
+    pub fn init_state(
+        &self,
+        batch_size: usize,
+        sequence_length: usize,
+    ) -> Result<MimiState<Q::T, Q::B>> {
         let upsample_state = match &self.upsample {
             Some(us) => Some(us.init_state(batch_size)?),
             None => None,
@@ -181,7 +185,7 @@ impl<T: WithDTypeF, B: Backend> MimiModel<T, B> {
     }
 
     /// Encode audio to latent (non-streaming). Returns [B, C, T'].
-    pub fn encode_to_latent(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    pub fn encode_to_latent(&self, x: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
         let frame_size = self.frame_size();
         let x = pad_for_conv1d(x, frame_size, frame_size)?;
         let mut enc_state = self.encoder.init_state(x.dim(0usize)?)?;
@@ -199,9 +203,9 @@ impl<T: WithDTypeF, B: Backend> MimiModel<T, B> {
     /// Decode from latent to audio (streaming). Input: [B, C, T'].
     pub fn decode_from_latent(
         &self,
-        latent: &Tensor<T, B>,
-        state: &mut MimiState<T, B>,
-    ) -> Result<Tensor<T, B>> {
+        latent: &Tensor<Q::T, Q::B>,
+        state: &mut MimiState<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
         // Upsample to encoder frame rate
         let emb = match (&self.upsample, &mut state.upsample_state) {
             (Some(us), Some(us_state)) => us.forward(latent, us_state)?,

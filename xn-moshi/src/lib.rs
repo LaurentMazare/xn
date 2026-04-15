@@ -1,5 +1,4 @@
 pub mod asr;
-pub mod batched_transformer;
 pub mod conditioners;
 pub mod conv;
 pub mod lm;

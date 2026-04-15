@@ -4,8 +4,8 @@ mod audio_helpers;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ptts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences};
+use xn::Tensor;
 use xn::nn::VB;
-use xn::{Backend, Tensor};
 
 struct SpTokenizer(sentencepiece::SentencePieceProcessor);
 
@@ -52,6 +52,9 @@ struct Args {
     /// Use the cpu device even if cuda is available
     #[arg(long, default_value_t = false)]
     cpu: bool,
+
+    #[arg(long)]
+    quant: Option<String>,
 
     #[arg(long)]
     chrome_tracing: bool,
@@ -149,6 +152,55 @@ fn init_tracing(chrome_tracing: bool) -> Option<tracing_chrome::FlushGuard> {
     }
 }
 
+fn run_cpu(args: Args) -> Result<()> {
+    match args.quant.as_deref() {
+        None => {
+            tracing::info!("using cpu backend");
+            run_for_device::<xn::Unquantized<f32, _>>(args, xn::CPU)
+        }
+        Some("q8" | "q8_0") => {
+            tracing::info!("using cpu q8 backend");
+            run_for_device::<xn::quantized::Q80F32>(args, xn::CPU)
+        }
+        Some("q8_1") => {
+            tracing::info!("using cpu q8_1 backend");
+            run_for_device::<xn::quantized::Q81F32>(args, xn::CPU)
+        }
+        Some("q8k") => {
+            tracing::info!("using cpu q8k backend");
+            run_for_device::<xn::quantized::Q8kF32>(args, xn::CPU)
+        }
+        Some("q6k") => {
+            tracing::info!("using cpu q6k backend");
+            run_for_device::<xn::quantized::Q6kF32>(args, xn::CPU)
+        }
+        Some("q5" | "q5_0") => {
+            tracing::info!("using cpu q5 backend");
+            run_for_device::<xn::quantized::Q50F32>(args, xn::CPU)
+        }
+        Some("q5_1") => {
+            tracing::info!("using cpu q5_1 backend");
+            run_for_device::<xn::quantized::Q51F32>(args, xn::CPU)
+        }
+        Some("q5k") => {
+            tracing::info!("using cpu q5k backend");
+            run_for_device::<xn::quantized::Q5kF32>(args, xn::CPU)
+        }
+        Some("q4" | "q4_0") => {
+            tracing::info!("using cpu q4 backend");
+            run_for_device::<xn::quantized::Q40F32>(args, xn::CPU)
+        }
+        Some("q4_1") => {
+            tracing::info!("using cpu q4_1 backend");
+            run_for_device::<xn::quantized::Q41F32>(args, xn::CPU)
+        }
+        Some("q4k") => {
+            tracing::info!("using cpu q4k backend");
+            run_for_device::<xn::quantized::Q4kF32>(args, xn::CPU)
+        }
+        Some(other) => anyhow::bail!("unsupported quantization option '{other}'"),
+    }
+}
 fn main() -> Result<()> {
     let args = Args::parse();
     let _guard = init_tracing(args.chrome_tracing);
@@ -156,8 +208,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         if args.cpu {
-            tracing::info!("using cpu backend");
-            run_for_device(args, xn::CPU)?;
+            run_cpu(args)?;
         } else {
             tracing::info!("using cuda backend");
             let dev = xn::cuda_backend::Device::new(0)?;
@@ -169,8 +220,7 @@ fn main() -> Result<()> {
     }
     #[cfg(not(feature = "cuda"))]
     {
-        tracing::info!("using cpu backend");
-        run_for_device(args, xn::CPU)?;
+        run_cpu(args)?;
     }
 
     Ok(())
@@ -231,7 +281,7 @@ where
     })
 }
 
-fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
+fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> Result<()> {
     let (model_path, tokenizer_path, voice, cfg) = match args.config.as_ref() {
         Some(config) => {
             let config = std::fs::canonicalize(config)?;
@@ -274,7 +324,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     );
 
     let vb = VB::load_with_key_map(&[&model_path], dev.clone(), remap_key)?.root();
-    let model: TTSModel<f32, Dev> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
+    let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
             || v.starts_with("mimi.quantizer")
@@ -318,7 +368,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
                 let voice_dims = voice_shape.dims();
 
                 // Load as raw tensor and reshape to [1, T, dim]
-                let voice_emb: Tensor<f32, Dev> =
+                let voice_emb: Tensor<f32, Q::B> =
                     voice_vb.tensor(voice_key, voice_shape.clone())?;
                 let voice_emb = if voice_dims.len() == 2 {
                     voice_emb.reshape((1, voice_dims[0], voice_dims[1]))?
@@ -375,6 +425,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let start = std::time::Instant::now();
     tracing::info!("starting generation...");
     let mut all_audios = vec![];
+    let mut backbone_step_timings_ms = vec![];
     let model = std::sync::Arc::new(model);
     for (tokens, max_frames, frames_after_eos) in all_tokens.into_iter() {
         tracing::info!("prompting with text conditioning ({} tokens)...", tokens.len());
@@ -395,7 +446,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         // BOS marker: NaN tensor [1, 1, ldim]
         let ldim = cfg.flow_lm.ldim;
         let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-        let mut prev_latent: Tensor<f32, Dev> = Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?;
+        let mut prev_latent: Tensor<f32, Q::B> = Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?;
 
         let mut eos_countdown: Option<usize> = None;
 
@@ -406,7 +457,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
             let model = model.clone();
             let is_done = is_done.clone();
             move || {
-                let mut audio_chunks: Vec<Tensor<f32, Dev>> = Vec::new();
+                let mut audio_chunks: Vec<Tensor<f32, Q::B>> = Vec::new();
                 if wait_to_decode {
                     tracing::info!("waiting for generation to finish before decoding...");
                     while !is_done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -419,7 +470,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
                     audio_chunks.push(audio_chunk);
                 }
                 // Concatenate audio
-                let audio_refs: Vec<&Tensor<f32, Dev>> = audio_chunks.iter().collect();
+                let audio_refs: Vec<&Tensor<f32, Q::B>> = audio_chunks.iter().collect();
                 let audio = Tensor::cat(&audio_refs, 2)?;
                 let audio = audio.narrow(0, ..1)?.contiguous()?;
                 Ok::<_, anyhow::Error>(audio)
@@ -427,6 +478,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         });
 
         for step in 0..max_frames {
+            let step_start = std::time::Instant::now();
             let (next_latent, is_eos) = match cfg_state.as_mut() {
                 Some((coef, null_state)) => model.generate_step_cfg(
                     &mut tts_state,
@@ -437,6 +489,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
                 )?,
                 None => model.generate_step(&mut tts_state, &prev_latent, &mut rng)?,
             };
+            backbone_step_timings_ms.push(step_start.elapsed().as_secs_f64() * 1000.0);
             latent_tx.send(next_latent.clone())?;
 
             if is_eos && eos_countdown.is_none() {
@@ -462,7 +515,7 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
         let audio = jh.join().map_err(|_| anyhow::anyhow!("cannot join thread"))?;
         all_audios.push(audio);
     }
-    let all_audios = all_audios.iter().collect::<Vec<&Tensor<f32, Dev>>>();
+    let all_audios = all_audios.iter().collect::<Vec<&Tensor<f32, Q::B>>>();
     let audio = Tensor::cat(&all_audios, 2)?;
     let pcm = audio.to_vec()?;
     let duration = pcm.len() as f64 / cfg.mimi.sample_rate as f64;
@@ -470,6 +523,12 @@ fn run_for_device<Dev: Backend>(args: Args, dev: Dev) -> Result<()> {
     let elapsed = start.elapsed().as_secs_f64();
     let rtf = duration / elapsed;
     tracing::info!("generated {duration:.2}s in {elapsed:.2}s (RTF={rtf:.3})");
+    let nsteps = backbone_step_timings_ms.len();
+    tracing::info!(
+        ?nsteps,
+        "average backbone step time: {:.2}ms",
+        backbone_step_timings_ms.iter().sum::<f64>() / nsteps as f64
+    );
 
     // Write WAV
     let output_file = std::fs::File::create(&args.output)?;

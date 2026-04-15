@@ -37,6 +37,7 @@ pub enum Fp8ScaleMode {
     PerToken,
 }
 
+#[derive(Clone)]
 pub struct Fp8Tensor {
     pub data: CudaSlice<u8>,
     pub scales: CudaSlice<f32>,
@@ -331,6 +332,7 @@ pub fn quantize_fp8_per_token<T: Fp8Quantizable>(
     })
 }
 
+#[derive(Clone)]
 // A linear layer with FP8-quantized weights.
 ///
 /// Weights are stored as `Fp8Tensor` (quantized once at load time).
@@ -383,5 +385,24 @@ impl Fp8Linear {
             Some(b) => out.broadcast_add(b),
             None => Ok(out),
         }
+    }
+}
+
+impl crate::ModuleT for Fp8Linear {
+    type T = bf16;
+    type B = Device;
+    fn forward(&self, xs: &Tensor<Self::T, Self::B>) -> Result<Tensor<Self::T, Self::B>> {
+        self.forward(xs)
+    }
+}
+
+impl crate::BackendQ for Fp8Linear {
+    type T = bf16;
+    type B = Device;
+    type LinearQ = Fp8Linear;
+
+    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
+        let weight = Fp8Tensor::quantize(l.weight())?;
+        Ok(Self::LinearQ::new(weight, l.bias().cloned()))
     }
 }

@@ -1,8 +1,7 @@
-use crate::batched_transformer::{self as bt, BatchedTransformerState};
-use crate::transformer::{self, Config as TransformerConfig, Norm};
+use crate::transformer::{self, BatchedTransformerState, Config as TransformerConfig, Norm};
 use xn::nn::{Embedding, Linear, var_builder::Path};
 use xn::streaming::StreamMask;
-use xn::{Backend, Result, Tensor, WithDTypeF};
+use xn::{BackendQ, Result, Tensor};
 
 // ============================================================================
 // Config
@@ -126,35 +125,37 @@ impl Config {
 // State
 // ============================================================================
 
-pub struct LmState<T: WithDTypeF, B: Backend> {
-    pub model: std::sync::Arc<LmModel<T, B>>,
-    pub transformer: BatchedTransformerState<T, B>,
+pub struct LmState<Q: BackendQ> {
+    pub model: std::sync::Arc<LmModel<Q>>,
+    pub transformer: BatchedTransformerState<Q::T, Q::B>,
 }
 
 // ============================================================================
 // LmModel
 // ============================================================================
 
-pub struct LmModel<T: WithDTypeF, B: Backend> {
-    transformer: bt::BatchedTransformer<T, B>,
-    text_emb: Embedding<T, B>,        // (text_in_vocab_size, d_model)
-    audio_embs: Vec<Embedding<T, B>>, // each (audio_vocab_size, d_model)
-    text_linear: Linear<T, B>,        // (text_out_vocab_size, d_model)
-    out_norm: Norm<T, B>,
-    extra_heads: Vec<Linear<T, B>>, // each (dim, d_model)
+pub struct LmModel<Q: BackendQ> {
+    transformer: transformer::BatchedTransformer<Q>,
+    text_emb: Embedding<Q::T, Q::B>, // (text_in_vocab_size, d_model)
+    audio_embs: Vec<Embedding<Q::T, Q::B>>, // each (audio_vocab_size, d_model)
+    text_linear: Q::LinearQ,
+    out_norm: Norm<Q::T, Q::B>,
+    extra_heads: Vec<Q::LinearQ>, // each (dim, d_model)
     audio_vocab_size: usize,
     text_in_vocab_size: usize,
 }
 
-impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
-    pub fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
+impl<Q: BackendQ> LmModel<Q> {
+    pub fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         let d_model = cfg.transformer.d_model;
 
         let text_emb = Embedding::load(vb.pp("text_emb"), cfg.text_in_vocab_size, d_model)?;
         let out_norm = Norm::load(vb.pp("out_norm"), d_model, cfg.transformer.norm)?;
         let text_linear = Linear::load(vb.pp("text_linear"), d_model, cfg.text_out_vocab_size)?;
+        let text_linear = Q::from_linear(text_linear)?;
 
-        let transformer = bt::BatchedTransformer::load(&vb.pp("transformer"), &cfg.transformer)?;
+        let transformer =
+            transformer::BatchedTransformer::load(&vb.pp("transformer"), &cfg.transformer)?;
 
         let vb_e = vb.pp("emb");
         let mut audio_embs = Vec::with_capacity(cfg.audio_codebooks);
@@ -167,6 +168,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         if let Some(ExtraHeadsConfig { num_heads, dim }) = &cfg.extra_heads {
             for i in 0..*num_heads {
                 let head = Linear::load(vb.pp("extra_heads").pp(i), d_model, *dim)?;
+                let head = Q::from_linear(head)?;
                 extra_heads.push(head);
             }
         }
@@ -183,7 +185,7 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         })
     }
 
-    pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<LmState<T, B>> {
+    pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<LmState<Q>> {
         Ok(LmState { model: self.clone(), transformer: self.transformer.init_state(batch_size)? })
     }
 
@@ -199,23 +201,25 @@ impl<T: WithDTypeF, B: Backend> LmModel<T, B> {
         self.audio_embs.len()
     }
 
-    pub fn device(&self) -> &B {
+    pub fn device(&self) -> &Q::B {
         self.text_emb.device()
     }
 }
 
-impl<T: WithDTypeF, B: Backend> LmState<T, B> {
+impl<Q: BackendQ> LmState<Q> {
     /// Forward pass returning (text_logits, transformer_output).
     ///
     /// `text_ids`: token IDs per batch element (batch_size,), or None for zeros.
     /// `audio_ids`: per-codebook token IDs, each (batch_size,) or None to skip.
+    #[allow(clippy::type_complexity)]
     pub fn forward(
         &mut self,
         text_ids: Option<&[u32]>,
         audio_ids: &[Option<&[u32]>],
         mask: &StreamMask,
-        condition: Option<&Tensor<T, B>>,
-    ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
+        condition: Option<&Tensor<Q::T, Q::B>>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        use xn::ModuleT;
         let model = &self.model;
         // Text embedding: forward gives (batch, d_model), unsqueeze to (batch, 1, d_model)
         let mut emb = match text_ids {
@@ -260,7 +264,8 @@ impl<T: WithDTypeF, B: Backend> LmState<T, B> {
     }
 
     /// Compute extra head outputs from transformer output.
-    pub fn extra_heads(&self, ys: &Tensor<T, B>) -> Result<Vec<Tensor<T, B>>> {
+    pub fn extra_heads(&self, ys: &Tensor<Q::T, Q::B>) -> Result<Vec<Tensor<Q::T, Q::B>>> {
+        use xn::ModuleT;
         let mut results = Vec::with_capacity(self.model.extra_heads.len());
         for head in &self.model.extra_heads {
             results.push(head.forward(ys)?);

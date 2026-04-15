@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "ptts"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-pyo3"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "hf-hub",
  "numpy",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "ptts-wasm"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
@@ -3076,10 +3076,11 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
 name = "xn"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "bindgen_cuda",
+ "byteorder",
  "clap",
  "cudarc",
  "gemm",
@@ -3107,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "xn-moshi"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "clap",

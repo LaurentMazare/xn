@@ -1,4 +1,4 @@
-use crate::{batched_transformer as bt, conv, quantization, seanet, transformer};
+use crate::{conv, quantization, seanet, transformer as bt, transformer};
 use xn::nn::var_builder::Path;
 use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
@@ -124,8 +124,8 @@ impl<T: WithDTypeF, B: Backend> MimiDecodeState<T, B> {
 pub struct Mimi<T: WithDTypeF, B: Backend> {
     encoder: seanet::SeaNetEncoder<T, B>,
     decoder: seanet::SeaNetDecoder<T, B>,
-    encoder_transformer: bt::BatchedProjectedTransformer<T, B>,
-    decoder_transformer: bt::BatchedProjectedTransformer<T, B>,
+    encoder_transformer: bt::BatchedProjectedTransformer<xn::Unquantized<T, B>>,
+    decoder_transformer: bt::BatchedProjectedTransformer<xn::Unquantized<T, B>>,
     downsample: conv::ConvDownsample1d<T, B>,
     upsample: conv::ConvTrUpsample1d<T, B>,
     quantizer: quantization::SplitResidualVectorQuantizer<T, B>,

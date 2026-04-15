@@ -10,18 +10,23 @@ pub enum DType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DTypeF {
+pub enum DTypeQ {
+    Fp8,
     F16,
     BF16,
     F32,
 }
 
-impl From<DTypeF> for DType {
-    fn from(dtype_f: DTypeF) -> Self {
-        match dtype_f {
-            DTypeF::F16 => DType::F16,
-            DTypeF::BF16 => DType::BF16,
-            DTypeF::F32 => DType::F32,
+impl std::str::FromStr for DTypeQ {
+    type Err = crate::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "fp8" => Ok(DTypeQ::Fp8),
+            "f16" => Ok(DTypeQ::F16),
+            "bf16" => Ok(DTypeQ::BF16),
+            "f32" => Ok(DTypeQ::F32),
+            _ => crate::bail!("Invalid DTypeQ: {s}"),
         }
     }
 }

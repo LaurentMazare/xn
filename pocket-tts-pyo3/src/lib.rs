@@ -3,7 +3,7 @@ use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use xn::nn::VB;
-use xn::{Tensor, error::Context};
+use xn::{Tensor, Unquantized, error::Context};
 
 struct StdRng {
     inner: rand::rngs::StdRng,
@@ -53,7 +53,7 @@ const VOICES: &[&str] =
     &["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"];
 
 struct ModelB<B: xn::Backend> {
-    inner: Arc<TTSModel<f32, B>>,
+    inner: Arc<TTSModel<Unquantized<f32, B>>>,
     voices: std::collections::HashMap<String, Tensor<f32, B>>,
 }
 
@@ -172,9 +172,9 @@ impl Model {
 }
 
 struct ModelStateB<B: xn::Backend> {
-    model: Arc<TTSModel<f32, B>>,
-    state: TTSState<f32, B>,
-    cfg_state: Option<(f32, TTSState<f32, B>)>,
+    model: Arc<TTSModel<Unquantized<f32, B>>>,
+    state: TTSState<Unquantized<f32, B>>,
+    cfg_state: Option<(f32, TTSState<Unquantized<f32, B>>)>,
 }
 
 enum ModelStateV {
@@ -196,9 +196,9 @@ fn check_py_interrupt() -> xn::Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn run_generate<B: xn::Backend>(
-    model: Arc<TTSModel<f32, B>>,
-    mut state: TTSState<f32, B>,
-    mut cfg_state: Option<(f32, TTSState<f32, B>)>,
+    model: Arc<TTSModel<Unquantized<f32, B>>>,
+    mut state: TTSState<Unquantized<f32, B>>,
+    mut cfg_state: Option<(f32, TTSState<Unquantized<f32, B>>)>,
     tokens: Vec<u32>,
     temperature: f32,
     seed: u64,
