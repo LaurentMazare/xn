@@ -162,21 +162,6 @@ impl MatmulDesc {
         }
         Ok(())
     }
-
-    /// Set a matmul descriptor attribute using a raw attribute ID.
-    /// Used for attributes that are not in all cudarc enum variants (e.g. the
-    /// CUDA-12.8+-only scale mode attributes).
-    fn set_attr_raw<T>(&self, attr_id: u32, val: &T) -> Result<(), CublasError> {
-        unsafe {
-            cudarc::cublaslt::result::set_matmul_desc_attribute(
-                self.handle,
-                std::mem::transmute(attr_id),
-                val as *const T as *const _,
-                std::mem::size_of::<T>(),
-            )?;
-        }
-        Ok(())
-    }
 }
 
 impl Drop for MatmulDesc {
@@ -263,13 +248,8 @@ impl CudaBlasLT {
         let fp8_type = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
         let bf16_type = lt_sys::cudaDataType_t::CUDA_R_16BF;
 
-        // cuBLASLt matmul descriptor attribute IDs for scale mode (CUDA 12.8+).
-        //   CUBLASLT_MATMUL_DESC_A_SCALE_MODE = 31
-        //   CUBLASLT_MATMUL_DESC_B_SCALE_MODE = 32
         // Scale mode value (CUDA 12.9+):
         //   CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F = 3
-        const A_SCALE_MODE: u32 = 31;
-        const B_SCALE_MODE: u32 = 32;
         const OUTER_VEC_32F: i32 = 3;
 
         // Matmul descriptor: compute in f32, scale type f32.
@@ -295,8 +275,14 @@ impl CudaBlasLT {
 
         // OUTER_VEC_32F requires BOTH A and B scale modes to be set together.
         if use_outer_vec {
-            matmul_desc.set_attr_raw(A_SCALE_MODE, &OUTER_VEC_32F)?;
-            matmul_desc.set_attr_raw(B_SCALE_MODE, &OUTER_VEC_32F)?;
+            matmul_desc.set_attr(
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                &OUTER_VEC_32F,
+            )?;
+            matmul_desc.set_attr(
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                &OUTER_VEC_32F,
+            )?;
         }
 
         // Matrix layouts.
