@@ -62,12 +62,8 @@ impl Fp8Tensor {
     /// Quantize a `Tensor<T, Device>` into an `Fp8Tensor` using dynamic per-token scaling.
     pub fn quantize_per_token<T: Fp8Quantizable>(src: &Tensor<T, Device>) -> Result<Self> {
         let shape = src.shape();
-        if shape.rank() < 2 {
-            crate::bail!("quantize_per_token requires at least 2 dimensions, got {}", shape.rank());
-        }
-        let dims = shape.dims();
-        let hidden_size = dims[shape.rank() - 1];
-        let num_tokens: usize = dims[..shape.rank() - 1].iter().product();
+        let hidden_size = shape.dim(crate::D::Minus1)?;
+        let num_tokens: usize = shape.elem_count() / hidden_size;
         let storage = src.storage()?;
         quantize_fp8_per_token(
             &storage.device,
