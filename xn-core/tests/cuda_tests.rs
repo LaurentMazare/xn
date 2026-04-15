@@ -1862,3 +1862,114 @@ fn test_fp8_matmul_t() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_quantize_fp8_per_token_bf16() -> Result<()> {
+    use xn::cuda_backend::quantization::{Fp8ScaleMode, Fp8Tensor};
+
+    let device = get_device();
+    let data: Vec<half::bf16> = [
+        1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+        -0.5, 0.25, -0.125, 0.0, 1.0, -1.0, 2.0, -2.0, 100.0, -100.0, 50.0, -50.0, 25.0, -25.0,
+        12.5, -12.5,
+    ]
+    .iter()
+    .map(|&v| half::bf16::from_f32(v))
+    .collect();
+
+    let t: Tensor<half::bf16, Device> = Tensor::from_vec(data.clone(), vec![4, 8], &device)?;
+    let fp8 = Fp8Tensor::quantize_per_token(&t)?;
+
+    assert_eq!(fp8.scale_mode, Fp8ScaleMode::PerToken);
+
+    // Per-token: should have 4 scales (one per row).
+    let scales: Vec<f32> = device.stream().clone_dtoh(&fp8.scales)?;
+    assert_eq!(scales.len(), 4);
+
+    // Row 0: max abs = 8, scale = 8/448
+    // Row 1: max abs = 80, scale = 80/448
+    // Row 2: max abs = 2, scale = 2/448
+    // Row 3: max abs = 100, scale = 100/448
+    let expected_scales = [8.0f32 / 448.0, 80.0 / 448.0, 2.0 / 448.0, 100.0 / 448.0];
+    for (i, (&got, &expected)) in scales.iter().zip(expected_scales.iter()).enumerate() {
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "scale[{i}] mismatch: got {got} expected {expected}",
+        );
+    }
+
+    // Dequantize back and check round-trip error.
+    let out: Tensor<half::bf16, Device> = fp8.dequantize()?;
+    assert_eq!(out.dims(), &[4, 8]);
+    let result: Vec<half::bf16> = out.to_vec()?;
+
+    for (i, (&orig, &deq)) in data.iter().zip(result.iter()).enumerate() {
+        let o = orig.to_f32();
+        let d = deq.to_f32();
+        let tol = f32::max(o.abs() * 0.1, 0.5);
+        assert!(
+            (o - d).abs() <= tol,
+            "per-token round-trip mismatch at index {i}: original {o}, dequantized {d}, tol {tol}",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_fp8_matmul_t_per_token() -> Result<()> {
+    use xn::cuda_backend::quantization::Fp8Tensor;
+
+    let device = get_device();
+
+    // A[M, K], W[N, K] → C[M, N] = A × W^T
+    const M: usize = 32;
+    const K: usize = 64;
+    const N: usize = 32;
+
+    // Build A: each row i has value (i+1) in every column.
+    let a_data: Vec<half::bf16> =
+        (0..M * K).map(|idx| half::bf16::from_f32((idx / K + 1) as f32)).collect();
+
+    // Build W as a scaled identity-like matrix: W[j, j] = 1.0 for j < N, rest 0.
+    // C = A × W^T picks the first N columns of A → C[i, j] = (i+1) for all j.
+    let w_data: Vec<half::bf16> = (0..N * K)
+        .map(|idx| {
+            let row = idx / K;
+            let col = idx % K;
+            if row == col { half::bf16::from_f32(1.0) } else { half::bf16::from_f32(0.0) }
+        })
+        .collect();
+
+    let a_t: Tensor<half::bf16, Device> = Tensor::from_vec(a_data, vec![M, K], &device)?;
+    let w_t: Tensor<half::bf16, Device> = Tensor::from_vec(w_data, vec![N, K], &device)?;
+
+    // Both per-token.
+    let a_fp8 = Fp8Tensor::quantize_per_token(&a_t)?;
+    let w_fp8 = Fp8Tensor::quantize_per_token(&w_t)?;
+
+    let c: Tensor<half::bf16, Device> = a_fp8.matmul_t(&w_fp8)?;
+    assert_eq!(c.dims(), &[M, N]);
+
+    let result: Vec<half::bf16> = c.to_vec()?;
+
+    // Expected: C[i, j] ≈ (i+1) for all j.
+    for i in 0..M {
+        let expected = (i + 1) as f32;
+        for j in 0..N {
+            let got = result[i * N + j].to_f32();
+            let tol = f32::max(expected.abs() * 0.15, 1.0);
+            assert!(
+                (got - expected).abs() <= tol,
+                "per-token matmul mismatch at [{i}, {j}]: got {got}, expected {expected}, tol {tol}",
+            );
+        }
+    }
+
+    // Mixed scale modes must be rejected.
+    let a_fp8_pt = Fp8Tensor::quantize_per_token(&a_t)?;
+    let w_fp8_scalar = Fp8Tensor::quantize(&w_t)?;
+    assert!(a_fp8_pt.matmul_t(&w_fp8_scalar).is_err(), "mixed scale modes should be rejected",);
+
+    Ok(())
+}

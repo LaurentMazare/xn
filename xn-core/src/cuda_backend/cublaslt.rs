@@ -223,7 +223,11 @@ impl CudaBlasLT {
     /// This implements the TN layout required by cuBLASLt for FP8:
     /// - `a_data`: rhs FP8 data, row-major `[N, K]` (= col-major `[K, N]`)
     /// - `b_data`: lhs FP8 data, row-major `[M, K]` (= col-major `[K, M]`)
-    /// - `a_scale`, `b_scale`: per-tensor f32 scales on device
+    /// - `a_scale`, `b_scale`: f32 scales on device — either scalars (per-tensor)
+    ///   or vectors (outer-vector mode).
+    /// - `use_outer_vec`: when true, use `CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F`
+    ///   for both A and B scale modes. In this mode `a_scale` must have N elements
+    ///   and `b_scale` must have M elements. Requires CUDA 12.9+ on Hopper/Ada.
     /// - `out`: output bf16 buffer, row-major `[M, N]` (= col-major `[N, M]`)
     /// - `m`, `n`, `k`: matrix dimensions
     /// - `batch`: optional batch configuration
@@ -233,6 +237,7 @@ impl CudaBlasLT {
         b_data: &CudaSlice<u8>,
         a_scale: &CudaSlice<f32>,
         b_scale: &CudaSlice<f32>,
+        use_outer_vec: bool,
         out: &mut CudaSlice<half::bf16>,
         m: usize,
         n: usize,
@@ -243,6 +248,10 @@ impl CudaBlasLT {
         let fp8_type = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
         let bf16_type = lt_sys::cudaDataType_t::CUDA_R_16BF;
 
+        // Scale mode value (CUDA 12.9+):
+        //   CUBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F = 3
+        const OUTER_VEC_32F: i32 = 3;
+
         // Matmul descriptor: compute in f32, scale type f32.
         let matmul_desc = MatmulDesc::new(
             lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
@@ -250,7 +259,7 @@ impl CudaBlasLT {
         )?;
         matmul_desc.set_transpose(true, Matrix::A)?;
 
-        // Set per-tensor scale pointers.
+        // Set scale pointers.
         let (a_sc_ptr, _ga) = a_scale.device_ptr(stream);
         let (b_sc_ptr, _gb) = b_scale.device_ptr(stream);
         let a_sc_p = a_sc_ptr as *const c_void;
@@ -263,6 +272,18 @@ impl CudaBlasLT {
             lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
             &b_sc_p,
         )?;
+
+        // OUTER_VEC_32F requires BOTH A and B scale modes to be set together.
+        if use_outer_vec {
+            matmul_desc.set_attr(
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                &OUTER_VEC_32F,
+            )?;
+            matmul_desc.set_attr(
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                &OUTER_VEC_32F,
+            )?;
+        }
 
         // Matrix layouts.
         // A = rhs: stored as [K, N] col-major, ld = K
