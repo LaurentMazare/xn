@@ -63,10 +63,7 @@ impl Fp8Tensor {
     pub fn quantize_per_token<T: Fp8Quantizable>(src: &Tensor<T, Device>) -> Result<Self> {
         let shape = src.shape();
         if shape.rank() < 2 {
-            crate::bail!(
-                "quantize_per_token requires at least 2 dimensions, got {}",
-                shape.rank()
-            );
+            crate::bail!("quantize_per_token requires at least 2 dimensions, got {}", shape.rank());
         }
         let dims = shape.dims();
         let hidden_size = dims[shape.rank() - 1];
@@ -131,14 +128,14 @@ impl Fp8Tensor {
     /// - `rhs` has shape `[N, K]` (e.g. weight matrix `[out_features, in_features]`)
     /// - Result has shape `[M, N]` in bf16
     ///
-    /// The per-tensor scales from both operands are applied by cuBLASLt.
-    /// Requires a GPU with compute capability >= 8.9 (Ada Lovelace / Hopper).
+    /// Both operands must share the same `scale_mode`:
+    /// - `PerTensor` on both: cuBLASLt scalar scaling (default mode).
+    /// - `PerToken`  on both: cuBLASLt `OUTER_VEC_32F` scaling (CUDA 12.9+).
+    ///
+    /// Mixing per-tensor with per-token is not supported because cuBLASLt
+    /// requires both A and B scale modes to be set together.
+    /// Requires a GPU with compute cap >= 8.9 (Ada Lovelace / Hopper).
     pub fn matmul_t(&self, rhs: &Fp8Tensor) -> Result<Tensor<bf16, Device>> {
-        if self.scale_mode == Fp8ScaleMode::PerToken
-            || rhs.scale_mode == Fp8ScaleMode::PerToken
-        {
-            crate::bail!("matmul_t does not support per-token scaling");
-        }
         let self_dims = self.shape.dims();
         let rhs_dims = rhs.shape.dims();
         if self_dims.len() < 2 || rhs_dims.len() < 2 {
@@ -153,15 +150,28 @@ impl Fp8Tensor {
                 "matmul_t dimension mismatch: self [..., {m}, {k}] vs rhs [..., {n}, {k2}]"
             );
         }
+        if self.scale_mode != rhs.scale_mode {
+            crate::bail!(
+                "matmul_t requires matching scale modes: self is {:?}, rhs is {:?}",
+                self.scale_mode,
+                rhs.scale_mode,
+            );
+        }
 
         let stream = self.device.stream();
         let mut out: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * n) }?;
+
+        // cuBLASLt A = rhs [N,K], B = self [M,K].
+        // In OUTER_VEC_32F mode: a_scale has N elements (per-row of rhs), and
+        // b_scale has M elements (per-row of self).
+        let use_outer_vec = self.scale_mode == Fp8ScaleMode::PerToken;
 
         self.device.blas_lt.matmul_f8(
             &rhs.data,
             &self.data,
             &rhs.scales,
             &self.scales,
+            use_outer_vec,
             &mut out,
             m,
             n,
