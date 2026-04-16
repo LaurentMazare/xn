@@ -220,6 +220,18 @@ impl Device {
         self.stream.clone()
     }
 
+    /// Returns the compute capability of the device as `(major, minor)`,
+    /// e.g. `(9, 0)` for H100.
+    pub fn compute_cap(&self) -> Result<(i32, i32)> {
+        use cudarc::driver::sys::CUdevice_attribute::{
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        };
+        let major = self.cuda.attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+        let minor = self.cuda.attribute(CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        Ok((major, minor))
+    }
+
     /// When turned on, all cuda tensors **created after calling this function** will
     /// not track uses via cuda events.
     ///

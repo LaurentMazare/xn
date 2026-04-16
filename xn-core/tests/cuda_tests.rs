@@ -1922,6 +1922,13 @@ fn test_fp8_matmul_t_per_token() -> Result<()> {
 
     let device = get_device();
 
+    // FP8 per-token matmul requires Hopper (compute capability >= 9.0).
+    let (cc_major, _) = device.compute_cap()?;
+    if cc_major < 9 {
+        eprintln!("skipping test_fp8_matmul_t_per_token: requires compute capability >= 9.0");
+        return Ok(());
+    }
+
     // A[M, K], W[N, K] → C[M, N] = A × W^T
     const M: usize = 32;
     const K: usize = 64;

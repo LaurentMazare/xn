@@ -30,6 +30,8 @@ fn random_bf16_vec(n: usize, seed: u64) -> Vec<half::bf16> {
 fn main() -> Result<()> {
     let device = Device::new(0)?;
 
+    let (cc_major, cc_minor) = device.compute_cap()?;
+    println!("GPU compute capability: {cc_major}.{cc_minor}");
     println!("Matrix dimensions: A=[{M}, {K}], B=[{N}, {K}] -> C=[{M}, {N}]");
     println!("Warmup: {WARMUP}  |  Iterations: {ITERS}");
 
@@ -121,60 +123,68 @@ fn main() -> Result<()> {
     );
 
     // =====================================================================
-    // 4. FP8 × FP8 -> BF16 with per-token scaling (both pre-quantized)
+    // 4 & 5. Per-token scaling variants (require compute capability >= 9.0)
     // =====================================================================
-    println!("\n=== FP8 x FP8 -> BF16 per-token (both pre-quantized) ===");
+    let per_token = if cc_major >= 9 {
+        // 4. FP8 × FP8 -> BF16 with per-token scaling (both pre-quantized)
+        println!("\n=== FP8 x FP8 -> BF16 per-token (both pre-quantized) ===");
 
-    let a_fp8_pt = Fp8Tensor::quantize_per_token(&a_bf16)?;
-    let b_fp8_pt = Fp8Tensor::quantize_per_token(&b_bf16)?;
+        let a_fp8_pt = Fp8Tensor::quantize_per_token(&a_bf16)?;
+        let b_fp8_pt = Fp8Tensor::quantize_per_token(&b_bf16)?;
 
-    for _ in 0..WARMUP {
-        let _c = a_fp8_pt.matmul_t(&b_fp8_pt)?;
-    }
-    device.synchronize()?;
+        for _ in 0..WARMUP {
+            let _c = a_fp8_pt.matmul_t(&b_fp8_pt)?;
+        }
+        device.synchronize()?;
 
-    let t0 = Instant::now();
-    for _ in 0..ITERS {
-        let _c = a_fp8_pt.matmul_t(&b_fp8_pt)?;
-    }
-    device.synchronize()?;
-    let fp8_pt_elapsed = t0.elapsed();
-    let fp8_pt_us = fp8_pt_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
-    let fp8_pt_tflops = flops * ITERS as f64 / fp8_pt_elapsed.as_secs_f64() / 1e12;
-    println!(
-        "  {ITERS} iters in {:.3} ms  |  {fp8_pt_us:.1} us/iter  |  {fp8_pt_tflops:.2} TFLOP/s",
-        fp8_pt_elapsed.as_secs_f64() * 1e3,
-    );
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let _c = a_fp8_pt.matmul_t(&b_fp8_pt)?;
+        }
+        device.synchronize()?;
+        let fp8_pt_elapsed = t0.elapsed();
+        let fp8_pt_us = fp8_pt_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+        let fp8_pt_tflops = flops * ITERS as f64 / fp8_pt_elapsed.as_secs_f64() / 1e12;
+        println!(
+            "  {ITERS} iters in {:.3} ms  |  {fp8_pt_us:.1} us/iter  |  {fp8_pt_tflops:.2} TFLOP/s",
+            fp8_pt_elapsed.as_secs_f64() * 1e3,
+        );
 
-    let c_fp8_pt = a_fp8_pt.matmul_t(&b_fp8_pt)?;
-    device.synchronize()?;
+        let c_fp8_pt = a_fp8_pt.matmul_t(&b_fp8_pt)?;
+        device.synchronize()?;
 
-    // =====================================================================
-    // 5. Per-token mixed: quantize_per_token(A) on-the-fly + FP8 matmul
-    // =====================================================================
-    println!(
-        "\n=== Mixed per-token: quantize_per_token(A) on-the-fly + FP8 matmul (B pre-quantized per-token) ==="
-    );
+        // 5. Per-token mixed: quantize_per_token(A) on-the-fly + FP8 matmul
+        println!(
+            "\n=== Mixed per-token: quantize_per_token(A) on-the-fly + FP8 matmul (B pre-quantized per-token) ==="
+        );
 
-    for _ in 0..WARMUP {
-        let a_q = Fp8Tensor::quantize_per_token(&a_bf16)?;
-        let _c = a_q.matmul_t(&b_fp8_pt)?;
-    }
-    device.synchronize()?;
+        for _ in 0..WARMUP {
+            let a_q = Fp8Tensor::quantize_per_token(&a_bf16)?;
+            let _c = a_q.matmul_t(&b_fp8_pt)?;
+        }
+        device.synchronize()?;
 
-    let t0 = Instant::now();
-    for _ in 0..ITERS {
-        let a_q = Fp8Tensor::quantize_per_token(&a_bf16)?;
-        let _c = a_q.matmul_t(&b_fp8_pt)?;
-    }
-    device.synchronize()?;
-    let mixed_pt_elapsed = t0.elapsed();
-    let mixed_pt_us = mixed_pt_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
-    let mixed_pt_tflops = flops * ITERS as f64 / mixed_pt_elapsed.as_secs_f64() / 1e12;
-    println!(
-        "  {ITERS} iters in {:.3} ms  |  {mixed_pt_us:.1} us/iter  |  {mixed_pt_tflops:.2} TFLOP/s",
-        mixed_pt_elapsed.as_secs_f64() * 1e3,
-    );
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let a_q = Fp8Tensor::quantize_per_token(&a_bf16)?;
+            let _c = a_q.matmul_t(&b_fp8_pt)?;
+        }
+        device.synchronize()?;
+        let mixed_pt_elapsed = t0.elapsed();
+        let mixed_pt_us = mixed_pt_elapsed.as_secs_f64() * 1e6 / ITERS as f64;
+        let mixed_pt_tflops = flops * ITERS as f64 / mixed_pt_elapsed.as_secs_f64() / 1e12;
+        println!(
+            "  {ITERS} iters in {:.3} ms  |  {mixed_pt_us:.1} us/iter  |  {mixed_pt_tflops:.2} TFLOP/s",
+            mixed_pt_elapsed.as_secs_f64() * 1e3,
+        );
+
+        Some((fp8_pt_us, mixed_pt_us, c_fp8_pt))
+    } else {
+        println!(
+            "\n=== Skipping per-token FP8 matmul benchmarks (requires compute capability >= 9.0, got {cc_major}.{cc_minor}) ==="
+        );
+        None
+    };
 
     // =====================================================================
     // Comparison
@@ -182,14 +192,15 @@ fn main() -> Result<()> {
     println!("\n=== Comparison ===");
     println!("  FP8 vs BF16 speedup:             {:.2}x", bf16_us / fp8_us);
     println!("  Mixed vs BF16 speedup:           {:.2}x", bf16_us / mixed_us);
-    println!("  FP8 per-token vs BF16 speedup:   {:.2}x", bf16_us / fp8_pt_us);
-    println!("  Mixed per-token vs BF16 speedup: {:.2}x", bf16_us / mixed_pt_us);
-    println!("  FP8 per-token vs FP8 per-tensor: {:.2}x", fp8_us / fp8_pt_us);
+    if let Some((fp8_pt_us, mixed_pt_us, _)) = per_token.as_ref() {
+        println!("  FP8 per-token vs BF16 speedup:   {:.2}x", bf16_us / fp8_pt_us);
+        println!("  Mixed per-token vs BF16 speedup: {:.2}x", bf16_us / mixed_pt_us);
+        println!("  FP8 per-token vs FP8 per-tensor: {:.2}x", fp8_us / fp8_pt_us);
+    }
 
     // Accuracy: compare FP8 results against BF16 reference.
     let c_bf16_vec = c_bf16.to_vec()?;
     let c_fp8_vec = c_fp8.to_vec()?;
-    let c_fp8_pt_vec = c_fp8_pt.to_vec()?;
 
     let mut max_diff: f32 = 0.0;
     let mut sum_diff: f64 = 0.0;
@@ -202,16 +213,19 @@ fn main() -> Result<()> {
     println!("    Max abs diff:  {max_diff:.4}");
     println!("    Mean abs diff: {:.4}", sum_diff / (M * N) as f64);
 
-    let mut max_diff: f32 = 0.0;
-    let mut sum_diff: f64 = 0.0;
-    for (&a, &b) in c_bf16_vec.iter().zip(c_fp8_pt_vec.iter()) {
-        let d = (a.to_f32() - b.to_f32()).abs();
-        max_diff = max_diff.max(d);
-        sum_diff += d as f64;
+    if let Some((_, _, c_fp8_pt)) = per_token.as_ref() {
+        let c_fp8_pt_vec = c_fp8_pt.to_vec()?;
+        let mut max_diff: f32 = 0.0;
+        let mut sum_diff: f64 = 0.0;
+        for (&a, &b) in c_bf16_vec.iter().zip(c_fp8_pt_vec.iter()) {
+            let d = (a.to_f32() - b.to_f32()).abs();
+            max_diff = max_diff.max(d);
+            sum_diff += d as f64;
+        }
+        println!("\n  FP8 per-token vs BF16 accuracy:");
+        println!("    Max abs diff:  {max_diff:.4}");
+        println!("    Mean abs diff: {:.4}", sum_diff / (M * N) as f64);
     }
-    println!("\n  FP8 per-token vs BF16 accuracy:");
-    println!("    Max abs diff:  {max_diff:.4}");
-    println!("    Mean abs diff: {:.4}", sum_diff / (M * N) as f64);
 
     Ok(())
 }
