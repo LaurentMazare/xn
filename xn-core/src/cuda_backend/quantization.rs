@@ -372,7 +372,10 @@ impl Fp8Linear {
         let batch_dims = &dims[..rank - 1];
         // Flatten batch dims into M for 2D matmul.
         let xs = xs.reshape(((), k))?;
-        let xs_fp8 = Fp8Tensor::quantize(&xs)?;
+        let xs_fp8 = match self.weight.scale_mode {
+            Fp8ScaleMode::PerTensor => Fp8Tensor::quantize(&xs)?,
+            Fp8ScaleMode::PerToken => Fp8Tensor::quantize_per_token(&xs)?,
+        };
         let out = xs_fp8.matmul_t(&self.weight)?;
 
         // Restore batch dims: [...batch, N].
@@ -403,6 +406,34 @@ impl crate::BackendQ for Fp8Linear {
 
     fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
         let weight = Fp8Tensor::quantize(l.weight())?;
+        Ok(Self::LinearQ::new(weight, l.bias().cloned()))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Fp8ScalePerTensor;
+
+#[derive(Clone, Copy)]
+pub struct Fp8ScalePerToken;
+
+impl crate::BackendQ for Fp8ScalePerTensor {
+    type T = bf16;
+    type B = Device;
+    type LinearQ = Fp8Linear;
+
+    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
+        let weight = Fp8Tensor::quantize(l.weight())?;
+        Ok(Self::LinearQ::new(weight, l.bias().cloned()))
+    }
+}
+
+impl crate::BackendQ for Fp8ScalePerToken {
+    type T = bf16;
+    type B = Device;
+    type LinearQ = Fp8Linear;
+
+    fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
+        let weight = Fp8Tensor::quantize_per_token(l.weight())?;
         Ok(Self::LinearQ::new(weight, l.bias().cloned()))
     }
 }
