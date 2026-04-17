@@ -157,7 +157,10 @@ impl Runner {
             } else {
                 let dev = cuda_backend::Device::new(_device_id)?;
                 match self.dtype {
-                    DTypeQ::Fp8 => w.run::<cuda_backend::quantization::Fp8Linear>(dev)?,
+                    DTypeQ::Fp8 => w.run::<cuda_backend::quantization::Fp8ScalePerTensor>(dev)?,
+                    DTypeQ::Fp8PerToken => {
+                        w.run::<cuda_backend::quantization::Fp8ScalePerToken>(dev)?
+                    }
                     DTypeQ::F16 => w.run::<Unquantized<half::f16, _>>(dev)?,
                     DTypeQ::BF16 => w.run::<Unquantized<half::bf16, _>>(dev)?,
                     DTypeQ::F32 => w.run::<Unquantized<f32, _>>(dev)?,
