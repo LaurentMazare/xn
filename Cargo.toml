@@ -18,8 +18,8 @@ categories = ["science"]
 license = "MIT/Apache-2.0"
 
 [workspace.dependencies]
-xn = { path = "xn-core", version = "0.1.8" }
-ptts = { path = "pocket-tts", version = "0.1.8" }
+xn = { path = "xn-core", version = "0.1.9" }
+ptts = { path = "pocket-tts", version = "0.1.9" }
 anyhow = "1"
 bindgen_cuda = "0.1.6"
 byteorder = "1"
