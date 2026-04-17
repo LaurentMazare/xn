@@ -140,7 +140,7 @@ pub struct LmModel<Q: BackendQ> {
     audio_embs: Vec<Embedding<Q::T, Q::B>>, // each (audio_vocab_size, d_model)
     text_linear: Q::LinearQ,
     out_norm: Norm<Q::T, Q::B>,
-    extra_heads: Vec<Q::LinearQ>, // each (dim, d_model)
+    extra_heads: Vec<xn::nn::Linear<Q::T, Q::B>>, // each (dim, d_model)
     audio_vocab_size: usize,
     text_in_vocab_size: usize,
 }
@@ -168,7 +168,6 @@ impl<Q: BackendQ> LmModel<Q> {
         if let Some(ExtraHeadsConfig { num_heads, dim }) = &cfg.extra_heads {
             for i in 0..*num_heads {
                 let head = Linear::load(vb.pp("extra_heads").pp(i), d_model, *dim)?;
-                let head = Q::from_linear(head)?;
                 extra_heads.push(head);
             }
         }
@@ -265,7 +264,6 @@ impl<Q: BackendQ> LmState<Q> {
 
     /// Compute extra head outputs from transformer output.
     pub fn extra_heads(&self, ys: &Tensor<Q::T, Q::B>) -> Result<Vec<Tensor<Q::T, Q::B>>> {
-        use xn::ModuleT;
         let mut results = Vec::with_capacity(self.model.extra_heads.len());
         for head in &self.model.extra_heads {
             results.push(head.forward(ys)?);
