@@ -139,6 +139,7 @@ pub fn qtensor_from_ggml(
     match ggml_dtype {
         GgmlDType::F32 => from_raw_data::<f32>(raw_data, size_in_bytes, dims),
         GgmlDType::F16 => from_raw_data::<half::f16>(raw_data, size_in_bytes, dims),
+        GgmlDType::BF16 => from_raw_data::<half::bf16>(raw_data, size_in_bytes, dims),
         GgmlDType::Q4_0 => from_raw_data::<k_quants::BlockQ4_0>(raw_data, size_in_bytes, dims),
         GgmlDType::Q4_1 => from_raw_data::<k_quants::BlockQ4_1>(raw_data, size_in_bytes, dims),
         GgmlDType::Q5_0 => from_raw_data::<k_quants::BlockQ5_0>(raw_data, size_in_bytes, dims),

@@ -16,7 +16,7 @@ pub mod neon;
 pub mod simd128;
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod utils;
-use half::f16;
+use half::{bf16, f16};
 
 pub use k_quants::GgmlType;
 
@@ -91,6 +91,7 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    BF16,
 }
 
 impl GgmlDType {
@@ -110,6 +111,7 @@ impl GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            30 => Self::BF16,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -131,6 +133,7 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::BF16 => 30,
         }
     }
 
@@ -139,6 +142,7 @@ impl GgmlDType {
         match self {
             Self::F32 => Box::new(vec![f32::zeros(); elem_count]),
             Self::F16 => Box::new(vec![f16::zeros(); elem_count]),
+            Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
             Self::Q4_0 => Box::new(vec![BlockQ4_0::zeros(); elem_count / BlockQ4_0::BLCK_SIZE]),
             Self::Q4_1 => Box::new(vec![BlockQ4_1::zeros(); elem_count / BlockQ4_1::BLCK_SIZE]),
             Self::Q5_0 => Box::new(vec![BlockQ5_0::zeros(); elem_count / BlockQ5_0::BLCK_SIZE]),
@@ -159,6 +163,7 @@ impl GgmlDType {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
+            Self::BF16 => 2,
             Self::Q4_0 => std::mem::size_of::<BlockQ4_0>(),
             Self::Q4_1 => std::mem::size_of::<BlockQ4_1>(),
             Self::Q5_0 => std::mem::size_of::<BlockQ5_0>(),
@@ -179,6 +184,7 @@ impl GgmlDType {
         match self {
             Self::F32 => 1,
             Self::F16 => 1,
+            Self::BF16 => 1,
             Self::Q4_0 => k_quants::QK4_0,
             Self::Q4_1 => k_quants::QK4_1,
             Self::Q5_0 => k_quants::QK5_0,
