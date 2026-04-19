@@ -19,10 +19,10 @@ impl MmapedFiles {
 }
 
 #[derive(yoke::Yokeable)]
-pub struct TensorData<'a> {
-    pub data: &'a [u8],
-    pub shape: Shape,
-    pub dtype: crate::DType,
+struct TensorData<'a> {
+    data: &'a [u8],
+    shape: Shape,
+    dtype: crate::DType,
 }
 
 pub struct VarBuilder<'a, B: Backend> {
@@ -102,10 +102,6 @@ impl<'a, B: Backend> VarBuilder<'a, B> {
         Ok(Self { tensor_data, device })
     }
 
-    pub fn get_tensor(&self, name: &str) -> Option<&TensorData<'a>> {
-        self.tensor_data.get(name)
-    }
-
     pub fn device(&self) -> &B {
         &self.device
     }
@@ -153,23 +149,36 @@ struct VarBuilderYokeBytes<'a> {
     tensor_data: std::collections::HashMap<String, TensorData<'a>>,
 }
 
+pub trait Reader: std::io::Seek + std::io::Read {}
+
 enum VBData {
     Mmap(yoke::Yoke<VarBuilderYoke<'static>, Box<MmapedFiles>>),
     Bytes(yoke::Yoke<VarBuilderYokeBytes<'static>, Vec<Vec<u8>>>),
+    Gguf(crate::quantized::gguf_file::Content, Mutex<Box<dyn Reader>>),
 }
 
 impl VBData {
-    fn get_tensor<'a>(&'a self, name: &str) -> Option<&'a TensorData<'a>> {
-        match self {
-            Self::Mmap(yoke) => yoke.get().tensor_data.get(name),
-            Self::Bytes(yoke) => yoke.get().tensor_data.get(name),
-        }
-    }
-
     fn tensor_names(&self) -> Vec<&str> {
         match self {
             Self::Mmap(yoke) => yoke.get().tensor_data.keys().map(|k| k.as_str()).collect(),
             Self::Bytes(yoke) => yoke.get().tensor_data.keys().map(|k| k.as_str()).collect(),
+            Self::Gguf(content, _) => content.tensor_infos.keys().map(|k| k.as_str()).collect(),
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        match self {
+            Self::Mmap(yoke) => yoke.get().tensor_data.contains_key(name),
+            Self::Bytes(yoke) => yoke.get().tensor_data.contains_key(name),
+            Self::Gguf(content, _) => content.tensor_infos.contains_key(name),
+        }
+    }
+
+    fn shape(&self, name: &str) -> Option<&Shape> {
+        match self {
+            Self::Mmap(yoke) => yoke.get().tensor_data.get(name).map(|td| &td.shape),
+            Self::Bytes(yoke) => yoke.get().tensor_data.get(name).map(|td| &td.shape),
+            Self::Gguf(content, _) => content.tensor_infos.get(name).map(|info| &info.shape),
         }
     }
 }
@@ -190,6 +199,14 @@ impl<B: Backend> VB<B> {
         })?;
         let used = Mutex::new(Default::default());
         Ok(Self { data: VBData::Mmap(yoke), used, device })
+    }
+
+    pub fn load_gguf<R: Reader + 'static>(mut reader: R, device: B) -> Result<Self> {
+        let content = crate::quantized::gguf_file::Content::read(&mut reader)?;
+        let reader = Mutex::new(Box::new(reader) as Box<dyn Reader>);
+        let data = VBData::Gguf(content, reader);
+        let used = Mutex::new(Default::default());
+        Ok(Self { data, used, device })
     }
 
     pub fn load_with_key_map<P: AsRef<std::path::Path>>(
@@ -228,10 +245,6 @@ impl<B: Backend> VB<B> {
         Ok(Self { data: VBData::Bytes(yoke), used, device })
     }
 
-    pub fn get_tensor(&self, name: &str) -> Option<&TensorData<'_>> {
-        self.data.get_tensor(name)
-    }
-
     pub fn device(&self) -> &B {
         &self.device
     }
@@ -241,12 +254,37 @@ impl<B: Backend> VB<B> {
         name: &str,
         shape: impl Into<Shape>,
     ) -> Result<Tensor<T, B>> {
-        let td = self.data.get_tensor(name);
-        if td.is_some() {
-            let mut t = self.used.lock().unwrap();
-            t.insert(name.to_string());
+        match &self.data {
+            VBData::Mmap(yoke) => {
+                let td = yoke.get().tensor_data.get(name);
+                if td.is_some() {
+                    let mut t = self.used.lock().unwrap();
+                    t.insert(name.to_string());
+                }
+                make_tensor(td, name, shape, &self.device)
+            }
+            VBData::Bytes(yoke) => {
+                let td = yoke.get().tensor_data.get(name);
+                if td.is_some() {
+                    let mut t = self.used.lock().unwrap();
+                    t.insert(name.to_string());
+                }
+                make_tensor(td, name, shape, &self.device)
+            }
+            VBData::Gguf(content, reader) => {
+                let tensor = {
+                    let mut reader = reader.lock().unwrap();
+                    content.tensor(&mut *reader, name)?
+                };
+                {
+                    let mut t = self.used.lock().unwrap();
+                    t.insert(name.to_string());
+                }
+                let shape = tensor.shape();
+                let dequantized = tensor.dequantize()?;
+                Tensor::from_vec(dequantized, shape, &self.device)?.to()
+            }
         }
-        make_tensor(td, name, shape, &self.device)
     }
 
     pub fn tensor_names(&self) -> Vec<&str> {
@@ -255,6 +293,14 @@ impl<B: Backend> VB<B> {
 
     pub fn root(self) -> Path<B> {
         Path { vb: self.into(), path: vec![] }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.data.contains(name)
+    }
+
+    pub fn shape(&self, name: &str) -> Option<&Shape> {
+        self.data.shape(name)
     }
 
     pub fn check_all_used(&self) -> Result<()> {
@@ -284,11 +330,6 @@ pub struct Path<B: Backend> {
 }
 
 impl<B: Backend> Path<B> {
-    pub fn get_tensor(&self, name: &str) -> Option<&TensorData<'_>> {
-        let name = self.path(name);
-        self.vb.get_tensor(&name)
-    }
-
     pub fn device(&self) -> &B {
         self.vb.device()
     }
@@ -322,7 +363,13 @@ impl<B: Backend> Path<B> {
 
     /// Check if a tensor with the given name exists.
     pub fn contains(&self, name: &str) -> bool {
-        self.get_tensor(name).is_some()
+        let name = self.path(name);
+        self.vb.data.contains(&name)
+    }
+
+    pub fn shape(&self, name: &str) -> Option<&Shape> {
+        let name = self.path(name);
+        self.vb.data.shape(&name)
     }
 
     fn path(&self, tensor_name: &str) -> String {

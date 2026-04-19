@@ -359,9 +359,9 @@ impl<T: WithDTypeF, B: Backend> Llama<T, B> {
         let norm = RmsNorm::load(model.pp("norm"), config.hidden_size, config.rms_norm_eps)?;
 
         // lm_head might be tied to embed_tokens in some models
-        let lm_head = match vb.get_tensor("lm_head.weight") {
-            Some(_) => Linear::load(vb.pp("lm_head"), config.hidden_size, config.vocab_size)?,
-            None => Linear::new(embed_tokens.embeddings().clone()),
+        let lm_head = match vb.contains("lm_head.weight") {
+            true => Linear::load(vb.pp("lm_head"), config.hidden_size, config.vocab_size)?,
+            false => Linear::new(embed_tokens.embeddings().clone()),
         };
 
         let (cos_cache, sin_cache) = precompute_freqs_cis(
