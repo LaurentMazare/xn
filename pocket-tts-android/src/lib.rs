@@ -126,10 +126,7 @@ struct Stats {
 impl Session {
     pub fn new(weights_dir: &str, voice: &str) -> Result<Self, String> {
         if !VOICES.contains(&voice) {
-            return Err(format!(
-                "unknown voice '{voice}'. Available: {}",
-                VOICES.join(", ")
-            ));
+            return Err(format!("unknown voice '{voice}'. Available: {}", VOICES.join(", ")));
         }
         let dir = std::path::Path::new(weights_dir);
         let model_path = dir.join("tts_b6369a24.safetensors");
@@ -216,20 +213,17 @@ impl Session {
             return Err("no sentences".into());
         }
 
-        let need_reprime =
-            self.prompted_base.is_none() || max_seq_budget > self.seq_budget;
+        let need_reprime = self.prompted_base.is_none() || max_seq_budget > self.seq_budget;
         if need_reprime {
             let mut base_state = self
                 .model
                 .init_flow_lm_state(1, max_seq_budget)
                 .map_err(|e| format!("init state: {e}"))?;
-            let voice_vb = VB::load(&[&self.voice_path], CPU)
-                .map_err(|e| format!("load voice: {e}"))?;
+            let voice_vb =
+                VB::load(&[&self.voice_path], CPU).map_err(|e| format!("load voice: {e}"))?;
             let voice_names = voice_vb.tensor_names();
-            let voice_key: String = voice_names
-                .first()
-                .ok_or_else(|| "empty voice file".to_string())?
-                .to_string();
+            let voice_key: String =
+                voice_names.first().ok_or_else(|| "empty voice file".to_string())?.to_string();
             let voice_shape = voice_vb
                 .shape(&voice_key)
                 .ok_or_else(|| format!("voice tensor '{voice_key}' missing"))?;
@@ -252,11 +246,7 @@ impl Session {
         }
 
         let base_state = self.prompted_base.as_ref().unwrap().clone();
-        self.gen_loop = Some(GenLoop {
-            chunks: chunks.into_iter(),
-            base_state,
-            cur: None,
-        });
+        self.gen_loop = Some(GenLoop { chunks: chunks.into_iter(), base_state, cur: None });
         self.stats = Stats::default();
         self.started_at = Some(Instant::now());
         self.first_chunk_seen = false;

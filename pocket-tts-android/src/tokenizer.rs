@@ -101,8 +101,7 @@ impl Unigram {
             let start_byte = chars[i].0;
             let max_len = core::cmp::min(n - i, 64);
             for len in 1..=max_len {
-                let end_byte =
-                    if i + len < n { chars[i + len].0 } else { total_bytes };
+                let end_byte = if i + len < n { chars[i + len].0 } else { total_bytes };
                 let sub = &text[start_byte..end_byte];
                 if let Some(&(id, score)) = self.vocab.get(sub) {
                     let new_score = best[i].score + score as f64;
@@ -119,11 +118,7 @@ impl Unigram {
                     Some(&(id, score)) => (id, score),
                     None => (self.unk_id, -100.0),
                 };
-                best[i + 1] = Cell {
-                    score: best[i].score + fscore as f64,
-                    len: 1,
-                    id: fid as i64,
-                };
+                best[i + 1] = Cell { score: best[i].score + fscore as f64, len: 1, id: fid as i64 };
             }
         }
 
