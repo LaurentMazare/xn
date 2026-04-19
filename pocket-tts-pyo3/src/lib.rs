@@ -480,8 +480,7 @@ fn load_voice_embedding<B: xn::Backend>(
     let voice_vb = VB::load(&[voice_path], device.clone())?;
     let voice_names = voice_vb.tensor_names();
     let voice_key = voice_names.first().context("no tensors found in voice embedding file")?;
-    let voice_td = voice_vb.get_tensor(voice_key).context("voice tensor not found")?;
-    let voice_shape = &voice_td.shape;
+    let voice_shape = voice_vb.shape(voice_key).context("voice tensor not found")?;
     let voice_dims = voice_shape.dims();
     let voice_emb: Tensor<f32, B> = voice_vb.tensor(voice_key, voice_shape.clone())?;
     if voice_dims.len() == 2 {
