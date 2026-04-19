@@ -149,10 +149,12 @@ struct VarBuilderYokeBytes<'a> {
     tensor_data: std::collections::HashMap<String, TensorData<'a>>,
 }
 
+pub trait Reader: std::io::Seek + std::io::Read {}
+
 enum VBData {
     Mmap(yoke::Yoke<VarBuilderYoke<'static>, Box<MmapedFiles>>),
     Bytes(yoke::Yoke<VarBuilderYokeBytes<'static>, Vec<Vec<u8>>>),
-    Gguf(crate::quantized::gguf_file::Content),
+    Gguf(crate::quantized::gguf_file::Content, Mutex<Box<dyn Reader>>),
 }
 
 impl VBData {
@@ -160,7 +162,7 @@ impl VBData {
         match self {
             Self::Mmap(yoke) => yoke.get().tensor_data.keys().map(|k| k.as_str()).collect(),
             Self::Bytes(yoke) => yoke.get().tensor_data.keys().map(|k| k.as_str()).collect(),
-            Self::Gguf(content) => content.tensor_infos.keys().map(|k| k.as_str()).collect(),
+            Self::Gguf(content, _) => content.tensor_infos.keys().map(|k| k.as_str()).collect(),
         }
     }
 
@@ -168,7 +170,7 @@ impl VBData {
         match self {
             Self::Mmap(yoke) => yoke.get().tensor_data.contains_key(name),
             Self::Bytes(yoke) => yoke.get().tensor_data.contains_key(name),
-            Self::Gguf(content) => content.tensor_infos.contains_key(name),
+            Self::Gguf(content, _) => content.tensor_infos.contains_key(name),
         }
     }
 
@@ -176,7 +178,7 @@ impl VBData {
         match self {
             Self::Mmap(yoke) => yoke.get().tensor_data.get(name).map(|td| &td.shape),
             Self::Bytes(yoke) => yoke.get().tensor_data.get(name).map(|td| &td.shape),
-            Self::Gguf(content) => content.tensor_infos.get(name).map(|info| &info.shape),
+            Self::Gguf(content, _) => content.tensor_infos.get(name).map(|info| &info.shape),
         }
     }
 }
@@ -197,6 +199,14 @@ impl<B: Backend> VB<B> {
         })?;
         let used = Mutex::new(Default::default());
         Ok(Self { data: VBData::Mmap(yoke), used, device })
+    }
+
+    pub fn load_gguf<R: Reader + 'static>(mut reader: R, device: B) -> Result<Self> {
+        let content = crate::quantized::gguf_file::Content::read(&mut reader)?;
+        let reader = Mutex::new(Box::new(reader) as Box<dyn Reader>);
+        let data = VBData::Gguf(content, reader);
+        let used = Mutex::new(Default::default());
+        Ok(Self { data, used, device })
     }
 
     pub fn load_with_key_map<P: AsRef<std::path::Path>>(
@@ -261,13 +271,18 @@ impl<B: Backend> VB<B> {
                 }
                 make_tensor(td, name, shape, &self.device)
             }
-            VBData::Gguf(content) => {
-                let td = content.tensor_infos.get(name);
-                if td.is_some() {
+            VBData::Gguf(content, reader) => {
+                let tensor = {
+                    let mut reader = reader.lock().unwrap();
+                    content.tensor(&mut *reader, name)?
+                };
+                {
                     let mut t = self.used.lock().unwrap();
                     t.insert(name.to_string());
                 }
-                todo!()
+                let shape = tensor.shape();
+                let dequantized = tensor.dequantize()?;
+                Tensor::from_vec(dequantized, shape, &self.device)?.to()
             }
         }
     }
