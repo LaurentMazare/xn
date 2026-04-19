@@ -215,7 +215,7 @@ fn main() -> Result<()> {
             unsafe {
                 dev.disable_event_tracking();
             }
-            run_for_device(args, dev)?;
+            run_for_device::<xn::Unquantized<half::bf16, _>>(args, dev)?;
         }
     }
     #[cfg(not(feature = "cuda"))]
@@ -223,7 +223,17 @@ fn main() -> Result<()> {
         run_cpu(args)?;
     }
 
+    tracing::info!("peak RSS: {:.2} MB", peak_rss_mb());
+
     Ok(())
+}
+
+fn peak_rss_mb() -> f64 {
+    let mut usage = std::mem::MaybeUninit::uninit();
+    unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
+        usage.assume_init().ru_maxrss as f64 / 1024.0
+    }
 }
 
 enum Rng {
@@ -281,7 +291,7 @@ where
     })
 }
 
-fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> Result<()> {
+fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()> {
     let (model_path, tokenizer_path, voice, cfg) = match args.config.as_ref() {
         Some(config) => {
             let config = std::fs::canonicalize(config)?;
@@ -378,7 +388,7 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
                 if cfg_state.is_some() {
                     anyhow::bail!("cfg is not supported with pre-computed voice embeddings");
                 }
-                (voice_emb, None)
+                (voice_emb.to::<Q::T>()?, None)
             }
             Voice::Audio(path) => {
                 tracing::info!("loading voice from audio file {}", path);
@@ -397,7 +407,7 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
                 } else {
                     pcm
                 };
-                let pcm_tensor = Tensor::from_vec(pcm, (1, 1, ()), &dev)?;
+                let pcm_tensor = Tensor::from_vec(pcm, (1, 1, ()), &dev)?.to::<Q::T>()?;
                 let emb = model.encode_audio(&pcm_tensor)?;
                 tracing::info!(?emb, "encoded audio to latent");
                 let null_emb = if cfg_state.is_some() {
@@ -446,11 +456,12 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
         // BOS marker: NaN tensor [1, 1, ldim]
         let ldim = cfg.flow_lm.ldim;
         let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-        let mut prev_latent: Tensor<f32, Q::B> = Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?;
+        let mut prev_latent: Tensor<Q::T, Q::B> =
+            Tensor::from_vec(nan_data, (1, 1, ldim), &dev)?.to::<Q::T>()?;
 
         let mut eos_countdown: Option<usize> = None;
 
-        let (latent_tx, latent_rx) = std::sync::mpsc::channel();
+        let (latent_tx, latent_rx) = std::sync::mpsc::channel::<Tensor<Q::T, _>>();
         let is_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let jh = spawn({
             let wait_to_decode = args.wait_to_decode;
@@ -466,6 +477,7 @@ fn run_for_device<Q: xn::BackendQ<T = f32> + 'static>(args: Args, dev: Q::B) -> 
                 }
                 while let Ok(next_latent) = latent_rx.recv() {
                     // Decode latent to audio
+                    let next_latent = next_latent.to()?;
                     let audio_chunk = model.decode_latent(&next_latent, &mut mimi_state)?;
                     audio_chunks.push(audio_chunk);
                 }
