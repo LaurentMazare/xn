@@ -478,7 +478,7 @@ pub fn write<W: std::io::Seek + std::io::Write>(
     tensors: &[(&str, &QTensor)],
 ) -> Result<()> {
     w.write_u32::<LittleEndian>(0x46554747)?;
-    w.write_u32::<LittleEndian>(2)?; // version 2.
+    w.write_u32::<LittleEndian>(3)?; // version 3.
     w.write_u64::<LittleEndian>(tensors.len() as u64)?;
     w.write_u64::<LittleEndian>(metadata.len() as u64)?;
     for (name, value) in metadata.iter() {
