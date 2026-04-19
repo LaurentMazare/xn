@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pocket TTS</string>
+    <string name="default_text">Hello world, this is pocket TTS running on Android.</string>
+    <string name="downloading">Downloading model weights…</string>
+    <string name="generate">Generate</string>
+    <string name="text_label">Text to synthesize</string>
+    <string name="voice">Voice</string>
+</resources>

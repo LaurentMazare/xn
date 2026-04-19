@@ -34,9 +34,14 @@ class ModelDownloader(private val ctx: Context) {
     data class Progress(val label: String, val received: Long, val total: Long)
 
     companion object {
-        private const val BASE = "https://huggingface.co/kyutai/pocket-tts/resolve/main"
+        // Use the no-auth public variant. The "embeddings_v2/" files ship as
+        // pre-primed KV-cache state; the Rust core loads them via
+        // load_voice_kv_cache (see pocket-tts-android/src/lib.rs) rather than
+        // via prompt_audio.
+        private const val BASE =
+            "https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main"
         val VOICES = listOf(
-            "alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma",
+            "alba", "marius", "javert", "fantine", "cosette", "eponine", "azelma",
         )
     }
 
@@ -44,14 +49,14 @@ class ModelDownloader(private val ctx: Context) {
     suspend fun ensureDownloaded(): File = withContext(Dispatchers.IO) {
         val root = this@ModelDownloader.root
         root.mkdirs()
-        File(root, "embeddings").mkdirs()
 
+File(root, "embeddings_v2").mkdirs()
         fetch("$BASE/tts_b6369a24.safetensors", File(root, "tts_b6369a24.safetensors"), "model")
         fetch("$BASE/tokenizer.model", File(root, "tokenizer.model"), "tokenizer")
         for (v in VOICES) {
             fetch(
-                "$BASE/embeddings/$v.safetensors",
-                File(root, "embeddings/$v.safetensors"),
+                "$BASE/embeddings_v2/$v.safetensors",
+                File(root, "embeddings_v2/$v.safetensors"),
                 "voice $v",
             )
         }

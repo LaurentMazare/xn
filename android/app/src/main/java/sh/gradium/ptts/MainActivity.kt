@@ -134,10 +134,20 @@ class MainActivity : AppCompatActivity() {
             track.play()
             try {
                 p.generate(text, 0.7f, 4242424242424242L)
+                var framesWritten = 0
                 while (true) {
                     val chunk = p.nextChunk() ?: break
                     // AudioTrack.write with ENCODING_PCM_FLOAT takes float[] directly.
-                    track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
+                    val wrote = track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
+                    if (wrote > 0) framesWritten += wrote // mono float: samples == frames
+                }
+                // Drain the hardware buffer before we stop/release. Without this
+                // the tail (a few hundred ms) gets cut off.
+                val deadline = System.currentTimeMillis() + 10_000
+                while (track.playbackHeadPosition < framesWritten
+                    && System.currentTimeMillis() < deadline
+                ) {
+                    Thread.sleep(20)
                 }
                 track.stop()
             } finally {

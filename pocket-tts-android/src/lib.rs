@@ -15,26 +15,33 @@
 mod tokenizer;
 
 use log::info;
+use ptts::flow_lm::FlowLMState;
+use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{
     TTSConfig, TTSModel, TTSState, prepare_text_prompt, split_into_best_sentences,
 };
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Instant;
 use tokenizer::Unigram;
 use xn::nn::VB;
-use xn::{CPU, CpuDevice, Tensor, Unquantized};
+use xn::{CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
 
 type Model = TTSModel<Unquantized<f32, CpuDevice>>;
 type State = TTSState<Unquantized<f32, CpuDevice>>;
-type Mimi = ptts::mimi::MimiState<f32, CpuDevice>;
 
-const VOICES: &[&str] =
-    &["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"];
+// Matches the public HF repo at huggingface.co/kyutai/pocket-tts-without-voice-cloning
+// (no auth required). Voice files under embeddings_v2/ are pre-primed KV-cache
+// states — loaded via load_voice_kv_cache() rather than prompt_audio().
+const VOICES: &[&str] = &["alba", "marius", "javert", "fantine", "cosette", "eponine", "azelma"];
 
 fn remap_key(name: &str) -> Option<String> {
     if name.contains("flow.w_s_t")
         || name.contains("quantizer.vq")
         || name.contains("quantizer.logvar_proj")
+        || name.contains("learnt_padding")
     {
         return None;
     }
@@ -81,36 +88,28 @@ struct Chunk {
     frames_after_eos: usize,
 }
 
-struct GenLoop {
-    chunks: std::vec::IntoIter<Chunk>,
-    base_state: State,
-    cur: Option<ActiveChunk>,
-}
-
-struct ActiveChunk {
-    tts_state: State,
-    mimi_state: Mimi,
-    prev_latent: Tensor<f32, CpuDevice>,
-    rng: Rng,
-    max_frames: usize,
-    frames_after_eos: usize,
-    eos_countdown: Option<usize>,
-    step: usize,
+/// State for a single in-flight generation: two worker threads (backbone +
+/// decode) feeding a PCM queue the JNI caller drains chunk-by-chunk. Mirrors
+/// the CLI's `spawn(|| decode loop)` pattern from pocket-tts/examples/.
+struct Run {
+    pcm_rx: mpsc::Receiver<Vec<f32>>,
+    backbone: Option<JoinHandle<Result<(), String>>>,
+    decoder: Option<JoinHandle<Result<(), String>>>,
+    step_count: Arc<AtomicUsize>,
+    step_total_ns: Arc<AtomicU64>,
+    started_at: Instant,
+    first_chunk_at: Option<Instant>,
+    duration_s: f64,
 }
 
 pub struct Session {
-    model: Model,
+    model: Arc<Model>,
     voice_path: std::path::PathBuf,
     seq_budget: usize,
-    prompted_base: Option<State>,
-    gen_loop: Option<GenLoop>,
+    voice_cached: Option<State>,
+    sample_rate: usize,
+    run: Option<Run>,
     stats: Stats,
-    started_at: Option<Instant>,
-    first_chunk_seen: bool,
-    step_count: usize,
-    step_total_ms: f64,
-    temperature: f32,
-    seed: u64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -131,7 +130,7 @@ impl Session {
         let dir = std::path::Path::new(weights_dir);
         let model_path = dir.join("tts_b6369a24.safetensors");
         let tokenizer_path = dir.join("tokenizer.model");
-        let voice_path = dir.join("embeddings").join(format!("{voice}.safetensors"));
+        let voice_path = dir.join("embeddings_v2").join(format!("{voice}.safetensors"));
         for p in [&model_path, &tokenizer_path, &voice_path] {
             if !p.exists() {
                 return Err(format!("missing file: {}", p.display()));
@@ -141,12 +140,25 @@ impl Session {
         let tok = Unigram::from_file(tokenizer_path.to_str().unwrap())
             .map_err(|e| format!("tokenizer load: {e}"))?;
 
+        // Big.LITTLE: on a 1+4+4 Pixel 8a or similar, letting rayon use all 9
+        // cores drags matmul down to the slow A520 cluster. Cap at the big+mid
+        // cluster size so gemm only touches fast cores; the decoder thread we
+        // spawn in `start()` sits on a spare core. Tunable via $PTTS_THREADS.
+        let threads = std::env::var("PTTS_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| xn::get_num_cpus().min(4));
+        xn::set_num_threads(threads);
+
         info!(
-            "backends: avx={} neon={} simd128={} f16c={}",
+            "backends: avx={} neon={} simd128={} f16c={} | cpu threads: detected={} rayon={}",
             xn::with_avx(),
             xn::with_neon(),
             xn::with_simd128(),
             xn::with_f16c(),
+            xn::get_num_cpus(),
+            xn::get_num_threads(),
         );
 
         let cfg = TTSConfig::v202601(0.7);
@@ -155,33 +167,28 @@ impl Session {
             .root();
         let model: Model =
             Model::load(&vb, Box::new(tok), &cfg).map_err(|e| format!("model load: {e}"))?;
+        let sample_rate = model.sample_rate();
 
         Ok(Self {
-            model,
+            model: Arc::new(model),
             voice_path,
             seq_budget: 0,
-            prompted_base: None,
-            gen_loop: None,
+            voice_cached: None,
+            sample_rate,
+            run: None,
             stats: Stats::default(),
-            started_at: None,
-            first_chunk_seen: false,
-            step_count: 0,
-            step_total_ms: 0.0,
-            temperature: 0.7,
-            seed: 4242424242424242,
         })
     }
 
     pub fn sample_rate(&self) -> usize {
-        self.model.sample_rate()
+        self.sample_rate
     }
 
-    /// Tokenize the input, build per-chunk token streams and prime a fresh
-    /// base state with voice conditioning. Must be called before the first
-    /// `next_chunk`.
+    /// Tokenize the input, build per-chunk token streams and spawn the
+    /// backbone + decoder threads. The JNI caller drains PCM via `next_chunk`.
     pub fn start(&mut self, text: &str, temperature: f32, seed: u64) -> Result<(), String> {
-        self.temperature = temperature;
-        self.seed = seed;
+        // Drop any previous run (force threads to finish / unblock).
+        self.stop_run();
 
         let tokenizer_ref = self
             .model
@@ -213,167 +220,190 @@ impl Session {
             return Err("no sentences".into());
         }
 
-        let need_reprime = self.prompted_base.is_none() || max_seq_budget > self.seq_budget;
-        if need_reprime {
-            let mut base_state = self
-                .model
-                .init_flow_lm_state(1, max_seq_budget)
-                .map_err(|e| format!("init state: {e}"))?;
-            let voice_vb =
-                VB::load(&[&self.voice_path], CPU).map_err(|e| format!("load voice: {e}"))?;
-            let voice_names = voice_vb.tensor_names();
-            let voice_key: String =
-                voice_names.first().ok_or_else(|| "empty voice file".to_string())?.to_string();
-            let voice_shape = voice_vb
-                .shape(&voice_key)
-                .ok_or_else(|| format!("voice tensor '{voice_key}' missing"))?;
-            let dims = voice_shape.dims().to_vec();
-            let voice_emb: Tensor<f32, CpuDevice> = voice_vb
-                .tensor(&voice_key, voice_shape)
-                .map_err(|e| format!("read voice tensor: {e}"))?;
-            let voice_emb = if dims.len() == 2 {
-                voice_emb
-                    .reshape((1, dims[0], dims[1]))
-                    .map_err(|e| format!("reshape voice: {e}"))?
-            } else {
-                voice_emb
-            };
-            self.model
-                .prompt_audio(&mut base_state, &voice_emb)
-                .map_err(|e| format!("prompt_audio: {e}"))?;
-            self.prompted_base = Some(base_state);
-            self.seq_budget = max_seq_budget;
+        // Lazily load + resize the voice KV-cache state.
+        if self.voice_cached.is_none() {
+            let cached = load_voice_kv_cache(&self.voice_path)?;
+            self.voice_cached = Some(cached);
         }
+        let cached = self.voice_cached.as_ref().unwrap();
+        let base_state = resize_tts_state(cached, max_seq_budget)?;
+        self.seq_budget = max_seq_budget;
 
-        let base_state = self.prompted_base.as_ref().unwrap().clone();
-        self.gen_loop = Some(GenLoop { chunks: chunks.into_iter(), base_state, cur: None });
+        // Two channels:
+        //   backbone --latent--> decoder --pcm--> JNI caller
+        // The backbone is one thread tight around `generate_step`; decoder is a
+        // second thread tight around `decode_latent`. Matches the
+        // `pocket-tts/examples/pocket_tts.rs` CLI pattern (spawn()'d decode).
+        let (latent_tx, latent_rx) = mpsc::channel::<(Tensor<f32, CpuDevice>, usize)>();
+        let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<f32>>(8);
+
+        let step_count = Arc::new(AtomicUsize::new(0));
+        let step_total_ns = Arc::new(AtomicU64::new(0));
+
+        let backbone = {
+            let model = self.model.clone();
+            let step_count = step_count.clone();
+            let step_total_ns = step_total_ns.clone();
+            std::thread::Builder::new()
+                .name("ptts-backbone".into())
+                .spawn(move || -> Result<(), String> {
+                    let ldim = model.flow_lm.ldim;
+                    for chunk in chunks.into_iter() {
+                        let mut tts_state = base_state.clone();
+                        model
+                            .prompt_text(&mut tts_state, &chunk.tokens)
+                            .map_err(|e| format!("prompt_text: {e}"))?;
+                        let nan_data: Vec<f32> = vec![f32::NAN; ldim];
+                        let mut prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU)
+                            .map_err(|e| format!("init bos tensor: {e}"))?;
+                        let mut rng = Rng::new(temperature, seed);
+                        let mut eos_countdown: Option<usize> = None;
+                        for step in 0..chunk.max_frames {
+                            let t0 = Instant::now();
+                            let (next_latent, is_eos) = model
+                                .generate_step(&mut tts_state, &prev_latent, &mut rng)
+                                .map_err(|e| format!("generate_step: {e}"))?;
+                            step_total_ns
+                                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            step_count.fetch_add(1, Ordering::Relaxed);
+
+                            // Hand the latent to the decoder; bail if the
+                            // consumer went away (JNI caller closed early).
+                            if latent_tx.send((next_latent.clone(), step)).is_err() {
+                                return Ok(());
+                            }
+                            if is_eos && eos_countdown.is_none() {
+                                eos_countdown = Some(chunk.frames_after_eos);
+                            }
+                            if let Some(c) = eos_countdown.as_mut() {
+                                if *c == 0 {
+                                    break;
+                                }
+                                *c -= 1;
+                            }
+                            prev_latent = next_latent;
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(|e| format!("spawn backbone: {e}"))?
+        };
+
+        let decoder = {
+            let model = self.model.clone();
+            std::thread::Builder::new()
+                .name("ptts-decoder".into())
+                .spawn(move || -> Result<(), String> {
+                    let mut mimi_state = model
+                        .init_mimi_state(1, 250)
+                        .map_err(|e| format!("init_mimi_state: {e}"))?;
+                    while let Ok((latent, _step)) = latent_rx.recv() {
+                        let audio_chunk = model
+                            .decode_latent(&latent, &mut mimi_state)
+                            .map_err(|e| format!("decode_latent: {e}"))?;
+                        let audio = audio_chunk
+                            .narrow(0, ..1)
+                            .and_then(|t| t.contiguous())
+                            .map_err(|e| format!("slice audio: {e}"))?;
+                        let pcm: Vec<f32> =
+                            audio.to_vec().map_err(|e| format!("audio.to_vec: {e}"))?;
+                        if pcm.is_empty() {
+                            continue;
+                        }
+                        if pcm_tx.send(pcm).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(|e| format!("spawn decoder: {e}"))?
+        };
+
+        self.run = Some(Run {
+            pcm_rx,
+            backbone: Some(backbone),
+            decoder: Some(decoder),
+            step_count,
+            step_total_ns,
+            started_at: Instant::now(),
+            first_chunk_at: None,
+            duration_s: 0.0,
+        });
         self.stats = Stats::default();
-        self.started_at = Some(Instant::now());
-        self.first_chunk_seen = false;
-        self.step_count = 0;
-        self.step_total_ms = 0.0;
         Ok(())
     }
 
-    /// Produce the next PCM chunk. Returns Ok(None) at end-of-stream.
+    /// Block until the next PCM chunk is ready, or return `Ok(None)` on EOS.
     pub fn next_chunk(&mut self) -> Result<Option<Vec<f32>>, String> {
-        loop {
-            let Some(gen_loop) = self.gen_loop.as_mut() else {
-                return Ok(None);
-            };
-
-            if gen_loop.cur.is_none() {
-                let next_chunk = match gen_loop.chunks.next() {
-                    None => {
-                        self.finish_stats();
-                        self.gen_loop = None;
-                        return Ok(None);
-                    }
-                    Some(c) => c,
-                };
-                let mut tts_state = gen_loop.base_state.clone();
-                self.model
-                    .prompt_text(&mut tts_state, &next_chunk.tokens)
-                    .map_err(|e| format!("prompt_text: {e}"))?;
-                let mimi_state = self
-                    .model
-                    .init_mimi_state(1, 250)
-                    .map_err(|e| format!("init_mimi_state: {e}"))?;
-                let ldim = self.model.flow_lm.ldim;
-                let nan_data: Vec<f32> = vec![f32::NAN; ldim];
-                let prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU)
-                    .map_err(|e| format!("init bos tensor: {e}"))?;
-                gen_loop.cur = Some(ActiveChunk {
-                    tts_state,
-                    mimi_state,
-                    prev_latent,
-                    rng: Rng::new(self.temperature, self.seed),
-                    max_frames: next_chunk.max_frames,
-                    frames_after_eos: next_chunk.frames_after_eos,
-                    eos_countdown: None,
-                    step: 0,
-                });
-            }
-
-            let cur = gen_loop.cur.as_mut().unwrap();
-            if cur.step >= cur.max_frames {
-                gen_loop.cur = None;
-                continue;
-            }
-
-            let step_start = Instant::now();
-            let (next_latent, is_eos) = self
-                .model
-                .generate_step(&mut cur.tts_state, &cur.prev_latent, &mut cur.rng)
-                .map_err(|e| format!("generate_step: {e}"))?;
-            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
-            self.step_count += 1;
-            self.step_total_ms += step_ms;
-
-            let audio_chunk = self
-                .model
-                .decode_latent(&next_latent, &mut cur.mimi_state)
-                .map_err(|e| format!("decode_latent: {e}"))?;
-            let audio = audio_chunk
-                .narrow(0, ..1)
-                .and_then(|t| t.contiguous())
-                .map_err(|e| format!("slice audio: {e}"))?;
-            let pcm: Vec<f32> = audio.to_vec().map_err(|e| format!("audio.to_vec: {e}"))?;
-
-            if is_eos && cur.eos_countdown.is_none() {
-                cur.eos_countdown = Some(cur.frames_after_eos);
-            }
-            let done_this_chunk = if let Some(c) = cur.eos_countdown.as_mut() {
-                if *c == 0 {
-                    true
-                } else {
-                    *c -= 1;
-                    false
+        let sr = self.sample_rate as f64;
+        let Some(run) = self.run.as_mut() else { return Ok(None) };
+        match run.pcm_rx.recv() {
+            Ok(pcm) => {
+                run.duration_s += pcm.len() as f64 / sr;
+                if run.first_chunk_at.is_none() {
+                    run.first_chunk_at = Some(Instant::now());
                 }
-            } else {
-                false
-            };
-
-            cur.prev_latent = next_latent;
-            cur.step += 1;
-            if done_this_chunk {
-                gen_loop.cur = None;
+                Ok(Some(pcm))
             }
-
-            self.stats.duration_s += pcm.len() as f64 / self.sample_rate() as f64;
-            if !self.first_chunk_seen && !pcm.is_empty() {
-                if let Some(started) = self.started_at {
-                    self.stats.first_audio_s = started.elapsed().as_secs_f64();
-                }
-                self.first_chunk_seen = true;
+            Err(_) => {
+                // Channel closed → both threads finished (or errored). Drain
+                // their Results so we propagate errors, then finalize stats.
+                self.finalize_run();
+                Ok(None)
             }
-
-            if pcm.is_empty() {
-                continue;
-            }
-            return Ok(Some(pcm));
         }
     }
 
-    fn finish_stats(&mut self) {
-        if let Some(started) = self.started_at {
-            self.stats.total_elapsed_s = started.elapsed().as_secs_f64();
-        }
-        if self.stats.total_elapsed_s > 0.0 {
-            self.stats.rtf = self.stats.duration_s / self.stats.total_elapsed_s;
-        }
-        if self.step_count > 0 {
-            self.stats.avg_step_ms = self.step_total_ms / self.step_count as f64;
-        }
-        self.stats.peak_rss_mb = peak_rss_mb();
+    fn finalize_run(&mut self) {
+        let Some(mut run) = self.run.take() else { return };
+        let bb_res = run.backbone.take().and_then(|h| h.join().ok());
+        let dec_res = run.decoder.take().and_then(|h| h.join().ok());
+
+        let total_elapsed_s = run.started_at.elapsed().as_secs_f64();
+        let duration_s = run.duration_s;
+        let step_count = run.step_count.load(Ordering::Relaxed);
+        let step_total_ns = run.step_total_ns.load(Ordering::Relaxed);
+        let avg_step_ms =
+            if step_count > 0 { (step_total_ns as f64 / step_count as f64) / 1.0e6 } else { 0.0 };
+        let first_audio_s = run
+            .first_chunk_at
+            .map(|t| t.saturating_duration_since(run.started_at).as_secs_f64())
+            .unwrap_or(0.0);
+        let rtf = if total_elapsed_s > 0.0 { duration_s / total_elapsed_s } else { 0.0 };
+        self.stats = Stats {
+            total_elapsed_s,
+            duration_s,
+            rtf,
+            avg_step_ms,
+            first_audio_s,
+            peak_rss_mb: peak_rss_mb(),
+        };
         info!(
-            "generated {:.2}s in {:.2}s (RTF={:.3}), avg step {:.2}ms, peak RSS {:.1} MB",
-            self.stats.duration_s,
-            self.stats.total_elapsed_s,
-            self.stats.rtf,
-            self.stats.avg_step_ms,
+            "generated {:.2}s in {:.2}s (RTF={:.3}), {} steps, avg backbone {:.1} ms, \
+             first audio {:.2}s, peak RSS {:.1} MB",
+            duration_s,
+            total_elapsed_s,
+            rtf,
+            step_count,
+            avg_step_ms,
+            first_audio_s,
             self.stats.peak_rss_mb,
         );
+        if let Some(Err(e)) = bb_res {
+            log::warn!("backbone thread error: {e}");
+        }
+        if let Some(Err(e)) = dec_res {
+            log::warn!("decoder thread error: {e}");
+        }
+    }
+
+    fn stop_run(&mut self) {
+        if self.run.is_some() {
+            // Drop the PCM receiver by clearing `run`; this unblocks pcm_tx
+            // sends on the decoder thread so it exits, which closes latent_rx
+            // and unblocks the backbone.
+            self.run = None;
+        }
     }
 
     pub fn stats(&self) -> [f32; 6] {
@@ -386,6 +416,93 @@ impl Session {
             self.stats.peak_rss_mb as f32,
         ]
     }
+}
+
+/// Load an `embeddings_v2/{voice}.safetensors` file and build a small TTSState
+/// whose flow LM KV cache matches the file exactly (no extra budget). Mirrors
+/// `pocket-tts-wasm::Model::add_voice_`.
+fn load_voice_kv_cache(path: &std::path::Path) -> Result<State, String> {
+    let tensors = xn::safetensors::load_from_file(path, &CPU)
+        .map_err(|e| format!("load voice safetensors: {e}"))?;
+    const NUM_LAYERS: usize = 6;
+    let mut layer_states = Vec::with_capacity(NUM_LAYERS);
+    for i in 0..NUM_LAYERS {
+        let cache_name = format!("transformer.layers.{i}.self_attn/cache");
+        let cache = match tensors.get(&cache_name) {
+            Some(TypedTensor::F32(t)) => t,
+            _ => return Err(format!("expected f32 tensor '{cache_name}' in voice file")),
+        };
+        let (two, batch, seq_len, num_heads, head_dim) =
+            cache.dims5().map_err(|e| format!("cache shape: {e}"))?;
+        if two != 2 {
+            return Err("voice cache first dim must be 2 (k/v)".into());
+        }
+        let k_cache = cache
+            .narrow(0, 0..1)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.reshape((batch, seq_len, num_heads, head_dim)))
+            .map_err(|e| format!("split k: {e}"))?;
+        let v_cache = cache
+            .narrow(0, 1..2)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.reshape((batch, seq_len, num_heads, head_dim)))
+            .map_err(|e| format!("split v: {e}"))?;
+        layer_states.push(LayerAttentionState::FlowLm(StreamingMHAState {
+            k_cache,
+            v_cache,
+            current_end: seq_len,
+        }));
+    }
+    Ok(TTSState {
+        flow_lm_state: FlowLMState {
+            transformer_state: StreamingTransformerState { layer_states },
+        },
+    })
+}
+
+/// Grow a cached voice state's KV buffers to the requested sequence budget,
+/// preserving the primed prefix. Mirrors `pocket-tts-wasm::resize_tts_state`.
+fn resize_tts_state(cached: &State, new_seq_budget: usize) -> Result<State, String> {
+    let mut new_layer_states = Vec::new();
+    for layer_state in cached.flow_lm_state.transformer_state.layer_states.iter() {
+        match layer_state {
+            LayerAttentionState::FlowLm(mha) => {
+                let current_end = mha.current_end;
+                let b = mha.k_cache.dim(0usize).map_err(|e| e.to_string())?;
+                let h = mha.k_cache.dim(2usize).map_err(|e| e.to_string())?;
+                let d = mha.k_cache.dim(3usize).map_err(|e| e.to_string())?;
+                let new_k = Tensor::zeros((b, new_seq_budget, h, d), &CPU)
+                    .map_err(|e| format!("alloc k: {e}"))?;
+                let new_v = Tensor::zeros((b, new_seq_budget, h, d), &CPU)
+                    .map_err(|e| format!("alloc v: {e}"))?;
+                if current_end > 0 {
+                    let k_used = mha
+                        .k_cache
+                        .narrow(1, 0..current_end)
+                        .and_then(|t| t.contiguous())
+                        .map_err(|e| format!("slice k: {e}"))?;
+                    let v_used = mha
+                        .v_cache
+                        .narrow(1, 0..current_end)
+                        .and_then(|t| t.contiguous())
+                        .map_err(|e| format!("slice v: {e}"))?;
+                    new_k.slice_set(&k_used, 1usize, 0).map_err(|e| format!("slice_set k: {e}"))?;
+                    new_v.slice_set(&v_used, 1usize, 0).map_err(|e| format!("slice_set v: {e}"))?;
+                }
+                new_layer_states.push(LayerAttentionState::FlowLm(StreamingMHAState {
+                    k_cache: new_k,
+                    v_cache: new_v,
+                    current_end,
+                }));
+            }
+            other => new_layer_states.push(other.clone()),
+        }
+    }
+    Ok(TTSState {
+        flow_lm_state: FlowLMState {
+            transformer_state: StreamingTransformerState { layer_states: new_layer_states },
+        },
+    })
 }
 
 fn peak_rss_mb() -> f64 {

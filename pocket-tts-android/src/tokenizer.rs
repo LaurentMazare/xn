@@ -11,6 +11,8 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct Unigram {
     vocab: HashMap<String, (u32, f32)>,
+    // id -> piece string (for decode)
+    pieces: Vec<String>,
     unk_id: u32,
 }
 
@@ -33,10 +35,11 @@ struct Piece {
 
 impl Unigram {
     pub fn from_proto_bytes(buf: &[u8]) -> Result<Self, TokenizerError> {
-        let pieces = parse_sentencepiece_model(buf)?;
-        let mut vocab: HashMap<String, (u32, f32)> = HashMap::with_capacity(pieces.len());
+        let proto_pieces = parse_sentencepiece_model(buf)?;
+        let mut vocab: HashMap<String, (u32, f32)> = HashMap::with_capacity(proto_pieces.len());
+        let mut pieces: Vec<String> = Vec::with_capacity(proto_pieces.len());
         let mut unk_id = 0u32;
-        for (i, p) in pieces.iter().enumerate() {
+        for (i, p) in proto_pieces.iter().enumerate() {
             if p.ty == 2 {
                 unk_id = i as u32;
             }
@@ -46,8 +49,9 @@ impl Unigram {
             if p.ty == 1 || p.ty == 4 || p.ty == 6 {
                 vocab.insert(p.piece.clone(), (i as u32, p.score));
             }
+            pieces.push(p.piece.clone());
         }
-        Ok(Self { vocab, unk_id })
+        Ok(Self { vocab, pieces, unk_id })
     }
 
     pub fn from_file(path: &str) -> Result<Self, TokenizerError> {
@@ -69,12 +73,17 @@ impl Unigram {
         self.viterbi(&normalized)
     }
 
-    pub fn decode(&self, _tokens: &[u32]) -> String {
-        // split_into_best_sentences calls decode on token sub-ranges to rebuild
-        // sentence text. The CLI implementation uses sentencepiece which joins
-        // pieces and replaces ▁ with a space. We don't need decode for the
-        // Android hot path, but provide a minimal implementation anyway.
-        String::new()
+    pub fn decode(&self, tokens: &[u32]) -> String {
+        // Mirror sentencepiece: concatenate pieces then turn the ▁ marker back
+        // into a space. `split_into_best_sentences` relies on decode returning
+        // a non-empty string per sub-range.
+        let mut out = String::new();
+        for &tok in tokens {
+            if let Some(p) = self.pieces.get(tok as usize) {
+                out.push_str(p);
+            }
+        }
+        out.replace('\u{2581}', " ")
     }
 
     fn viterbi(&self, text: &str) -> Vec<u32> {
