@@ -1693,6 +1693,7 @@ dependencies = [
  "ptts",
  "rand",
  "rand_distr",
+ "rayon",
  "xn",
 ]
 

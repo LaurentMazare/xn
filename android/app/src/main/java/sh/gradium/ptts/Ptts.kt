@@ -21,7 +21,11 @@ class Ptts private constructor(private val handle: Long) {
         @JvmStatic external fun nativeNextChunk(handle: Long): FloatArray?
         @JvmStatic external fun nativeStats(handle: Long): FloatArray
         @JvmStatic external fun nativeSampleRate(handle: Long): Int
+        @JvmStatic external fun nativeSetThreads(handle: Long, n: Int)
+        @JvmStatic external fun nativeNumCpus(): Int
         @JvmStatic external fun nativeFree(handle: Long)
+
+        fun numCpus(): Int = nativeNumCpus()
 
         fun init(weightsDir: String, voice: String): Ptts {
             val h = nativeInit(weightsDir, voice)
@@ -36,6 +40,8 @@ class Ptts private constructor(private val handle: Long) {
     fun nextChunk(): FloatArray? = nativeNextChunk(handle)
 
     fun sampleRate(): Int = nativeSampleRate(handle)
+
+    fun setThreads(n: Int) = nativeSetThreads(handle, n)
 
     fun stats(): Stats {
         val s = nativeStats(handle)

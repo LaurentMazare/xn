@@ -18,6 +18,7 @@ rand = { workspace = true, default-features = false, features = ["std", "std_rng
 rand_distr = { workspace = true }
 log = "0.4"
 libc = { workspace = true }
+rayon = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

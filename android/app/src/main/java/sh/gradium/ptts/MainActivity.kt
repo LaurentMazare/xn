@@ -23,6 +23,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
     private lateinit var textInput: EditText
     private lateinit var voiceSpinner: Spinner
+    private lateinit var threadsSpinner: Spinner
     private lateinit var generate: Button
     private lateinit var statsView: TextView
 
@@ -37,6 +38,7 @@ class MainActivity : AppCompatActivity() {
         progress = findViewById(R.id.progress)
         textInput = findViewById(R.id.text_input)
         voiceSpinner = findViewById(R.id.voice_spinner)
+        threadsSpinner = findViewById(R.id.threads_spinner)
         generate = findViewById(R.id.generate)
         statsView = findViewById(R.id.stats)
 
@@ -44,6 +46,10 @@ class MainActivity : AppCompatActivity() {
             this, android.R.layout.simple_spinner_dropdown_item, ModelDownloader.VOICES,
         )
         voiceSpinner.setSelection(0)
+
+        // threadsSpinner is populated with the real hardware cpu count once
+        // the native side is initialized (see bootstrap()); default selection
+        // lands on 4 to match the built-in floor.
 
         generate.setOnClickListener { onGenerate() }
 
@@ -89,6 +95,26 @@ class MainActivity : AppCompatActivity() {
         ptts = withContext(Dispatchers.Default) {
             Ptts.init(root.absolutePath, currentVoice)
         }
+
+        // Populate the thread spinner with 1..numCpus now that the library is
+        // loaded. Default selection: 4 (or num_cpus if smaller) to match the
+        // Rust-side floor.
+        val hw = Ptts.numCpus()
+        val threadOptions = (1..hw).map { it.toString() }
+        threadsSpinner.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, threadOptions,
+        )
+        threadsSpinner.setSelection(0) // default: 1 thread
+        threadsSpinner.onItemSelectedListener =
+            object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: android.widget.AdapterView<*>?, view: android.view.View?,
+                    pos: Int, id: Long,
+                ) {
+                    ptts?.setThreads(pos + 1)
+                }
+                override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            }
 
         progress.visibility = android.view.View.GONE
         status.text = "Ready — tap Generate."

@@ -140,15 +140,21 @@ impl Session {
         let tok = Unigram::from_file(tokenizer_path.to_str().unwrap())
             .map_err(|e| format!("tokenizer load: {e}"))?;
 
-        // Big.LITTLE: on a 1+4+4 Pixel 8a or similar, letting rayon use all 9
-        // cores drags matmul down to the slow A520 cluster. Cap at the big+mid
-        // cluster size so gemm only touches fast cores; the decoder thread we
-        // spawn in `start()` sits on a spare core. Tunable via $PTTS_THREADS.
+        // Force the rayon global pool to be created up-front with the full
+        // hardware thread count, so the UI can later dial the actual gemm
+        // parallelism anywhere in 1..=hw via `set_threads` (which only flips
+        // xn's atomic; the pool size is fixed after the first matmul).
+        //
+        // Default floor: 4 threads — big.LITTLE on Pixel 8a has a slow A520
+        // cluster that drags gemm down if we include it. `PTTS_THREADS` env
+        // var and the `setThreads` JNI method both override.
+        let hw = xn::get_num_cpus();
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(hw).build_global();
         let threads = std::env::var("PTTS_THREADS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or_else(|| xn::get_num_cpus().min(4));
+            .unwrap_or(1);
         xn::set_num_threads(threads);
 
         info!(
@@ -182,6 +188,18 @@ impl Session {
 
     pub fn sample_rate(&self) -> usize {
         self.sample_rate
+    }
+
+    /// Cap the number of rayon workers gemm uses per matmul. Safe to call
+    /// between generations; the underlying pool is already max-sized.
+    pub fn set_threads(&self, n: usize) {
+        let n = n.clamp(1, xn::get_num_cpus());
+        xn::set_num_threads(n);
+        info!("matmul parallelism set to {n}");
+    }
+
+    pub fn num_cpus(&self) -> usize {
+        xn::get_num_cpus()
     }
 
     /// Tokenize the input, build per-chunk token streams and spawn the
@@ -220,13 +238,16 @@ impl Session {
             return Err("no sentences".into());
         }
 
-        // Lazily load + resize the voice KV-cache state.
+        // Lazily load the voice's pre-primed KV-cache state. Kept at its
+        // original small size; resized once in the backbone thread per chunk
+        // (so the JNI thread doesn't stall on a ~27 MB alloc+copy).
         if self.voice_cached.is_none() {
+            let t0 = Instant::now();
             let cached = load_voice_kv_cache(&self.voice_path)?;
+            info!("voice state loaded in {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
             self.voice_cached = Some(cached);
         }
-        let cached = self.voice_cached.as_ref().unwrap();
-        let base_state = resize_tts_state(cached, max_seq_budget)?;
+        let cached_voice = self.voice_cached.as_ref().unwrap().clone();
         self.seq_budget = max_seq_budget;
 
         // Two channels:
@@ -249,10 +270,24 @@ impl Session {
                 .spawn(move || -> Result<(), String> {
                     let ldim = model.flow_lm.ldim;
                     for chunk in chunks.into_iter() {
-                        let mut tts_state = base_state.clone();
+                        let t_resize = Instant::now();
+                        let mut tts_state = resize_tts_state(&cached_voice, max_seq_budget)?;
+                        let before = layer_current_end(&tts_state);
+                        let t_prompt = Instant::now();
                         model
                             .prompt_text(&mut tts_state, &chunk.tokens)
                             .map_err(|e| format!("prompt_text: {e}"))?;
+                        let after = layer_current_end(&tts_state);
+                        info!(
+                            "chunk init: resize={:.1}ms prompt_text={:.1}ms \
+                             (budget={}, tokens={}, current_end before={:?} after={:?})",
+                            (t_prompt - t_resize).as_secs_f64() * 1000.0,
+                            t_prompt.elapsed().as_secs_f64() * 1000.0,
+                            max_seq_budget,
+                            chunk.tokens.len(),
+                            before,
+                            after,
+                        );
                         let nan_data: Vec<f32> = vec![f32::NAN; ldim];
                         let mut prev_latent = Tensor::from_vec(nan_data, (1, 1, ldim), &CPU)
                             .map_err(|e| format!("init bos tensor: {e}"))?;
@@ -426,6 +461,7 @@ fn load_voice_kv_cache(path: &std::path::Path) -> Result<State, String> {
         .map_err(|e| format!("load voice safetensors: {e}"))?;
     const NUM_LAYERS: usize = 6;
     let mut layer_states = Vec::with_capacity(NUM_LAYERS);
+    let mut primed_seq_lens = [0usize; NUM_LAYERS];
     for i in 0..NUM_LAYERS {
         let cache_name = format!("transformer.layers.{i}.self_attn/cache");
         let cache = match tensors.get(&cache_name) {
@@ -434,6 +470,7 @@ fn load_voice_kv_cache(path: &std::path::Path) -> Result<State, String> {
         };
         let (two, batch, seq_len, num_heads, head_dim) =
             cache.dims5().map_err(|e| format!("cache shape: {e}"))?;
+        primed_seq_lens[i] = seq_len;
         if two != 2 {
             return Err("voice cache first dim must be 2 (k/v)".into());
         }
@@ -453,6 +490,11 @@ fn load_voice_kv_cache(path: &std::path::Path) -> Result<State, String> {
             current_end: seq_len,
         }));
     }
+    info!(
+        "voice state: primed seq_len per layer = {:?} (current_end starts at this value; \
+         prompt_text then appends new K/V to positions seq_len..seq_len+n_text_tokens)",
+        primed_seq_lens,
+    );
     Ok(TTSState {
         flow_lm_state: FlowLMState {
             transformer_state: StreamingTransformerState { layer_states },
@@ -503,6 +545,19 @@ fn resize_tts_state(cached: &State, new_seq_budget: usize) -> Result<State, Stri
             transformer_state: StreamingTransformerState { layer_states: new_layer_states },
         },
     })
+}
+
+fn layer_current_end(state: &State) -> Vec<usize> {
+    state
+        .flow_lm_state
+        .transformer_state
+        .layer_states
+        .iter()
+        .map(|s| match s {
+            LayerAttentionState::FlowLm(mha) => mha.current_end,
+            _ => 0,
+        })
+        .collect()
 }
 
 fn peak_rss_mb() -> f64 {
@@ -646,6 +701,29 @@ mod jni_bindings {
         let h = unsafe { &*(handle as *const Handle) };
         let sess = h.0.lock().unwrap();
         sess.sample_rate() as jint
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_sh_gradium_ptts_Ptts_nativeSetThreads(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        n: jint,
+    ) {
+        if handle == 0 {
+            return;
+        }
+        let h = unsafe { &*(handle as *const Handle) };
+        let sess = h.0.lock().unwrap();
+        sess.set_threads(n as usize);
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_sh_gradium_ptts_Ptts_nativeNumCpus(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> jint {
+        xn::get_num_cpus() as jint
     }
 
     #[unsafe(no_mangle)]

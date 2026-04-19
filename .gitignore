@@ -24,3 +24,4 @@ tmp/
 *.wav
 .DS_Store
 .gradle
+android/app/build
