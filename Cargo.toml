@@ -2,6 +2,7 @@
 members = [
   "xn-core",
   "pocket-tts",
+  "pocket-tts-android",
   "pocket-tts-pyo3",
   "pocket-tts-wasm",
   "xn-moshi",
@@ -60,3 +61,10 @@ debug = true
 [profile.release-no-debug]
 inherits = "release"
 debug = false
+
+[profile.android-release]
+inherits = "release"
+debug = false
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

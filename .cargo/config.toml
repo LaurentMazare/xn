@@ -6,3 +6,9 @@ rustflags = ["-C", "target-feature=+simd128", "--cfg", "getrandom_backend=\"wasm
 
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-feature=-avx,-avx2"]
+
+# Android: modern arm64 cores (Cortex-A76+ / Apple/Qualcomm M-series) support
+# ARMv8.2 FP16 — gemm-f16 requires it. 2016+ flagships always have it; plain
+# Cortex-A53/A55 phones do not and are not our target.
+[target.aarch64-linux-android]
+rustflags = ["-C", "target-feature=+fp16"]
