@@ -300,6 +300,11 @@ impl QTensor {
         self.storage.dequantize(self.shape.elem_count())
     }
 
+    pub fn to_tensor(&self) -> Result<crate::Tensor<f32, crate::CpuDevice>> {
+        let data = self.dequantize()?;
+        crate::Tensor::from_vec(data, self.shape.clone(), &crate::CpuDevice)
+    }
+
     pub fn storage_size_in_bytes(&self) -> usize {
         self.storage.size_in_bytes()
     }
