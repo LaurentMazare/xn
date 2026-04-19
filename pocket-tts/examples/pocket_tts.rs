@@ -373,8 +373,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                 let voice_names = voice_vb.tensor_names();
                 let voice_key =
                     voice_names.first().context("no tensors found in voice embedding file")?;
-                let voice_td = voice_vb.get_tensor(voice_key).context("voice tensor not found")?;
-                let voice_shape = &voice_td.shape;
+                let voice_shape = voice_vb.shape(voice_key).context("voice tensor not found")?;
                 let voice_dims = voice_shape.dims();
 
                 // Load as raw tensor and reshape to [1, T, dim]
