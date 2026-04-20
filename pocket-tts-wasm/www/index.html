@@ -53,6 +53,15 @@
       <option value="azelma">Azelma</option>
     </select>
   </div>
+  <div class="section">
+    <label for="quant">Quantization</label>
+    <select id="quant">
+      <option value="f32" selected>f32</option>
+      <option value="q8">q8</option>
+      <option value="q6">q6</option>
+      <option value="q4">q4</option>
+    </select>
+  </div>
   <button id="load-btn">Load Weights (240MB)</button>
   <button id="generate-btn" style="display:none">Generate</button>
   <div class="slider-section">
@@ -71,6 +80,7 @@ const statusEl = document.getElementById('status');
 const loadBtn = document.getElementById('load-btn');
 const btn = document.getElementById('generate-btn');
 const voiceSelect = document.getElementById('voice');
+const quantSelect = document.getElementById('quant');
 const progressBar = document.getElementById('progress-bar');
 const progressFill = document.getElementById('progress-fill');
 const canvas = document.getElementById('visualizer');
@@ -313,7 +323,8 @@ function concatenateChunks(chunks) {
 
 function loadWeights() {
   loadBtn.disabled = true;
-  worker.postMessage({ type: 'load', voiceName: voiceSelect.value });
+  quantSelect.disabled = true;
+  worker.postMessage({ type: 'load', voiceName: voiceSelect.value, quant: quantSelect.value });
 }
 
 function generate() {

@@ -16,7 +16,8 @@ use ptts::mimi::MimiState;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
-use xn::{CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
+use xn::quantized::{Q6kF32, Q40F32, Q80F32};
+use xn::{BackendQ, CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
 struct PresetTokenizer {
@@ -103,15 +104,20 @@ fn remap_key(name: &str) -> Option<String> {
     Some(name)
 }
 
-/// Creates a new TTSState with a larger seq_budget, copying the used KV entries
+/// Underlying type-erased transformer state, shared across all supported quantizations
+/// (all of them use `T = f32, B = CpuDevice`).
+type RawState = StreamingTransformerState<f32, CpuDevice>;
+
+fn wrap_state<Q: BackendQ<T = f32, B = CpuDevice>>(raw: RawState) -> TTSState<Q> {
+    TTSState { flow_lm_state: FlowLMState { transformer_state: raw } }
+}
+
+/// Creates a new transformer state with a larger seq_budget, copying the used KV entries
 /// from a cached state (which was allocated with a smaller budget).
-fn resize_tts_state(
-    cached: &TTSState<Unquantized<f32, CpuDevice>>,
-    new_seq_budget: usize,
-) -> xn::Result<TTSState<Unquantized<f32, CpuDevice>>> {
-    console_log!("[resize_tts_state] resizing to seq_budget={new_seq_budget}");
+fn resize_state(cached: &RawState, new_seq_budget: usize) -> xn::Result<RawState> {
+    console_log!("[resize_state] resizing to seq_budget={new_seq_budget}");
     let mut new_layer_states = Vec::new();
-    for layer_state in cached.flow_lm_state.transformer_state.layer_states.iter() {
+    for layer_state in cached.layer_states.iter() {
         match layer_state {
             LayerAttentionState::FlowLm(mha_state) => {
                 let current_end = mha_state.current_end;
@@ -137,15 +143,60 @@ fn resize_tts_state(
             }
         }
     }
-    Ok(TTSState {
-        flow_lm_state: FlowLMState {
-            transformer_state: StreamingTransformerState { layer_states: new_layer_states },
-        },
-    })
+    Ok(StreamingTransformerState { layer_states: new_layer_states })
+}
+
+/// Quantization variants exposed to JS.
+#[derive(Clone, Copy, Debug)]
+enum Quant {
+    F32,
+    Q8,
+    Q6,
+    Q4,
+}
+
+impl Quant {
+    fn parse(s: &str) -> xn::Result<Self> {
+        match s {
+            "f32" => Ok(Self::F32),
+            "q8" => Ok(Self::Q8),
+            "q6" => Ok(Self::Q6),
+            "q4" => Ok(Self::Q4),
+            other => xn::bail!("unsupported quantization '{other}'"),
+        }
+    }
+}
+
+enum ModelInner {
+    F32(TTSModel<Unquantized<f32, CpuDevice>>),
+    Q8(TTSModel<Q80F32>),
+    Q6(TTSModel<Q6kF32>),
+    Q4(TTSModel<Q40F32>),
+}
+
+enum StateInner {
+    F32(TTSState<Unquantized<f32, CpuDevice>>),
+    Q8(TTSState<Q80F32>),
+    Q6(TTSState<Q6kF32>),
+    Q4(TTSState<Q40F32>),
+}
+
+/// Dispatch a block of code over the currently active (model, state) pair. Within the
+/// block, `$m` is `&TTSModel<Q>` and `$s` is `&mut TTSState<Q>` for the matching `Q`.
+macro_rules! dispatch {
+    ($inner:expr, $state:expr, |$m:ident, $s:ident| $body:block) => {
+        match ($inner, $state) {
+            (ModelInner::F32($m), StateInner::F32($s)) => $body,
+            (ModelInner::Q8($m), StateInner::Q8($s)) => $body,
+            (ModelInner::Q6($m), StateInner::Q6($s)) => $body,
+            (ModelInner::Q4($m), StateInner::Q4($s)) => $body,
+            _ => xn::bail!("model/state quantization mismatch"),
+        }
+    };
 }
 
 struct GenState {
-    tts_state: TTSState<Unquantized<f32, CpuDevice>>,
+    tts_state: StateInner,
     mimi_state: MimiState<f32, CpuDevice>,
     prev_latent: Tensor<f32, CpuDevice>,
     rng: WasmRng,
@@ -157,15 +208,17 @@ struct GenState {
 
 #[wasm_bindgen]
 pub struct Model {
-    inner: TTSModel<Unquantized<f32, CpuDevice>>,
+    inner: ModelInner,
     tokenizer: std::sync::Arc<PresetTokenizer>,
     cfg: TTSConfig,
     gen_state: Option<GenState>,
-    voice_states: Vec<TTSState<Unquantized<f32, CpuDevice>>>,
+    voice_states: Vec<RawState>,
 }
 
 impl Model {
-    pub fn new_(model_weights: &[u8]) -> xn::Result<Model> {
+    pub fn new_(model_weights: &[u8], quant: &str) -> xn::Result<Model> {
+        let quant = Quant::parse(quant)?;
+        console_log!("[new] loading model with quant={quant:?}");
         let cfg = TTSConfig::v202601(0.7);
 
         let vb = VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?;
@@ -173,10 +226,19 @@ impl Model {
         let tokenizer = std::sync::Arc::new(PresetTokenizer::new());
         let tokenizer_box: Box<dyn ptts::Tokenizer + Send + Sync> =
             Box::new(SharedTokenizer(std::sync::Arc::clone(&tokenizer)));
-        let model: TTSModel<Unquantized<f32, CpuDevice>> =
-            TTSModel::load(&root, tokenizer_box, &cfg)?;
 
-        Ok(Model { inner: model, tokenizer, cfg, gen_state: None, voice_states: Vec::new() })
+        let inner = match quant {
+            Quant::F32 => ModelInner::F32(TTSModel::<Unquantized<f32, CpuDevice>>::load(
+                &root,
+                tokenizer_box,
+                &cfg,
+            )?),
+            Quant::Q8 => ModelInner::Q8(TTSModel::<Q80F32>::load(&root, tokenizer_box, &cfg)?),
+            Quant::Q6 => ModelInner::Q6(TTSModel::<Q6kF32>::load(&root, tokenizer_box, &cfg)?),
+            Quant::Q4 => ModelInner::Q4(TTSModel::<Q40F32>::load(&root, tokenizer_box, &cfg)?),
+        };
+
+        Ok(Model { inner, tokenizer, cfg, gen_state: None, voice_states: Vec::new() })
     }
 
     /// Load a pre-computed KV cache state from a safetensors buffer.
@@ -217,13 +279,9 @@ impl Model {
             }));
         }
 
-        let tts_state = TTSState {
-            flow_lm_state: FlowLMState {
-                transformer_state: StreamingTransformerState { layer_states },
-            },
-        };
+        let raw = StreamingTransformerState { layer_states };
         let idx = self.voice_states.len();
-        self.voice_states.push(tts_state);
+        self.voice_states.push(raw);
         Ok(idx)
     }
 
@@ -252,11 +310,20 @@ impl Model {
             xn::bail!("invalid voice index: {voice_index}");
         }
         let cached = &self.voice_states[voice_index];
-        let mut tts_state = resize_tts_state(cached, seq_budget)?;
-        let mimi_state = self.inner.init_mimi_state(1, 250)?;
+        let raw = resize_state(cached, seq_budget)?;
+
+        let mut tts_state = match &self.inner {
+            ModelInner::F32(_) => StateInner::F32(wrap_state(raw)),
+            ModelInner::Q8(_) => StateInner::Q8(wrap_state(raw)),
+            ModelInner::Q6(_) => StateInner::Q6(wrap_state(raw)),
+            ModelInner::Q4(_) => StateInner::Q4(wrap_state(raw)),
+        };
 
         console_log!("[start_generation] running prompt_text...");
-        self.inner.prompt_text(&mut tts_state, token_ids)?;
+        let mimi_state = dispatch!(&self.inner, &mut tts_state, |m, s| {
+            m.prompt_text(s, token_ids)?;
+            m.init_mimi_state(1, 250)?
+        });
         console_log!("[start_generation] prompt_text done, starting generation loop");
 
         let rng = WasmRng::new(temperature);
@@ -288,10 +355,13 @@ impl Model {
             return Ok(None);
         }
 
-        let (next_latent, is_eos) =
-            self.inner.generate_step(&mut state.tts_state, &state.prev_latent, &mut state.rng)?;
-
-        let audio_chunk = self.inner.decode_latent(&next_latent, &mut state.mimi_state)?;
+        let (next_latent, audio_chunk, is_eos) =
+            dispatch!(&self.inner, &mut state.tts_state, |m, s| {
+                let (next_latent, is_eos) =
+                    m.generate_step(s, &state.prev_latent, &mut state.rng)?;
+                let audio_chunk = m.decode_latent(&next_latent, &mut state.mimi_state)?;
+                (next_latent, audio_chunk, is_eos)
+            });
 
         if is_eos && state.eos_countdown.is_none() {
             state.eos_countdown = Some(state.frames_after_eos);
@@ -326,8 +396,8 @@ impl Model {
 #[wasm_bindgen]
 impl Model {
     #[wasm_bindgen(constructor)]
-    pub fn new(model_weights: &[u8]) -> Result<Model, JsError> {
-        Self::new_(model_weights).map_err(|e| JsError::new(&e.to_string()))
+    pub fn new(model_weights: &[u8], quant: &str) -> Result<Model, JsError> {
+        Self::new_(model_weights, quant).map_err(|e| JsError::new(&e.to_string()))
     }
 
     pub fn add_voice(&mut self, voice_weights: &[u8]) -> Result<usize, JsError> {
@@ -360,6 +430,11 @@ impl Model {
     }
 
     pub fn sample_rate(&self) -> usize {
-        self.inner.sample_rate()
+        match &self.inner {
+            ModelInner::F32(m) => m.sample_rate(),
+            ModelInner::Q8(m) => m.sample_rate(),
+            ModelInner::Q6(m) => m.sample_rate(),
+            ModelInner::Q4(m) => m.sample_rate(),
+        }
     }
 }

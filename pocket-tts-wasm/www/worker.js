@@ -206,7 +206,7 @@ let model = null;
 let tokenizer = null;
 let voiceIndexMap = {};
 
-async function handleLoad() {
+async function handleLoad(quant) {
   const wasmModule = await wasmModulePromise;
   await init(wasmModule);
   post('status', { message: 'WASM initialized. Downloading tokenizer and model...' });
@@ -218,8 +218,8 @@ async function handleLoad() {
 
   const modelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
 
-  post('status', { message: 'Initializing model...' });
-  model = new Model(modelWeights);
+  post('status', { message: `Initializing model (quant=${quant})...` });
+  model = new Model(modelWeights, quant);
 
   for (const name of VOICE_NAMES) {
     post('status', { message: `Loading voice: ${name}...` });
@@ -256,7 +256,7 @@ self.onmessage = async (e) => {
   const { type, ...data } = e.data;
   try {
     if (type === 'load') {
-      await handleLoad();
+      await handleLoad(data.quant || 'f32');
     } else if (type === 'generate') {
       await handleGenerate(data.text, data.voiceName, data.temperature);
     }
