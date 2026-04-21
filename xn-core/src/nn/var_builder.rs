@@ -249,6 +249,25 @@ impl<B: Backend> VB<B> {
         &self.device
     }
 
+    /// Returns a quantized tensor if the underlying data is from a GGUF file, otherwise returns
+    /// None.
+    pub fn qtensor<T: WithDTypeF>(&self, name: &str) -> Result<Option<crate::quantized::QTensor>> {
+        match &self.data {
+            VBData::Mmap(_) | VBData::Bytes(_) => Ok(None),
+            VBData::Gguf(content, reader) => {
+                let tensor = {
+                    let mut reader = reader.lock().unwrap();
+                    content.tensor(&mut *reader, name)?
+                };
+                {
+                    let mut t = self.used.lock().unwrap();
+                    t.insert(name.to_string());
+                }
+                Ok(Some(tensor))
+            }
+        }
+    }
+
     pub fn tensor<T: WithDTypeF>(
         &self,
         name: &str,
