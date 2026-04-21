@@ -398,6 +398,24 @@ macro_rules! backend_q_f32 {
             fn from_linear(l: crate::nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ> {
                 QLinear::from_linear(l, $dtype)
             }
+
+            fn linear_load<V: std::borrow::Borrow<crate::nn::Path<Self::B>>>(
+                vb: V,
+                in_features: usize,
+                out_features: usize,
+            ) -> Result<Self::LinearQ> {
+                if let Some(qt) = vb.borrow().qtensor("weight")? {
+                    if qt.shape().dims() != [out_features, in_features] {
+                        crate::bail!(
+                            "quantized weight tensor has wrong shape {:?}, expected [{out_features}, {in_features}]",
+                            qt.shape()
+                        )
+                    }
+                    return Ok(QLinear::new(qt));
+                }
+                let l = crate::nn::Linear::load(vb, in_features, out_features)?;
+                Self::from_linear(l)
+            }
         }
     };
 }
