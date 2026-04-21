@@ -411,6 +411,7 @@ macro_rules! backend_q_f32 {
                             qt.shape()
                         )
                     }
+                    // TODO(laurent): maybe we should change the quants if they don't match Self?
                     return Ok(QLinear::new(qt));
                 }
                 let l = crate::nn::Linear::load(vb, in_features, out_features)?;
