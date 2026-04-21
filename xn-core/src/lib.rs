@@ -92,6 +92,15 @@ pub trait BackendQ: Clone + 'static {
     type LinearQ: ModuleT<T = Self::T, B = Self::B> + Send + Sync;
 
     fn from_linear(l: nn::Linear<Self::T, Self::B>) -> Result<Self::LinearQ>;
+
+    fn linear_load<V: std::borrow::Borrow<nn::Path<Self::B>>>(
+        vb: V,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Self::LinearQ> {
+        let l = nn::Linear::load(vb, in_features, out_features)?;
+        Self::from_linear(l)
+    }
 }
 
 #[derive(Clone)]

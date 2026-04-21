@@ -67,10 +67,8 @@ pub struct StreamingMultiheadAttention<Q: BackendQ> {
 impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
     pub fn load(vb: &Path<Q::B>, embed_dim: usize, num_heads: usize) -> Result<Self> {
         let out_dim = 3 * embed_dim;
-        let in_proj = Linear::load(vb.pp("in_proj"), embed_dim, out_dim)?;
-        let in_proj = Q::from_linear(in_proj)?;
-        let out_proj = Linear::load(vb.pp("out_proj"), embed_dim, embed_dim)?;
-        let out_proj = Q::from_linear(out_proj)?;
+        let in_proj = Q::linear_load(vb.pp("in_proj"), embed_dim, out_dim)?;
+        let out_proj = Q::linear_load(vb.pp("out_proj"), embed_dim, embed_dim)?;
         let name = vb.prefix();
         let device = vb.device().clone();
         Ok(Self { in_proj, out_proj, embed_dim, num_heads, name, device })
@@ -334,10 +332,8 @@ impl<Q: BackendQ> StreamingTransformerLayer<Q> {
 
         let norm1 = LayerNorm::load(vb.pp("norm1"), d_model, 1e-5)?;
         let norm2 = LayerNorm::load(vb.pp("norm2"), d_model, 1e-5)?;
-        let linear1 = Linear::load(vb.pp("linear1"), d_model, dim_feedforward)?;
-        let linear1 = Q::from_linear(linear1)?;
-        let linear2 = Linear::load(vb.pp("linear2"), dim_feedforward, d_model)?;
-        let linear2 = Q::from_linear(linear2)?;
+        let linear1 = Q::linear_load(vb.pp("linear1"), d_model, dim_feedforward)?;
+        let linear2 = Q::linear_load(vb.pp("linear2"), dim_feedforward, d_model)?;
 
         let layer_scale_1 = if layer_scale.is_some() {
             Some(LayerScale::load(&vb.pp("layer_scale_1"), d_model)?)
