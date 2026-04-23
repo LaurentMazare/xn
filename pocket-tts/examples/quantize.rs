@@ -17,6 +17,9 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
 
+    #[arg(long)]
+    force_bf16: bool,
+
     /// Also exclude mimi.encoder* weights from the output
     #[arg(long)]
     no_mimi_encoder: bool,
@@ -64,10 +67,17 @@ fn tensor_to_f32(tensor: &TypedTensor<xn::CpuDevice>) -> Result<Vec<f32>> {
     Ok(vec)
 }
 
-fn as_is_qtensor(tensor: &TypedTensor<xn::CpuDevice>) -> Result<QTensor> {
+fn as_is_qtensor(tensor: &TypedTensor<xn::CpuDevice>, force_bf16: bool) -> Result<QTensor> {
     let shape = tensor.shape().clone();
     let qtensor = match tensor {
-        TypedTensor::F32(t) => QTensor::new(QStorage::Cpu(Box::new(t.to_vec()?)), shape)?,
+        TypedTensor::F32(t) => {
+            if force_bf16 {
+                let t = t.to::<half::bf16>()?;
+                QTensor::new(QStorage::Cpu(Box::new(t.to_vec()?)), shape)?
+            } else {
+                QTensor::new(QStorage::Cpu(Box::new(t.to_vec()?)), shape)?
+            }
+        }
         TypedTensor::F16(t) => QTensor::new(QStorage::Cpu(Box::new(t.to_vec()?)), shape)?,
         TypedTensor::BF16(t) => QTensor::new(QStorage::Cpu(Box::new(t.to_vec()?)), shape)?,
         TypedTensor::I64(_) => bail!("I64 tensors cannot be stored in GGUF"),
@@ -118,7 +128,7 @@ fn main() -> Result<()> {
                 let data = tensor_to_f32(tensor)?;
                 QTensor::quantize_f32(&data, tensor.shape(), dtype)?
             }
-            _ => as_is_qtensor(tensor)?,
+            _ => as_is_qtensor(tensor, args.force_bf16)?,
         };
         let size_mb = qtensor.storage_size_in_bytes() as f64 / (1024.0 * 1024.0);
         println!(
