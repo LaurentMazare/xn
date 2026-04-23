@@ -183,6 +183,8 @@ impl VBData {
     }
 }
 
+impl Reader for std::io::BufReader<std::fs::File> {}
+
 /// A self-contained VarBuilder that owns its data (memory-mapped files or byte buffers).
 pub struct VB<B: Backend> {
     data: VBData,
@@ -221,6 +223,19 @@ impl<B: Backend> VB<B> {
         })?;
         let used = Mutex::new(Default::default());
         Ok(Self { data: VBData::Mmap(yoke), used, device })
+    }
+
+    pub fn load_gguf_with_key_map<R: Reader + 'static>(
+        mut reader: R,
+        device: B,
+        key_map: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let content = crate::quantized::gguf_file::Content::read(&mut reader)?;
+        let content = content.apply_key_map(key_map);
+        let reader = Mutex::new(Box::new(reader) as Box<dyn Reader>);
+        let data = VBData::Gguf(content, reader);
+        let used = Mutex::new(Default::default());
+        Ok(Self { data, used, device })
     }
 
     pub fn from_bytes(data: Vec<Vec<u8>>, device: B) -> Result<Self> {

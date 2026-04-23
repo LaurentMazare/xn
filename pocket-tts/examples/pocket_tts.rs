@@ -31,6 +31,9 @@ struct Args {
     config: Option<String>,
 
     #[arg(long)]
+    weights: Option<String>,
+
+    #[arg(long)]
     cfg_coef: Option<f32>,
 
     /// Output WAV file path
@@ -292,11 +295,15 @@ where
 }
 
 fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()> {
+    use std::str::FromStr;
     let (model_path, tokenizer_path, voice, cfg) = match args.config.as_ref() {
         Some(config) => {
             let config = std::fs::canonicalize(config)?;
             let parent = config.parent().context("config path has no parent")?;
-            let model_path = parent.join("model.safetensors");
+            let model_path = match args.weights.as_ref() {
+                None => parent.join("model.safetensors"),
+                Some(p) => std::path::PathBuf::from_str(p)?,
+            };
             let tokenizer_path = parent.join("tokenizer.model");
             tracing::info!(?config, "using local config");
             let config: ptts::tts_model::TTSConfig =
@@ -305,6 +312,9 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
             (model_path, tokenizer_path, voice, config)
         }
         None => {
+            if args.weights.is_some() {
+                anyhow::bail!("--weights option is not supported without --config");
+            }
             let voice = args.voice.unwrap_or("alba".to_string());
             if !VOICES.contains(&voice.as_str()) && !std::path::PathBuf::from(&voice).exists() {
                 anyhow::bail!("unknown voice '{voice}'. Available voices: {}", VOICES.join(", "));
@@ -333,7 +343,15 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
         xn::with_f16c()
     );
 
-    let vb = VB::load_with_key_map(&[&model_path], dev.clone(), remap_key)?.root();
+    tracing::info!(?model_path, "loading model");
+    let vb = if model_path.extension().and_then(|v| v.to_str()) == Some("gguf") {
+        let reader = std::fs::File::open(&model_path)?;
+        let reader = std::io::BufReader::new(reader);
+        VB::load_gguf_with_key_map(reader, dev.clone(), remap_key)?
+    } else {
+        VB::load_with_key_map(&[&model_path], dev.clone(), remap_key)?
+    };
+    let vb = vb.root();
     let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"

@@ -452,6 +452,24 @@ impl Content {
         Ok(Self { magic, metadata, tensor_infos, tensor_data_offset })
     }
 
+    pub fn apply_key_map(self, key_map: impl Fn(&str) -> Option<String>) -> Self {
+        let mut tensor_infos = std::collections::HashMap::new();
+        for (key, value) in self.tensor_infos.into_iter() {
+            match key_map(key.as_str()) {
+                None => continue,
+                Some(key) => {
+                    tensor_infos.insert(key, value);
+                }
+            }
+        }
+        Self {
+            magic: self.magic,
+            metadata: self.metadata,
+            tensor_infos,
+            tensor_data_offset: self.tensor_data_offset,
+        }
+    }
+
     pub fn tensor<R: std::io::Seek + std::io::Read>(
         &self,
         reader: &mut R,
