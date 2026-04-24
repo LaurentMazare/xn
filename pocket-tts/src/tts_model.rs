@@ -80,6 +80,7 @@ impl TTSConfig {
                 transformer_context: 250,
                 transformer_max_period: 10000.0,
                 transformer_dim_feedforward: 2048,
+                downsample_channel_wise: false,
             },
             temp,
             lsd_decode_steps: 1,

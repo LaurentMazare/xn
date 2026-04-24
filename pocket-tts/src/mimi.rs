@@ -31,6 +31,8 @@ pub struct MimiConfig {
     pub transformer_context: usize,
     pub transformer_max_period: f32,
     pub transformer_dim_feedforward: usize,
+    #[serde(default)]
+    pub downsample_channel_wise: bool,
 }
 
 pub struct MimiModel<Q: BackendQ> {
@@ -127,8 +129,12 @@ impl<Q: BackendQ> MimiModel<Q> {
 
         let (downsample, upsample) = if (encoder_frame_rate - cfg.frame_rate).abs() > 0.01 {
             let downsample_stride = (encoder_frame_rate / cfg.frame_rate) as usize;
-            let ds =
-                ConvDownsample1d::load(&vb.pp("downsample"), downsample_stride, cfg.dimension)?;
+            let ds = ConvDownsample1d::load(
+                &vb.pp("downsample"),
+                downsample_stride,
+                cfg.dimension,
+                cfg.downsample_channel_wise,
+            )?;
             let us = ConvTrUpsample1d::load(&vb.pp("upsample"), downsample_stride, cfg.dimension)?;
             (Some(ds), Some(us))
         } else {
