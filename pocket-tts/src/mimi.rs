@@ -42,18 +42,16 @@ pub struct MimiModel<Q: BackendQ> {
     downsample: Option<ConvDownsample1d<Q::T, Q::B>>,
     upsample: Option<ConvTrUpsample1d<Q::T, Q::B>>,
     frame_rate: f64,
-    _encoder_frame_rate: f64,
     pub sample_rate: usize,
-    _dimension: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct MimiState<T: WithDTypeF, B: Backend> {
-    _encoder_state: SEANetEncoderState<T, B>,
+    encoder_state: SEANetEncoderState<T, B>,
     decoder_state: SEANetDecoderState<T, B>,
-    _encoder_transformer_state: StreamingTransformerState<T, B>,
+    encoder_transformer_state: StreamingTransformerState<T, B>,
     decoder_transformer_state: StreamingTransformerState<T, B>,
-    _downsample_state: Option<StreamingConv1dState<T, B>>,
+    downsample_state: Option<StreamingConv1dState<T, B>>,
     upsample_state: Option<StreamingConvTr1dState<T, B>>,
 }
 
@@ -146,9 +144,7 @@ impl<Q: BackendQ> MimiModel<Q> {
             downsample,
             upsample,
             frame_rate: cfg.frame_rate,
-            _encoder_frame_rate: encoder_frame_rate,
             sample_rate: cfg.sample_rate,
-            _dimension: cfg.dimension,
         })
     }
 
@@ -165,20 +161,20 @@ impl<Q: BackendQ> MimiModel<Q> {
             Some(us) => Some(us.init_state(batch_size)?),
             None => None,
         };
-        let _downsample_state = match &self.downsample {
+        let downsample_state = match &self.downsample {
             Some(ds) => Some(ds.init_state(batch_size)?),
             None => None,
         };
         let s = MimiState {
-            _encoder_state: self.encoder.init_state(batch_size)?,
+            encoder_state: self.encoder.init_state(batch_size)?,
             decoder_state: self.decoder.init_state(batch_size)?,
-            _encoder_transformer_state: self
+            encoder_transformer_state: self
                 .encoder_transformer
                 .init_state(batch_size, sequence_length)?,
             decoder_transformer_state: self
                 .decoder_transformer
                 .init_state(batch_size, sequence_length)?,
-            _downsample_state,
+            downsample_state,
             upsample_state,
         };
         Ok(s)
@@ -191,17 +187,35 @@ impl<Q: BackendQ> MimiModel<Q> {
         let mut enc_state = self.encoder.init_state(x.dim(0usize)?)?;
         let emb = self.encoder.forward(&x, &mut enc_state)?;
         let mut et_state = self.encoder_transformer.init_state(x.dim(0usize)?, 8192)?;
-        let outs = self.encoder_transformer.forward(&emb, &mut et_state)?;
-        let emb = &outs[0];
+        let mut outs = self.encoder_transformer.forward(&emb, &mut et_state)?;
+        let emb = outs.swap_remove(0);
         // Downsample to frame rate
         match &self.downsample {
-            Some(ds) => ds.forward_no_state(emb),
-            None => Ok(emb.clone()),
+            Some(ds) => ds.forward_no_state(&emb),
+            None => Ok(emb),
+        }
+    }
+
+    pub fn encode_to_latent_step(
+        &self,
+        x: &Tensor<Q::T, Q::B>,
+        state: &mut MimiState<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        let frame_size = self.frame_size();
+        let x = pad_for_conv1d(x, frame_size, frame_size)?;
+        let emb = self.encoder.forward(&x, &mut state.encoder_state)?;
+        let mut outs =
+            self.encoder_transformer.forward(&emb, &mut state.encoder_transformer_state)?;
+        let emb = outs.swap_remove(0);
+        // Downsample to frame rate
+        match (&self.downsample, &mut state.downsample_state) {
+            (Some(ds), Some(ds_state)) => ds.forward(&emb, ds_state),
+            _ => Ok(emb),
         }
     }
 
     /// Decode from latent to audio (streaming). Input: [B, C, T'].
-    pub fn decode_from_latent(
+    pub fn decode_from_latent_step(
         &self,
         latent: &Tensor<Q::T, Q::B>,
         state: &mut MimiState<Q::T, Q::B>,

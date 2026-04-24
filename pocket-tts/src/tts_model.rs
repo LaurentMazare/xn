@@ -287,7 +287,7 @@ impl<Q: BackendQ> TTSModel<Q> {
         // Convert from Q::T to f32 for mimi
         let f32_transposed = transposed.to()?;
         let quantized = self.mimi.quantizer.forward(&f32_transposed)?;
-        self.mimi.decode_from_latent(&quantized, mimi_state)
+        self.mimi.decode_from_latent_step(&quantized, mimi_state)
     }
 
     /// Initialize mimi streaming state.

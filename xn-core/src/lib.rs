@@ -20,7 +20,7 @@ pub mod utils;
 
 pub use backend::Backend;
 pub use dtype::{DType, DTypeQ, WithDType, WithDTypeF};
-pub use error::{Error, Result};
+pub use error::{Context, Error, Result};
 pub use shape::{D, Dim, Shape};
 pub use tensor::{Tensor, TypedTensor};
 pub use tensor_view::{TensorOrView, TensorView};
