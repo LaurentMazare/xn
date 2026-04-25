@@ -119,7 +119,8 @@ impl<Q: BackendQ> TTSModel<Q> {
         let mimi = MimiModel::load(&vb.pp("mimi"), &cfg.mimi)?;
 
         let speaker_proj = if vb.contains("flow_lm.speaker_proj_weight") {
-            let weights = vb.tensor("flow_lm.speaker_proj_weight", (1024, 512))?;
+            let weights = vb
+                .tensor("flow_lm.speaker_proj_weight", (cfg.flow_lm.d_model, cfg.mimi.dimension))?;
             Some(Linear::new(weights))
         } else {
             None
