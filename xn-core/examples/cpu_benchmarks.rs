@@ -39,16 +39,32 @@ const QM: usize = 125;
 const QK: usize = 4096;
 const QN: usize = 1024;
 
-// Pre-quantized q8_0 lhs (m × k_blocks) and q8_0 rhs (n × k_blocks). Both
-// `QMatMul` and `QMatMulSgemm` reuse this so the f32→q8_0 conversion is not
-// timed.
-type QData = (Vec<BlockQ8_0>, Vec<BlockQ8_0>);
+// Number of distinct weight matrices to rotate through. With QN=1024,
+// QK=4096, q8_0, each weight is ~4.25 MiB; 24 of them (~102 MiB) is well
+// past typical L3 caches so each iteration pays the cost of streaming the
+// weight from RAM, matching real LLM inference behaviour.
+const Q_WEIGHTS: usize = 24;
+
+// Pre-quantized q8_0 lhs (m × k_blocks) and `Q_WEIGHTS` q8_0 rhs matrices
+// (n × k_blocks each). Both `QMatMul` and `QMatMulSgemm` reuse this so the
+// f32→q8_0 conversion is not timed. The atomic counter cycles through the
+// weight matrices to defeat L3 caching.
+struct QData {
+    lhs: Vec<BlockQ8_0>,
+    rhs: Vec<Vec<BlockQ8_0>>,
+    counter: std::sync::atomic::AtomicUsize,
+}
 
 fn q_preprocess() -> Result<QData> {
     let k_blocks = QK / QK8_0;
     let lhs = vec![BlockQ8_0::zeros(); QM * k_blocks];
-    let rhs = vec![BlockQ8_0::zeros(); QN * k_blocks];
-    Ok((lhs, rhs))
+    let rhs = (0..Q_WEIGHTS).map(|_| vec![BlockQ8_0::zeros(); QN * k_blocks]).collect();
+    Ok(QData { lhs, rhs, counter: std::sync::atomic::AtomicUsize::new(0) })
+}
+
+fn q_pick_rhs(d: &QData) -> &[BlockQ8_0] {
+    let idx = d.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % d.rhs.len();
+    &d.rhs[idx]
 }
 
 // Existing per-row mul-vec path: for each output row, parallelise over
@@ -64,9 +80,10 @@ impl Benchmark for QMatMul {
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
         let k_blocks = QK / QK8_0;
+        let rhs = q_pick_rhs(d);
         let mut dst = vec![0f32; QM * QN];
         for row_idx in 0..QM {
-            let lhs_row = &d.0[row_idx * k_blocks..(row_idx + 1) * k_blocks];
+            let lhs_row = &d.lhs[row_idx * k_blocks..(row_idx + 1) * k_blocks];
             let dst_row = &mut dst[row_idx * QN..(row_idx + 1) * QN];
             let result: Result<Vec<_>> = dst_row
                 .into_par_iter()
@@ -74,7 +91,7 @@ impl Benchmark for QMatMul {
                 .with_min_len(128)
                 .with_max_len(512)
                 .map(|(col_idx, dst)| {
-                    let rhs_col = &d.1[col_idx * k_blocks..(col_idx + 1) * k_blocks];
+                    let rhs_col = &rhs[col_idx * k_blocks..(col_idx + 1) * k_blocks];
                     BlockQ8_0::vec_dot(QK, rhs_col, lhs_row).map(|value| *dst = value)
                 })
                 .collect();
@@ -83,7 +100,7 @@ impl Benchmark for QMatMul {
         Ok(dst)
     }
 
-    const ITERS: usize = 5;
+    const ITERS: usize = Q_WEIGHTS;
 }
 
 // New blocked sgemm path: q8_0 × q8_0 → f32 via `neon::sgemm_q8_0_q8_0`.
@@ -101,16 +118,17 @@ impl Benchmark for QMatMulSgemm {
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
         let k_blocks = QK / QK8_0;
+        let rhs = q_pick_rhs(d);
         // sgemm output is column-major with stride `ldc`; here we use ldc = QM
         // so the buffer is tightly packed.
         let mut dst = vec![0f32; QM * QN];
         xn::quantized::neon::sgemm_q8_0_q8_0(
-            QM, QN, k_blocks, &d.0, k_blocks, &d.1, k_blocks, &mut dst, QM, 0, 1,
+            QM, QN, k_blocks, &d.lhs, k_blocks, rhs, k_blocks, &mut dst, QM, 0, 1,
         )?;
         Ok(dst)
     }
 
-    const ITERS: usize = 5;
+    const ITERS: usize = Q_WEIGHTS;
 }
 
 struct MatVec;
