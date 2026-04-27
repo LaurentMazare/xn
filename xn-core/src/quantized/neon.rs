@@ -49,6 +49,30 @@ unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
     vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
 }
 
+// Ternary `acc + dot(a, b)` form, matching the 3-arg `vdotq_s32(acc, a, b)`
+// used in the cpp reference. With dotprod this maps to a single `sdot`
+// instruction that fuses the multiply-accumulate; without it we fall back
+// to `vaddq + vdotq`, which costs the same as the old code path.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn vdotq_acc_s32(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    let mut acc = acc;
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack),
+    );
+    acc
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+#[inline(always)]
+unsafe fn vdotq_acc_s32(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    vaddq_s32(acc, vdotq_s32(a, b))
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> Result<f32> {
     let qk = QK8_0;
@@ -278,12 +302,11 @@ impl TinyBlasQ0Arm {
                         let a_hi = vld1q_s8(a.qs.as_ptr().add(16));
                         let b_lo = vld1q_s8(b.qs.as_ptr());
                         let b_hi = vld1q_s8(b.qs.as_ptr().add(16));
-                        // The cpp code threads the dot product through the
-                        // 3-arg `vdotq_s32(acc, a, b)`. That intrinsic is
-                        // not in stable Rust, so accumulate into an i32x4
-                        // and add — the 2-arg `vdotq_s32` above handles a
-                        // 16-byte chunk at a time.
-                        let p = vaddq_s32(vdotq_s32(a_lo, b_lo), vdotq_s32(a_hi, b_hi));
+                        // Chain through the 3-arg `vdotq_acc_s32` matching
+                        // the cpp source. With dotprod this is two `sdot`
+                        // instructions (one zeroing, one accumulating);
+                        // without it the helper falls back to vdotq + vaddq.
+                        let p = vdotq_acc_s32(vdotq_s32(a_lo, b_lo), a_hi, b_hi);
                         let scale = a.d.to_f32() * b.d.to_f32();
                         cv[j][i] = vmlaq_n_f32(cv[j][i], vcvtq_f32_s32(p), scale);
                     }
