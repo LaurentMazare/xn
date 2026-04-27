@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use rayon::prelude::*;
 use xn::Result;
 use xn::quantized::GgmlType;
 use xn::quantized::k_quants::{BlockQ8_0, QK8_0};
@@ -38,59 +39,73 @@ const QM: usize = 125;
 const QK: usize = 4096;
 const QN: usize = 1024;
 
-// Existing per-row mul-vec path: f32 lhs × q8_0 rhs (rhs already transposed).
-// `k_quants::matmul` quantizes the lhs to q8_0 internally and parallelises
-// across output columns with rayon.
+// Pre-quantized q8_0 lhs (m × k_blocks) and q8_0 rhs (n × k_blocks). Both
+// `QMatMul` and `QMatMulSgemm` reuse this so the f32→q8_0 conversion is not
+// timed.
+type QData = (Vec<BlockQ8_0>, Vec<BlockQ8_0>);
+
+fn q_preprocess() -> Result<QData> {
+    let k_blocks = QK / QK8_0;
+    let lhs = vec![BlockQ8_0::zeros(); QM * k_blocks];
+    let rhs = vec![BlockQ8_0::zeros(); QN * k_blocks];
+    Ok((lhs, rhs))
+}
+
+// Existing per-row mul-vec path: for each output row, parallelise over
+// columns and call `vec_dot` (matches the inner loop of `k_quants::matmul`,
+// minus the lhs quantization step that we pre-do in `q_preprocess`).
 struct QMatMul;
 impl Benchmark for QMatMul {
-    type PreProcessData = (Vec<f32>, Vec<BlockQ8_0>);
+    type PreProcessData = QData;
     type RunResult = Vec<f32>;
     fn preprocess() -> Result<Self::PreProcessData> {
-        let lhs = vec![0f32; QM * QK];
-        let rhs = vec![BlockQ8_0::zeros(); QN * QK / QK8_0];
-        Ok((lhs, rhs))
+        q_preprocess()
     }
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
+        let k_blocks = QK / QK8_0;
         let mut dst = vec![0f32; QM * QN];
-        xn::quantized::k_quants::matmul((QM, QK, QN), &d.0, &d.1, &mut dst)?;
+        for row_idx in 0..QM {
+            let lhs_row = &d.0[row_idx * k_blocks..(row_idx + 1) * k_blocks];
+            let dst_row = &mut dst[row_idx * QN..(row_idx + 1) * QN];
+            let result: Result<Vec<_>> = dst_row
+                .into_par_iter()
+                .enumerate()
+                .with_min_len(128)
+                .with_max_len(512)
+                .map(|(col_idx, dst)| {
+                    let rhs_col = &d.1[col_idx * k_blocks..(col_idx + 1) * k_blocks];
+                    BlockQ8_0::vec_dot(QK, rhs_col, lhs_row).map(|value| *dst = value)
+                })
+                .collect();
+            result?;
+        }
         Ok(dst)
     }
 
     const ITERS: usize = 5;
 }
 
-// New blocked sgemm path: q8_0 × q8_0 → f32 via `neon::sgemm_q8_0_q8_0`. The
-// lhs is quantized inline each iteration so the comparison includes the same
-// f32→q8_0 conversion that `QMatMul` performs internally. Single-threaded —
-// the existing matmul uses rayon over output columns, so expect the gap to
-// shrink on multi-core machines.
+// New blocked sgemm path: q8_0 × q8_0 → f32 via `neon::sgemm_q8_0_q8_0`.
+// Single-threaded — the existing matmul uses rayon over output columns, so
+// expect the gap to shrink on multi-core machines.
 #[cfg(target_feature = "neon")]
 struct QMatMulSgemm;
 #[cfg(target_feature = "neon")]
 impl Benchmark for QMatMulSgemm {
-    type PreProcessData = (Vec<f32>, Vec<BlockQ8_0>);
+    type PreProcessData = QData;
     type RunResult = Vec<f32>;
     fn preprocess() -> Result<Self::PreProcessData> {
-        let lhs = vec![0f32; QM * QK];
-        let rhs = vec![BlockQ8_0::zeros(); QN * QK / QK8_0];
-        Ok((lhs, rhs))
+        q_preprocess()
     }
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
         let k_blocks = QK / QK8_0;
-        let mut lhs_q = vec![BlockQ8_0::zeros(); QM * k_blocks];
-        for row in 0..QM {
-            BlockQ8_0::from_float(
-                &d.0[row * QK..(row + 1) * QK],
-                &mut lhs_q[row * k_blocks..(row + 1) * k_blocks],
-            )?;
-        }
         // sgemm output is column-major with stride `ldc`; here we use ldc = QM
         // so the buffer is tightly packed.
         let mut dst = vec![0f32; QM * QN];
         xn::quantized::neon::sgemm_q8_0_q8_0(
-            QM, QN, k_blocks, &lhs_q, k_blocks, &d.1, k_blocks, &mut dst, QM, 0, 1,
+            QM, QN, k_blocks, &d.0, k_blocks, &d.1, k_blocks, &mut dst, QM, 0, 1,
         )?;
         Ok(dst)
     }
