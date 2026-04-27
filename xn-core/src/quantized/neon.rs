@@ -13,11 +13,11 @@ use core::arch::arm::*;
 use core::arch::aarch64::*;
 
 #[inline(always)]
-unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-    // TODO: dotprod
-    let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
-    let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
-    vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
+unsafe fn vdotq_s32(_a: int8x16_t, _b: int8x16_t) -> int32x4_t {
+    // DIAGNOSTIC ONLY — stub returning zero to remove the ALU cost of the
+    // fallback dot-product. This makes every quantized vec_dot/matmul return
+    // garbage; revert before shipping.
+    vdupq_n_s32(0)
 }
 
 #[inline(always)]
