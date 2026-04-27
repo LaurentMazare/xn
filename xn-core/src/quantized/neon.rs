@@ -12,9 +12,38 @@ use core::arch::arm::*;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
+// `vdotq_s32` is the int8x16_t × int8x16_t → int32x4_t dot product. Rust's
+// `core::arch::aarch64::vdotq_s32` intrinsic is still nightly-only (gated by
+// `stdarch_neon_dotprod`), so when the `dotprod` target feature is enabled
+// we drop into inline asm to emit the `sdot` instruction directly. The
+// fallback synthesises the same operation from `vmull` + `vpaddlq` and is
+// roughly 5× more expensive on a single dot product.
+//
+// Apple Silicon and any aarch64 chip from ~2018 on has dotprod, but Rust
+// does not always turn it on by default. To opt in, either set
+// `RUSTFLAGS="-C target-feature=+dotprod"` or pin a recent CPU via
+// `-C target-cpu=apple-m1` (or `apple-a14`/`neoverse-n1`/etc.). The
+// quickest project-local switch is a `.cargo/config.toml`:
+//
+//     [target.aarch64-apple-darwin]
+//     rustflags = ["-C", "target-feature=+dotprod"]
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 #[inline(always)]
 unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-    // TODO: dotprod
+    let mut acc = vdupq_n_s32(0);
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack),
+    );
+    acc
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+#[inline(always)]
+unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
     let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
     let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
     vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
