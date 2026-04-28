@@ -12,12 +12,65 @@ use core::arch::arm::*;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
+// `vdotq_s32` is the int8x16_t × int8x16_t → int32x4_t dot product. Rust's
+// `core::arch::aarch64::vdotq_s32` intrinsic is still nightly-only (gated by
+// `stdarch_neon_dotprod`), so when the `dotprod` target feature is enabled
+// we drop into inline asm to emit the `sdot` instruction directly. The
+// fallback synthesises the same operation from `vmull` + `vpaddlq` and is
+// roughly 5× more expensive on a single dot product.
+//
+// Apple Silicon and any aarch64 chip from ~2018 on has dotprod, but Rust
+// does not always turn it on by default. To opt in, either set
+// `RUSTFLAGS="-C target-feature=+dotprod"` or pin a recent CPU via
+// `-C target-cpu=apple-m1` (or `apple-a14`/`neoverse-n1`/etc.). The
+// quickest project-local switch is a `.cargo/config.toml`:
+//
+//     [target.aarch64-apple-darwin]
+//     rustflags = ["-C", "target-feature=+dotprod"]
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 #[inline(always)]
 unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-    // TODO: dotprod
+    let mut acc = vdupq_n_s32(0);
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack),
+    );
+    acc
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+#[inline(always)]
+unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
     let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
     let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
     vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
+}
+
+// Ternary `acc + dot(a, b)` form, matching the 3-arg `vdotq_s32(acc, a, b)`
+// used in the cpp reference. With dotprod this maps to a single `sdot`
+// instruction that fuses the multiply-accumulate; without it we fall back
+// to `vaddq + vdotq`, which costs the same as the old code path.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+#[inline(always)]
+unsafe fn vdotq_acc_s32(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    let mut acc = acc;
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack),
+    );
+    acc
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
+#[inline(always)]
+unsafe fn vdotq_acc_s32(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    vaddq_s32(acc, vdotq_s32(a, b))
 }
 
 #[inline(always)]
@@ -90,6 +143,212 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
                 vmlaq_n_f32(sumv0, vcvtq_f32_s32(vaddq_s32(p0, p1)), x0.d.to_f32() * y0.d.to_f32());
         }
         Ok(vaddvq_f32(sumv0))
+    }
+}
+
+// Quantized matrix multiplication, mirroring `tinyBLAS_Q0_ARM` from
+// llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp. Both lhs and rhs are
+// `BlockQ8_0`; the rhs result is float. `lda`/`ldb` are leading dimensions
+// expressed in `BlockQ8_0` units (one block covers QK8_0 = 32 elements),
+// `ldc` is in f32 units. Output layout matches the C++ version: the
+// element at row `i`, column `j` is stored at `c[ldc * j + i]`.
+//
+// `ith`/`nth` partition the work across `nth` threads (single-threaded:
+// `ith = 0, nth = 1`). The inner kernel uses the 2-arg `vdotq_s32` defined
+// above since the 3-arg dotprod intrinsic is not available in stable Rust.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_q8_0_q8_0(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[BlockQ8_0],
+    lda: usize,
+    b: &[BlockQ8_0],
+    ldb: usize,
+    c: &mut [f32],
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+) -> Result<()> {
+    if nth == 0 {
+        crate::bail!("sgemm_q8_0_q8_0: nth must be > 0")
+    }
+    if ith >= nth {
+        crate::bail!("sgemm_q8_0_q8_0: ith {ith} >= nth {nth}")
+    }
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k > 0 {
+        if a.len() < lda * (m - 1) + k {
+            crate::bail!("sgemm_q8_0_q8_0: a slice too small ({} < {})", a.len(), lda * (m - 1) + k)
+        }
+        if b.len() < ldb * (n - 1) + k {
+            crate::bail!("sgemm_q8_0_q8_0: b slice too small ({} < {})", b.len(), ldb * (n - 1) + k)
+        }
+    }
+    if c.len() < ldc * (n - 1) + m {
+        crate::bail!("sgemm_q8_0_q8_0: c slice too small ({} < {})", c.len(), ldc * (n - 1) + m)
+    }
+    let blas = TinyBlasQ0Arm {
+        k,
+        a: a.as_ptr(),
+        lda,
+        b: b.as_ptr(),
+        ldb,
+        c: c.as_mut_ptr(),
+        ldc,
+        ith,
+        nth,
+    };
+    unsafe { blas.matmul(m, n) };
+    Ok(())
+}
+
+struct TinyBlasQ0Arm {
+    k: usize,
+    a: *const BlockQ8_0,
+    lda: usize,
+    b: *const BlockQ8_0,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+}
+
+impl TinyBlasQ0Arm {
+    #[inline]
+    unsafe fn matmul(&self, m: usize, n: usize) {
+        self.mnpack(0, m, 0, n)
+    }
+
+    #[inline(never)]
+    unsafe fn mnpack(&self, m0: usize, m: usize, n0: usize, n: usize) {
+        let mr = (m - m0).min(4);
+        let nr = (n - n0).min(4);
+        let (mc, nc) = match (mr << 4) | nr {
+            0x44 => {
+                self.gemm::<4, 4>(m0, m, n0, n);
+                (4, 4)
+            }
+            0x43 => {
+                self.gemm::<4, 3>(m0, m, n0, n);
+                (4, 3)
+            }
+            0x34 => {
+                self.gemm::<3, 4>(m0, m, n0, n);
+                (3, 4)
+            }
+            0x42 => {
+                self.gemm::<4, 2>(m0, m, n0, n);
+                (4, 2)
+            }
+            0x24 => {
+                self.gemm::<2, 4>(m0, m, n0, n);
+                (2, 4)
+            }
+            0x41 => {
+                self.gemm::<4, 1>(m0, m, n0, n);
+                (4, 1)
+            }
+            0x14 => {
+                self.gemm::<1, 4>(m0, m, n0, n);
+                (1, 4)
+            }
+            0x33 => {
+                self.gemm::<3, 3>(m0, m, n0, n);
+                (3, 3)
+            }
+            0x32 => {
+                self.gemm::<3, 2>(m0, m, n0, n);
+                (3, 2)
+            }
+            0x23 => {
+                self.gemm::<2, 3>(m0, m, n0, n);
+                (2, 3)
+            }
+            0x22 => {
+                self.gemm::<2, 2>(m0, m, n0, n);
+                (2, 2)
+            }
+            0x31 => {
+                self.gemm::<3, 1>(m0, m, n0, n);
+                (3, 1)
+            }
+            0x13 => {
+                self.gemm::<1, 3>(m0, m, n0, n);
+                (1, 3)
+            }
+            0x21 => {
+                self.gemm::<2, 1>(m0, m, n0, n);
+                (2, 1)
+            }
+            0x12 => {
+                self.gemm::<1, 2>(m0, m, n0, n);
+                (1, 2)
+            }
+            0x11 => {
+                self.gemm::<1, 1>(m0, m, n0, n);
+                (1, 1)
+            }
+            _ => return,
+        };
+        let mp = m0 + (m - m0) / mc * mc;
+        let np = n0 + (n - n0) / nc * nc;
+        self.mnpack(mp, m, n0, np);
+        self.mnpack(m0, m, np, n);
+    }
+
+    #[inline(never)]
+    unsafe fn gemm<const RM: usize, const RN: usize>(
+        &self,
+        m0: usize,
+        m: usize,
+        n0: usize,
+        n: usize,
+    ) {
+        let ytiles = (m - m0) / RM;
+        let xtiles = (n - n0) / RN;
+        let tiles = xtiles * ytiles;
+        if tiles == 0 {
+            return;
+        }
+        let duty = tiles.div_ceil(self.nth);
+        let start = duty * self.ith;
+        let end = (start + duty).min(tiles);
+        let zero = vdupq_n_f32(0.0);
+        for job in start..end {
+            let ii = m0 + job / xtiles * RM;
+            let jj = n0 + job % xtiles * RN;
+            let mut cv = [[zero; RM]; RN];
+            for l in 0..self.k {
+                for (j, cv) in cv.iter_mut().enumerate() {
+                    for (i, cv) in cv.iter_mut().enumerate() {
+                        let a = &*self.a.add(self.lda * (ii + i) + l);
+                        let b = &*self.b.add(self.ldb * (jj + j) + l);
+                        let a_lo = vld1q_s8(a.qs.as_ptr());
+                        let a_hi = vld1q_s8(a.qs.as_ptr().add(16));
+                        let b_lo = vld1q_s8(b.qs.as_ptr());
+                        let b_hi = vld1q_s8(b.qs.as_ptr().add(16));
+                        // Chain 3-arg `vdotq_acc_s32`: with dotprod this is
+                        // two `sdot` instructions (one zeroing, one
+                        // accumulating); without it the helper falls back to
+                        // vdotq + vaddq. Use `vfmaq_n_f32` (not `vmlaq_n_f32`)
+                        // so the multiply-add fuses into a single `fmla`
+                        // rather than separate `fmul`/`fadd`.
+                        let p = vdotq_acc_s32(vdotq_s32(a_lo, b_lo), a_hi, b_hi);
+                        let scale = a.d.to_f32() * b.d.to_f32();
+                        *cv = vfmaq_n_f32(*cv, vcvtq_f32_s32(p), scale);
+                    }
+                }
+            }
+            for (j, cv) in cv.iter().enumerate() {
+                for (i, cv) in cv.iter().enumerate() {
+                    *self.c.add(self.ldc * (jj + j) + (ii + i)) = vaddvq_f32(*cv);
+                }
+            }
+        }
     }
 }
 
