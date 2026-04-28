@@ -98,6 +98,197 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
     }
 }
 
+// Quantized matrix multiplication, mirroring `tinyBLAS_Q0_AVX` from
+// llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp. Both lhs and rhs are
+// `BlockQ8_0`; the result is float. `lda`/`ldb` are leading dimensions
+// expressed in `BlockQ8_0` units (one block covers QK8_0 = 32 elements),
+// `ldc` is in f32 units. Output layout matches the C++ version: the
+// element at row `i`, column `j` is stored at `c[ldc * j + i]`.
+//
+// `ith`/`nth` partition the work across `nth` threads (single-threaded:
+// `ith = 0, nth = 1`). The inner kernel uses the same AVX2 path as cpp's
+// `updot` — `_mm256_madd_epi16(1, _mm256_maddubs_epi16(u, s))` via the
+// existing `mul_sum_i8_pairs_float` helper. AVX-512 / VNNI / F16C-batched
+// variants are intentionally not implemented; tile-size dispatch follows
+// the cpp 16-register path (i.e. without `VECTOR_REGISTERS == 32`).
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_q8_0_q8_0(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[BlockQ8_0],
+    lda: usize,
+    b: &[BlockQ8_0],
+    ldb: usize,
+    c: &mut [f32],
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+) -> Result<()> {
+    if nth == 0 {
+        crate::bail!("sgemm_q8_0_q8_0: nth must be > 0")
+    }
+    if ith >= nth {
+        crate::bail!("sgemm_q8_0_q8_0: ith {ith} >= nth {nth}")
+    }
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k > 0 {
+        if a.len() < lda * (m - 1) + k {
+            crate::bail!("sgemm_q8_0_q8_0: a slice too small ({} < {})", a.len(), lda * (m - 1) + k)
+        }
+        if b.len() < ldb * (n - 1) + k {
+            crate::bail!("sgemm_q8_0_q8_0: b slice too small ({} < {})", b.len(), ldb * (n - 1) + k)
+        }
+    }
+    if c.len() < ldc * (n - 1) + m {
+        crate::bail!("sgemm_q8_0_q8_0: c slice too small ({} < {})", c.len(), ldc * (n - 1) + m)
+    }
+    let blas = TinyBlasQ0Avx {
+        k,
+        a: a.as_ptr(),
+        lda,
+        b: b.as_ptr(),
+        ldb,
+        c: c.as_mut_ptr(),
+        ldc,
+        ith,
+        nth,
+    };
+    unsafe { blas.matmul(m, n) };
+    Ok(())
+}
+
+struct TinyBlasQ0Avx {
+    k: usize,
+    a: *const BlockQ8_0,
+    lda: usize,
+    b: *const BlockQ8_0,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+}
+
+impl TinyBlasQ0Avx {
+    #[inline]
+    unsafe fn matmul(&self, m: usize, n: usize) {
+        self.mnpack(0, m, 0, n)
+    }
+
+    #[inline(never)]
+    unsafe fn mnpack(&self, m0: usize, m: usize, n0: usize, n: usize) {
+        let mr = (m - m0).min(4);
+        let nr = (n - n0).min(4);
+        // 16-YMM-register dispatch from cpp (no `VECTOR_REGISTERS == 32`):
+        // 4×N tiles collapse to 4×2, N×4 to 2×4, etc.
+        let (mc, nc) = match (mr << 4) | nr {
+            0x42..=0x44 => {
+                self.gemm::<4, 2>(m0, m, n0, n);
+                (4, 2)
+            }
+            0x34 | 0x24 => {
+                self.gemm::<2, 4>(m0, m, n0, n);
+                (2, 4)
+            }
+            0x33 | 0x32 => {
+                self.gemm::<3, 2>(m0, m, n0, n);
+                (3, 2)
+            }
+            0x23 => {
+                self.gemm::<2, 3>(m0, m, n0, n);
+                (2, 3)
+            }
+            0x41 => {
+                self.gemm::<4, 1>(m0, m, n0, n);
+                (4, 1)
+            }
+            0x22 => {
+                self.gemm::<2, 2>(m0, m, n0, n);
+                (2, 2)
+            }
+            0x14 => {
+                self.gemm::<1, 4>(m0, m, n0, n);
+                (1, 4)
+            }
+            0x31 => {
+                self.gemm::<3, 1>(m0, m, n0, n);
+                (3, 1)
+            }
+            0x13 => {
+                self.gemm::<1, 3>(m0, m, n0, n);
+                (1, 3)
+            }
+            0x21 => {
+                self.gemm::<2, 1>(m0, m, n0, n);
+                (2, 1)
+            }
+            0x12 => {
+                self.gemm::<1, 2>(m0, m, n0, n);
+                (1, 2)
+            }
+            0x11 => {
+                self.gemm::<1, 1>(m0, m, n0, n);
+                (1, 1)
+            }
+            _ => return,
+        };
+        let mp = m0 + (m - m0) / mc * mc;
+        let np = n0 + (n - n0) / nc * nc;
+        self.mnpack(mp, m, n0, np);
+        self.mnpack(m0, m, np, n);
+    }
+
+    #[inline(never)]
+    unsafe fn gemm<const RM: usize, const RN: usize>(
+        &self,
+        m0: usize,
+        m: usize,
+        n0: usize,
+        n: usize,
+    ) {
+        let ytiles = (m - m0) / RM;
+        let xtiles = (n - n0) / RN;
+        let tiles = xtiles * ytiles;
+        if tiles == 0 {
+            return;
+        }
+        let duty = tiles.div_ceil(self.nth);
+        let start = duty * self.ith;
+        let end = (start + duty).min(tiles);
+        let zero = _mm256_setzero_ps();
+        for job in start..end {
+            let ii = m0 + job / xtiles * RM;
+            let jj = n0 + job % xtiles * RN;
+            let mut cv = [[zero; RM]; RN];
+            for l in 0..self.k {
+                for (j, cv) in cv.iter_mut().enumerate() {
+                    for (i, cv) in cv.iter_mut().enumerate() {
+                        let a = &*self.a.add(self.lda * (ii + i) + l);
+                        let b = &*self.b.add(self.ldb * (jj + j) + l);
+                        let av = _mm256_loadu_si256(a.qs.as_ptr() as *const __m256i);
+                        let bv = _mm256_loadu_si256(b.qs.as_ptr() as *const __m256i);
+                        // Matches cpp's `updot(sign(a, a), sign(b, a))` AVX2
+                        // path: the abs-then-flip-sign trick that turns the
+                        // int8×int8 dot product into the unsigned form
+                        // supported by `vpmaddubsw`.
+                        let dot = mul_sum_i8_pairs_float(av, bv);
+                        let scale = _mm256_set1_ps(f16::to_f32(a.d) * f16::to_f32(b.d));
+                        *cv = _mm256_fmadd_ps(scale, dot, *cv);
+                    }
+                }
+            }
+            for (j, cv) in cv.iter().enumerate() {
+                for (i, cv) in cv.iter().enumerate() {
+                    *self.c.add(self.ldc * (jj + j) + (ii + i)) = hsum_float_8(*cv);
+                }
+            }
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn get_scale_shuffle(i: usize) -> __m128i {
     const K_SHUFFLE: [u8; 128] = [

@@ -4,6 +4,7 @@ use k_quants::*;
 use std::borrow::Cow;
 
 #[cfg(target_feature = "avx")]
+#[allow(unsafe_op_in_unsafe_fn)]
 pub mod avx;
 pub mod ggml_file;
 pub mod gguf_file;
