@@ -156,6 +156,7 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
 // `ith`/`nth` partition the work across `nth` threads (single-threaded:
 // `ith = 0, nth = 1`). The inner kernel uses the 2-arg `vdotq_s32` defined
 // above since the 3-arg dotprod intrinsic is not available in stable Rust.
+#[allow(clippy::too_many_arguments)]
 pub fn sgemm_q8_0_q8_0(
     m: usize,
     n: usize,
@@ -224,9 +225,37 @@ impl TinyBlasQ0Arm {
 
     #[inline(never)]
     unsafe fn mnpack(&self, m0: usize, m: usize, n0: usize, n: usize) {
-        let mr = (m - m0).min(3);
-        let nr = (n - n0).min(3);
+        let mr = (m - m0).min(4);
+        let nr = (n - n0).min(4);
         let (mc, nc) = match (mr << 4) | nr {
+            0x44 => {
+                self.gemm::<4, 4>(m0, m, n0, n);
+                (4, 4)
+            }
+            0x43 => {
+                self.gemm::<4, 3>(m0, m, n0, n);
+                (4, 3)
+            }
+            0x34 => {
+                self.gemm::<3, 4>(m0, m, n0, n);
+                (3, 4)
+            }
+            0x42 => {
+                self.gemm::<4, 2>(m0, m, n0, n);
+                (4, 2)
+            }
+            0x24 => {
+                self.gemm::<2, 4>(m0, m, n0, n);
+                (2, 4)
+            }
+            0x41 => {
+                self.gemm::<4, 1>(m0, m, n0, n);
+                (4, 1)
+            }
+            0x14 => {
+                self.gemm::<1, 4>(m0, m, n0, n);
+                (1, 4)
+            }
             0x33 => {
                 self.gemm::<3, 3>(m0, m, n0, n);
                 (3, 3)
@@ -294,27 +323,29 @@ impl TinyBlasQ0Arm {
             let jj = n0 + job % xtiles * RN;
             let mut cv = [[zero; RM]; RN];
             for l in 0..self.k {
-                for j in 0..RN {
-                    for i in 0..RM {
+                for (j, cv) in cv.iter_mut().enumerate() {
+                    for (i, cv) in cv.iter_mut().enumerate() {
                         let a = &*self.a.add(self.lda * (ii + i) + l);
                         let b = &*self.b.add(self.ldb * (jj + j) + l);
                         let a_lo = vld1q_s8(a.qs.as_ptr());
                         let a_hi = vld1q_s8(a.qs.as_ptr().add(16));
                         let b_lo = vld1q_s8(b.qs.as_ptr());
                         let b_hi = vld1q_s8(b.qs.as_ptr().add(16));
-                        // Chain through the 3-arg `vdotq_acc_s32` matching
-                        // the cpp source. With dotprod this is two `sdot`
-                        // instructions (one zeroing, one accumulating);
-                        // without it the helper falls back to vdotq + vaddq.
+                        // Chain 3-arg `vdotq_acc_s32`: with dotprod this is
+                        // two `sdot` instructions (one zeroing, one
+                        // accumulating); without it the helper falls back to
+                        // vdotq + vaddq. Use `vfmaq_n_f32` (not `vmlaq_n_f32`)
+                        // so the multiply-add fuses into a single `fmla`
+                        // rather than separate `fmul`/`fadd`.
                         let p = vdotq_acc_s32(vdotq_s32(a_lo, b_lo), a_hi, b_hi);
                         let scale = a.d.to_f32() * b.d.to_f32();
-                        cv[j][i] = vmlaq_n_f32(cv[j][i], vcvtq_f32_s32(p), scale);
+                        *cv = vfmaq_n_f32(*cv, vcvtq_f32_s32(p), scale);
                     }
                 }
             }
-            for j in 0..RN {
-                for i in 0..RM {
-                    *self.c.add(self.ldc * (jj + j) + (ii + i)) = vaddvq_f32(cv[j][i]);
+            for (j, cv) in cv.iter().enumerate() {
+                for (i, cv) in cv.iter().enumerate() {
+                    *self.c.add(self.ldc * (jj + j) + (ii + i)) = vaddvq_f32(*cv);
                 }
             }
         }
