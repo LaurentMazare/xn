@@ -154,8 +154,12 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
 // element at row `i`, column `j` is stored at `c[ldc * j + i]`.
 //
 // `ith`/`nth` partition the work across `nth` threads (single-threaded:
-// `ith = 0, nth = 1`). The inner kernel uses the 2-arg `vdotq_s32` defined
-// above since the 3-arg dotprod intrinsic is not available in stable Rust.
+// `ith = 0, nth = 1`). The inner kernel chains through `vdotq_acc_s32`
+// (3-arg sdot) on dotprod-capable cores and falls back to vdotq + vaddq
+// otherwise — see the helpers at the top of this file.
+//
+// Tile sizes go up to 4×4, one step beyond cpp's 3×3 cap; this still fits
+// inside the 32 NEON Q-registers without spilling.
 #[allow(clippy::too_many_arguments)]
 pub fn sgemm_q8_0_q8_0(
     m: usize,

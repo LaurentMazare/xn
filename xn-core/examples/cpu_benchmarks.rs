@@ -103,12 +103,13 @@ impl Benchmark for QMatMul {
     const ITERS: usize = Q_WEIGHTS;
 }
 
-// New blocked sgemm path: q8_0 × q8_0 → f32 via `neon::sgemm_q8_0_q8_0`.
-// Single-threaded — the existing matmul uses rayon over output columns, so
-// expect the gap to shrink on multi-core machines.
-#[cfg(target_feature = "neon")]
+// New blocked sgemm path: q8_0 × q8_0 → f32. Dispatches at compile time to
+// `neon::sgemm_q8_0_q8_0` on aarch64 and `avx::sgemm_q8_0_q8_0` on x86. Both
+// kernels are single-threaded — the existing matmul uses rayon over output
+// columns, so expect the gap to shrink on multi-core machines.
+#[cfg(any(target_feature = "neon", target_feature = "avx"))]
 struct QMatMulSgemm;
-#[cfg(target_feature = "neon")]
+#[cfg(any(target_feature = "neon", target_feature = "avx"))]
 impl Benchmark for QMatMulSgemm {
     type PreProcessData = QData;
     type RunResult = Vec<f32>;
@@ -122,7 +123,12 @@ impl Benchmark for QMatMulSgemm {
         // sgemm output is column-major with stride `ldc`; here we use ldc = QM
         // so the buffer is tightly packed.
         let mut dst = vec![0f32; QM * QN];
+        #[cfg(target_feature = "neon")]
         xn::quantized::neon::sgemm_q8_0_q8_0(
+            QM, QN, k_blocks, &d.lhs, k_blocks, rhs, k_blocks, &mut dst, QM, 0, 1,
+        )?;
+        #[cfg(all(target_feature = "avx", not(target_feature = "neon")))]
+        xn::quantized::avx::sgemm_q8_0_q8_0(
             QM, QN, k_blocks, &d.lhs, k_blocks, rhs, k_blocks, &mut dst, QM, 0, 1,
         )?;
         Ok(dst)
@@ -166,7 +172,7 @@ enum Task {
     Matmul,
     Matvec,
     Qmatmul,
-    #[cfg(target_feature = "neon")]
+    #[cfg(any(target_feature = "neon", target_feature = "avx"))]
     QmatmulSgemm,
 }
 
@@ -199,7 +205,7 @@ fn main() -> Result<()> {
                 run::<QMatMul>(args.iters)?
             }
         }
-        #[cfg(target_feature = "neon")]
+        #[cfg(any(target_feature = "neon", target_feature = "avx"))]
         Task::QmatmulSgemm => {
             for _ in 0..20 {
                 run::<QMatMulSgemm>(args.iters)?
