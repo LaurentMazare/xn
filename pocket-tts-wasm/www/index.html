@@ -208,6 +208,15 @@ let allChunks = [];
 let generating = false;
 let replayAudioCtx = null;
 let replaySource = null;
+let cpuFeatures = {};
+
+function formatFeatures(f) {
+  // Show every flag with a clear on/off marker. Wasm builds normally
+  // only enable simd128, but listing avx/neon/f16c too makes it obvious
+  // when one of them is actually active (e.g. in a native re-build).
+  const flags = ['avx', 'neon', 'simd128', 'f16c'];
+  return 'CPU features: ' + flags.map(k => `${k}=${f[k] ? 'on' : 'off'}`).join(' ');
+}
 
 worker.onmessage = (e) => {
   const { type, ...data } = e.data;
@@ -232,9 +241,10 @@ worker.onmessage = (e) => {
 
     case 'loaded':
       sampleRate = data.sampleRate;
+      cpuFeatures = data.features || {};
       loadBtn.style.display = 'none';
       btn.style.display = '';
-      log('Ready! Enter text and click Generate.');
+      log(`Ready! Enter text and click Generate.\n${formatFeatures(cpuFeatures)}`);
       break;
 
     case 'gen_start':
@@ -263,11 +273,24 @@ worker.onmessage = (e) => {
     }
 
     case 'done': {
-      const totalTime = ((performance.now() - startTime) / 1000).toFixed(2);
+      const totalMs = performance.now() - startTime;
+      const totalTime = (totalMs / 1000).toFixed(2);
       const totalSamples = allChunks.reduce((sum, c) => sum + c.length, 0);
-      const duration = (totalSamples / sampleRate).toFixed(2);
+      const durationSec = totalSamples / sampleRate;
+      const duration = durationSec.toFixed(2);
       const firstAudio = firstChunkTime != null ? (firstChunkTime / 1000).toFixed(2) : '?';
-      log(`Generated ${duration}s of audio in ${totalTime}s (first audio: ${firstAudio}s)`);
+      const rtf = totalMs > 0 ? (durationSec / (totalMs / 1000)).toFixed(3) : '?';
+      const promptMs = data.promptMs != null ? data.promptMs.toFixed(0) : '?';
+      const avgMs = data.stepMsAvg != null ? data.stepMsAvg.toFixed(1) : '?';
+      const minMs = data.stepMsMin != null ? data.stepMsMin.toFixed(1) : '?';
+      const maxMs = data.stepMsMax != null ? data.stepMsMax.toFixed(1) : '?';
+      const stats = [
+        `Generated ${duration}s of audio in ${totalTime}s (RTF=${rtf}, first audio: ${firstAudio}s)`,
+        `Text prompt: ${promptMs}ms`,
+        `Decode steps: ${data.numSteps ?? 0}, avg ${avgMs}ms (min ${minMs}, max ${maxMs})`,
+        formatFeatures(cpuFeatures),
+      ].join('\n');
+      log(stats);
 
       // Create WAV download/replay element
       const allPcm = concatenateChunks(allChunks);
