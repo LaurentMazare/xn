@@ -7,7 +7,8 @@
 //     wasmtime run target/wasm32-wasip1/release/examples/wasm_benchmarks.wasm \
 //         qmatmul-sgemm
 //
-// Tasks: `qmatmul` (per-row vec_dot) | `qmatmul-sgemm` (blocked sgemm).
+// Tasks: `qmatmul` (per-row vec_dot) | `qmatmul-sgemm` (blocked sgemm) |
+// `matmul-f32` (per-row f32 dot, same dims as `qmatmul`).
 
 #[cfg(target_arch = "wasm32")]
 mod bench {
@@ -89,6 +90,54 @@ mod bench {
         const ITERS: usize = Q_WEIGHTS;
     }
 
+    struct FData {
+        lhs: Vec<f32>,
+        rhs: Vec<Vec<f32>>,
+        counter: std::sync::atomic::AtomicUsize,
+    }
+
+    fn f_preprocess() -> Result<FData> {
+        let lhs = vec![0f32; QM * QK];
+        let rhs = (0..Q_WEIGHTS).map(|_| vec![0f32; QN * QK]).collect();
+        Ok(FData { lhs, rhs, counter: std::sync::atomic::AtomicUsize::new(0) })
+    }
+
+    fn f_pick_rhs(d: &FData) -> &[f32] {
+        let idx = d.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % d.rhs.len();
+        &d.rhs[idx]
+    }
+
+    struct MatMulF32;
+    impl Benchmark for MatMulF32 {
+        type PreProcessData = FData;
+        type RunResult = Vec<f32>;
+        fn preprocess() -> Result<Self::PreProcessData> {
+            f_preprocess()
+        }
+
+        fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
+            let rhs = f_pick_rhs(d);
+            let mut dst = vec![0f32; QM * QN];
+            for row_idx in 0..QM {
+                let lhs_row = &d.lhs[row_idx * QK..(row_idx + 1) * QK];
+                let dst_row = &mut dst[row_idx * QN..(row_idx + 1) * QN];
+                dst_row.into_par_iter().enumerate().with_min_len(128).with_max_len(512).for_each(
+                    |(col_idx, dst)| {
+                        let rhs_col = &rhs[col_idx * QK..(col_idx + 1) * QK];
+                        let mut acc = 0f32;
+                        for i in 0..QK {
+                            acc += lhs_row[i] * rhs_col[i];
+                        }
+                        *dst = acc;
+                    },
+                );
+            }
+            Ok(dst)
+        }
+
+        const ITERS: usize = Q_WEIGHTS;
+    }
+
     struct QMatMulSgemm;
     impl Benchmark for QMatMulSgemm {
         type PreProcessData = QData;
@@ -150,6 +199,11 @@ mod bench {
             "qmatmul-sgemm" => {
                 for _ in 0..20 {
                     run::<QMatMulSgemm>(iters)?
+                }
+            }
+            "matmul-f32" => {
+                for _ in 0..20 {
+                    run::<MatMulF32>(iters)?
                 }
             }
             other => panic!("unknown task: {other}"),
