@@ -91,6 +91,247 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
     }
 }
 
+// 32-element i8 dot product for a pair of `BlockQ8_0`s, returned as an
+// `i32x4` (lanes still holding partial sums; horizontal-add at the very
+// end). Mirrors the per-block work done in `vec_dot_q8_0_q8_0` but kept
+// as a helper so the gemm inner loop can reuse it.
+#[inline(always)]
+unsafe fn block_q8_0_dot_i32x4(a: &BlockQ8_0, b: &BlockQ8_0) -> v128 {
+    let xs0 = i16x8_load_extend_i8x8(a.qs.as_ptr());
+    let ys0 = i16x8_load_extend_i8x8(b.qs.as_ptr());
+    let mut s = i32x4_dot_i16x8(xs0, ys0);
+    let xs1 = i16x8_load_extend_i8x8(a.qs.as_ptr().add(8));
+    let ys1 = i16x8_load_extend_i8x8(b.qs.as_ptr().add(8));
+    s = i32x4_add(s, i32x4_dot_i16x8(xs1, ys1));
+    let xs2 = i16x8_load_extend_i8x8(a.qs.as_ptr().add(16));
+    let ys2 = i16x8_load_extend_i8x8(b.qs.as_ptr().add(16));
+    s = i32x4_add(s, i32x4_dot_i16x8(xs2, ys2));
+    let xs3 = i16x8_load_extend_i8x8(a.qs.as_ptr().add(24));
+    let ys3 = i16x8_load_extend_i8x8(b.qs.as_ptr().add(24));
+    i32x4_add(s, i32x4_dot_i16x8(xs3, ys3))
+}
+
+#[inline(always)]
+fn hsum_f32x4(v: v128) -> f32 {
+    f32x4_extract_lane::<0>(v)
+        + f32x4_extract_lane::<1>(v)
+        + f32x4_extract_lane::<2>(v)
+        + f32x4_extract_lane::<3>(v)
+}
+
+// Quantized matrix multiplication, mirroring `tinyBLAS_Q0_AVX` /
+// `tinyBLAS_Q0_ARM` from llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp.
+// Both lhs and rhs are `BlockQ8_0`; the result is float. `lda`/`ldb` are
+// leading dimensions in `BlockQ8_0` units (one block covers QK8_0 = 32
+// elements), `ldc` is in f32 units. Output layout matches the C++
+// version: the element at row `i`, column `j` is stored at
+// `c[ldc * j + i]`.
+//
+// `ith`/`nth` partition the work across `nth` threads (single-threaded:
+// `ith = 0, nth = 1`). The inner kernel uses `i32x4_dot_i16x8` over four
+// 8-lane chunks per block, then folds the i32 partial sums into an f32
+// accumulator scaled by the per-block `d` factors.
+//
+// Tile-size dispatch follows the cpp 16-register path used by the AVX
+// port; `v128` accumulators are 128-bit (4 f32 lanes), and engines that
+// lower wasm SIMD to SSE end up with the same 16-register budget.
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_q8_0_q8_0(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[BlockQ8_0],
+    lda: usize,
+    b: &[BlockQ8_0],
+    ldb: usize,
+    c: &mut [f32],
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+) -> Result<()> {
+    if nth == 0 {
+        crate::bail!("sgemm_q8_0_q8_0: nth must be > 0")
+    }
+    if ith >= nth {
+        crate::bail!("sgemm_q8_0_q8_0: ith {ith} >= nth {nth}")
+    }
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    if k > 0 {
+        if a.len() < lda * (m - 1) + k {
+            crate::bail!("sgemm_q8_0_q8_0: a slice too small ({} < {})", a.len(), lda * (m - 1) + k)
+        }
+        if b.len() < ldb * (n - 1) + k {
+            crate::bail!("sgemm_q8_0_q8_0: b slice too small ({} < {})", b.len(), ldb * (n - 1) + k)
+        }
+    }
+    if c.len() < ldc * (n - 1) + m {
+        crate::bail!("sgemm_q8_0_q8_0: c slice too small ({} < {})", c.len(), ldc * (n - 1) + m)
+    }
+    unsafe {
+        sgemm_q8_0_q8_0_raw(
+            m,
+            n,
+            k,
+            a.as_ptr(),
+            lda,
+            b.as_ptr(),
+            ldb,
+            c.as_mut_ptr(),
+            ldc,
+            ith,
+            nth,
+        )
+    };
+    Ok(())
+}
+
+/// Raw-pointer entry point for `sgemm_q8_0_q8_0` used by the parallel
+/// `BlockQ8_0::matmul` override. The caller is responsible for bounds and
+/// for ensuring different `ith` values write to disjoint output tiles.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sgemm_q8_0_q8_0_raw(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: *const BlockQ8_0,
+    lda: usize,
+    b: *const BlockQ8_0,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+) {
+    let blas = TinyBlasQ0Simd128 { k, a, lda, b, ldb, c, ldc, ith, nth };
+    unsafe { blas.matmul(m, n) };
+}
+
+struct TinyBlasQ0Simd128 {
+    k: usize,
+    a: *const BlockQ8_0,
+    lda: usize,
+    b: *const BlockQ8_0,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+}
+
+impl TinyBlasQ0Simd128 {
+    #[inline]
+    unsafe fn matmul(&self, m: usize, n: usize) {
+        self.mnpack(0, m, 0, n)
+    }
+
+    #[inline(never)]
+    unsafe fn mnpack(&self, m0: usize, m: usize, n0: usize, n: usize) {
+        let mr = (m - m0).min(4);
+        let nr = (n - n0).min(4);
+        // 16-register dispatch borrowed from the AVX port: 4×N tiles
+        // collapse to 4×2, N×4 to 2×4, etc. Wasm SIMD lowered to SSE has
+        // the same 16 XMM register budget.
+        let (mc, nc) = match (mr << 4) | nr {
+            0x42..=0x44 => {
+                self.gemm::<4, 2>(m0, m, n0, n);
+                (4, 2)
+            }
+            0x34 | 0x24 => {
+                self.gemm::<2, 4>(m0, m, n0, n);
+                (2, 4)
+            }
+            0x33 | 0x32 => {
+                self.gemm::<3, 2>(m0, m, n0, n);
+                (3, 2)
+            }
+            0x23 => {
+                self.gemm::<2, 3>(m0, m, n0, n);
+                (2, 3)
+            }
+            0x41 => {
+                self.gemm::<4, 1>(m0, m, n0, n);
+                (4, 1)
+            }
+            0x22 => {
+                self.gemm::<2, 2>(m0, m, n0, n);
+                (2, 2)
+            }
+            0x14 => {
+                self.gemm::<1, 4>(m0, m, n0, n);
+                (1, 4)
+            }
+            0x31 => {
+                self.gemm::<3, 1>(m0, m, n0, n);
+                (3, 1)
+            }
+            0x13 => {
+                self.gemm::<1, 3>(m0, m, n0, n);
+                (1, 3)
+            }
+            0x21 => {
+                self.gemm::<2, 1>(m0, m, n0, n);
+                (2, 1)
+            }
+            0x12 => {
+                self.gemm::<1, 2>(m0, m, n0, n);
+                (1, 2)
+            }
+            0x11 => {
+                self.gemm::<1, 1>(m0, m, n0, n);
+                (1, 1)
+            }
+            _ => return,
+        };
+        let mp = m0 + (m - m0) / mc * mc;
+        let np = n0 + (n - n0) / nc * nc;
+        self.mnpack(mp, m, n0, np);
+        self.mnpack(m0, m, np, n);
+    }
+
+    #[inline(never)]
+    unsafe fn gemm<const RM: usize, const RN: usize>(
+        &self,
+        m0: usize,
+        m: usize,
+        n0: usize,
+        n: usize,
+    ) {
+        let ytiles = (m - m0) / RM;
+        let xtiles = (n - n0) / RN;
+        let tiles = xtiles * ytiles;
+        if tiles == 0 {
+            return;
+        }
+        let duty = tiles.div_ceil(self.nth);
+        let start = duty * self.ith;
+        let end = (start + duty).min(tiles);
+        let zero = f32x4_splat(0.0);
+        for job in start..end {
+            let ii = m0 + job / xtiles * RM;
+            let jj = n0 + job % xtiles * RN;
+            let mut cv = [[zero; RM]; RN];
+            for l in 0..self.k {
+                for (j, cv) in cv.iter_mut().enumerate() {
+                    for (i, cv) in cv.iter_mut().enumerate() {
+                        let a = &*self.a.add(self.lda * (ii + i) + l);
+                        let b = &*self.b.add(self.ldb * (jj + j) + l);
+                        let dot_i = block_q8_0_dot_i32x4(a, b);
+                        let scale = f32x4_splat(f16::to_f32(a.d) * f16::to_f32(b.d));
+                        *cv = f32x4_add(*cv, f32x4_mul(f32x4_convert_i32x4(dot_i), scale));
+                    }
+                }
+            }
+            for (j, cv) in cv.iter().enumerate() {
+                for (i, cv) in cv.iter().enumerate() {
+                    *self.c.add(self.ldc * (jj + j) + (ii + i)) = hsum_f32x4(*cv);
+                }
+            }
+        }
+    }
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> Result<f32> {
     if !n.is_multiple_of(QK_K) {

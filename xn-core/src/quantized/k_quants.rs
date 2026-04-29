@@ -689,7 +689,7 @@ impl GgmlType for BlockQ8_0 {
         n: usize,
         k: usize,
     ) -> Result<()> {
-        #[cfg(any(target_feature = "avx", target_feature = "neon"))]
+        #[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128",))]
         if k.is_multiple_of(QK8_0) {
             return matmul_q8_0_sgemm(lhs_b, rhs_t, dst, m, n, k);
         }
@@ -697,16 +697,16 @@ impl GgmlType for BlockQ8_0 {
     }
 }
 
-// Q8_0 matmul backed by the cache-tiling AVX/NEON sgemm kernels. The
-// per-thread sgemm dispatch already partitions tiles via `ith`/`nth`, so
-// we just fan out across rayon workers with disjoint tile assignments.
+// Q8_0 matmul backed by the cache-tiling AVX/NEON/simd128 sgemm kernels.
+// The per-thread sgemm dispatch already partitions tiles via `ith`/`nth`,
+// so we just fan out across rayon workers with disjoint tile assignments.
 //
 // `dst` is row-major (`dst[i * n + j]`) while sgemm produces column-major
 // output (`c[ldc * j + i]`). To match layouts without a transpose, we
 // swap roles: pass `rhs_t` as sgemm-A, `lhs_b` as sgemm-B, and call
 // sgemm with `(m', n') = (n, m)` and `ldc = n`. Then sgemm's
 // `c[n * i + j]` lines up with `dst[i * n + j]`.
-#[cfg(any(target_feature = "avx", target_feature = "neon"))]
+#[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128"))]
 fn matmul_q8_0_sgemm(
     lhs_b: &[BlockQ8_0],
     rhs_t: &[BlockQ8_0],
@@ -758,6 +758,24 @@ fn matmul_q8_0_sgemm(
             );
             #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
             super::neon::sgemm_q8_0_q8_0_raw(
+                n,
+                m,
+                k_blocks,
+                a_addr as *const BlockQ8_0,
+                k_blocks,
+                b_addr as *const BlockQ8_0,
+                k_blocks,
+                c_addr as *mut f32,
+                n,
+                ith,
+                nth,
+            );
+            #[cfg(all(
+                target_feature = "simd128",
+                not(target_feature = "avx"),
+                not(target_feature = "neon"),
+            ))]
+            super::simd128::sgemm_q8_0_q8_0_raw(
                 n,
                 m,
                 k_blocks,

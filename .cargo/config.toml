@@ -4,5 +4,16 @@ rustflags = ["-C", "target-cpu=native"]
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "target-feature=+simd128", "--cfg", "getrandom_backend=\"wasm_js\""]
 
+[target.wasm32-wasip1]
+runner = "wasmtime"
+rustflags = ["-C", "target-feature=+simd128"]
+
+# `cc-rs` build scripts (e.g. for `onig_sys`) need a sysroot when targeting
+# wasi. These vars are target-prefixed so they're harmless on host builds.
+[env]
+WASI_SYSROOT = "/usr/share/wasi-sysroot"
+CC_wasm32_wasip1 = "clang"
+CFLAGS_wasm32_wasip1 = "--sysroot=/usr/share/wasi-sysroot --target=wasm32-wasip1"
+
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-feature=-avx,-avx2"]
