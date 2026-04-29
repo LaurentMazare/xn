@@ -37,6 +37,47 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
 
     /// Generic implementation of the dot product without simd optimizations.
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> Result<f32>;
+
+    fn matmul(
+        lhs_b: &[Self::VecDotType],
+        rhs_t: &[Self],
+        dst: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        matmul_by_row(lhs_b, rhs_t, dst, m, n, k)
+    }
+}
+
+fn matmul_by_row<T: GgmlType>(
+    lhs_b: &[T::VecDotType],
+    rhs_t: &[T],
+    dst: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let k_in_lhs_blocks = k.div_ceil(T::BLCK_SIZE);
+    let k_in_rhs_blocks = k.div_ceil(T::VecDotType::BLCK_SIZE);
+    for row_idx in 0..m {
+        let lhs_row = &lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
+        let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
+
+        let result: Result<Vec<_>> = dst_row
+            .into_par_iter()
+            .enumerate()
+            .with_min_len(128)
+            .with_max_len(512)
+            .map(|(col_idx, dst)| {
+                let rhs_col = &rhs_t[col_idx * k_in_rhs_blocks..(col_idx + 1) * k_in_rhs_blocks];
+                T::vec_dot(k, rhs_col, lhs_row).map(|value| *dst = value)
+            })
+            .collect();
+
+        result?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1814,7 +1855,6 @@ pub fn matmul<T: GgmlType>(
     }
 
     let k_in_lhs_blocks = k.div_ceil(T::BLCK_SIZE);
-    let k_in_rhs_blocks = k.div_ceil(T::VecDotType::BLCK_SIZE);
     // TODO: Do not make this copy if the DotType is f32.
     // TODO: Pre-allocate this.
     let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_lhs_blocks];
@@ -1824,24 +1864,7 @@ pub fn matmul<T: GgmlType>(
         T::VecDotType::from_float(lhs, lhs_b)?
     }
     let lhs_b = lhs_b.as_slice();
-
-    for row_idx in 0..m {
-        let lhs_row = &lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
-        let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
-
-        let result: Result<Vec<_>> = dst_row
-            .into_par_iter()
-            .enumerate()
-            .with_min_len(128)
-            .with_max_len(512)
-            .map(|(col_idx, dst)| {
-                let rhs_col = &rhs_t[col_idx * k_in_rhs_blocks..(col_idx + 1) * k_in_rhs_blocks];
-                T::vec_dot(k, rhs_col, lhs_row).map(|value| *dst = value)
-            })
-            .collect();
-
-        result?;
-    }
+    T::matmul(lhs_b, rhs_t, dst, m, n, k)?;
     Ok(())
 }
 
