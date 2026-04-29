@@ -86,16 +86,6 @@ fn qlinear_3d_input() -> Result<()> {
 // Exercises the SIMD `sgemm_q8_0_q8_0` kernels by computing a row-major
 // reference with `BlockQ8_0::vec_dot` and comparing it against the
 // column-major output of sgemm.
-//
-// Tolerance: AVX is bit-exact (`tol = 0.0`) — both kernels run the same
-// `mul_sum_i8_pairs_float` + `_mm256_fmadd_ps` per block and `hsum_float_8`
-// at the end, so every fmadd has identical inputs and the f32 result is
-// reproducible. NEON is allowed a tiny absolute drift because the reference
-// uses `vmlaq_n_f32` (mul + add, two roundings) while sgemm uses
-// `vfmaq_n_f32` (fused, one rounding); each block contributes at most
-// ~1 ULP of divergence, so for our test shapes (k ≤ 128, |result| ≲ 20) the
-// bound `k · ULP(result)` lands around 3 × 10⁻⁴ — `1e-4` covers the
-// expected case and `1e-3` would still be safe.
 #[cfg(any(target_feature = "neon", target_feature = "avx"))]
 #[allow(clippy::type_complexity)]
 fn check_sgemm_q8_0_matches_vec_dot(
@@ -115,7 +105,6 @@ fn check_sgemm_q8_0_matches_vec_dot(
     m: usize,
     k: usize,
     n: usize,
-    tol: f32,
 ) -> Result<()> {
     use xn::quantized::GgmlType;
     use xn::quantized::k_quants::{BlockQ8_0, QK8_0};
@@ -165,6 +154,7 @@ fn check_sgemm_q8_0_matches_vec_dot(
             max_err = max_err.max((r - s).abs());
         }
     }
+    let tol = 0.0;
     assert!(max_err <= tol, "({m}, {k}, {n}): max error {max_err} > tol {tol}");
     Ok(())
 }
@@ -180,7 +170,7 @@ const SGEMM_TEST_SHAPES: &[(usize, usize, usize)] =
 #[test]
 fn sgemm_q8_0_neon_matches_vec_dot() -> Result<()> {
     for &(m, k, n) in SGEMM_TEST_SHAPES {
-        check_sgemm_q8_0_matches_vec_dot(xn::quantized::neon::sgemm_q8_0_q8_0, m, k, n, 1e-4)?;
+        check_sgemm_q8_0_matches_vec_dot(xn::quantized::neon::sgemm_q8_0_q8_0, m, k, n)?;
     }
     Ok(())
 }
@@ -189,7 +179,7 @@ fn sgemm_q8_0_neon_matches_vec_dot() -> Result<()> {
 #[test]
 fn sgemm_q8_0_avx_matches_vec_dot() -> Result<()> {
     for &(m, k, n) in SGEMM_TEST_SHAPES {
-        check_sgemm_q8_0_matches_vec_dot(xn::quantized::avx::sgemm_q8_0_q8_0, m, k, n, 0.0)?;
+        check_sgemm_q8_0_matches_vec_dot(xn::quantized::avx::sgemm_q8_0_q8_0, m, k, n)?;
     }
     Ok(())
 }

@@ -106,7 +106,7 @@ pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) ->
 
             let pl0 = vdotq_s32(v0_0ls, v1_0l);
             let ph0 = vdotq_s32(v0_0hs, v1_0h);
-            sumv0 = vmlaq_n_f32(
+            sumv0 = vfmaq_n_f32(
                 sumv0,
                 vcvtq_f32_s32(vaddq_s32(pl0, ph0)),
                 x0.d.to_f32() * y0.d.to_f32(),
@@ -140,7 +140,7 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
             let p1 = vdotq_s32(x0_1, y0_1);
 
             sumv0 =
-                vmlaq_n_f32(sumv0, vcvtq_f32_s32(vaddq_s32(p0, p1)), x0.d.to_f32() * y0.d.to_f32());
+                vfmaq_n_f32(sumv0, vcvtq_f32_s32(vaddq_s32(p0, p1)), x0.d.to_f32() * y0.d.to_f32());
         }
         Ok(vaddvq_f32(sumv0))
     }
