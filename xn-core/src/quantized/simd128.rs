@@ -308,21 +308,31 @@ impl TinyBlasQ0Simd128 {
             // Hoist b's loads + f16→f32 scale conversion out of the
             // inner i loop: b doesn't depend on i, but with raw pointers
             // LLVM's CSE can't always prove that, so we tell it directly.
+            // Symmetrically, materialise a's loads + scale into per-`l`
+            // stack arrays so they aren't redundantly recomputed for each
+            // j; spilling 16 v128 to stack is cheap (L1 reloads) compared
+            // to repeating four `i16x8_load_extend_i8x8` per (l, j, i).
             // f16::to_f32 is software on wasm (no f16c), so the saving
             // matters even though it's only a few scalar ops per call.
             for l in 0..self.k {
+                let mut avs = [[f32x4_splat(0.0); 4]; RM];
+                let mut a_ds = [0f32; RM];
+                for i in 0..RM {
+                    let a = &*self.a.add(self.lda * (ii + i) + l);
+                    avs[i] = load_block_q8_0(a.qs.as_ptr());
+                    a_ds[i] = f16::to_f32(a.d);
+                }
                 for j in 0..RN {
                     let b = &*self.b.add(self.ldb * (jj + j) + l);
                     let bv = load_block_q8_0(b.qs.as_ptr());
                     let b_d = f16::to_f32(b.d);
                     for i in 0..RM {
-                        let a = &*self.a.add(self.lda * (ii + i) + l);
-                        let av = load_block_q8_0(a.qs.as_ptr());
+                        let av = avs[i];
                         let mut s = i32x4_dot_i16x8(av[0], bv[0]);
                         s = i32x4_add(s, i32x4_dot_i16x8(av[1], bv[1]));
                         s = i32x4_add(s, i32x4_dot_i16x8(av[2], bv[2]));
                         s = i32x4_add(s, i32x4_dot_i16x8(av[3], bv[3]));
-                        let scale = f32x4_splat(f16::to_f32(a.d) * b_d);
+                        let scale = f32x4_splat(a_ds[i] * b_d);
                         cv[j][i] = f32x4_add(cv[j][i], f32x4_mul(f32x4_convert_i32x4(s), scale));
                     }
                 }
