@@ -1,4 +1,4 @@
-import init, { Model } from './wasm_pocket_tts.js';
+import init, { Model, cpu_features } from './ptts_wasm.js';
 
 const HF_BASE = 'https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main';
 const MODEL_URL = `${HF_BASE}/tts_b6369a24.safetensors`;
@@ -200,7 +200,7 @@ const VOICE_NAMES = ['alba', 'marius', 'javert', 'fantine', 'cosette', 'eponine'
 
 // Start WASM compilation immediately so the optimizing compiler (TurboFan)
 // finishes well before the first generation runs.
-const wasmModulePromise = WebAssembly.compileStreaming(fetch('wasm_pocket_tts_bg.wasm'));
+const wasmModulePromise = WebAssembly.compileStreaming(fetch('ptts_wasm_bg.wasm'));
 
 let model = null;
 let tokenizer = null;
@@ -228,7 +228,8 @@ async function handleLoad(quant) {
   }
 
   const sampleRate = model.sample_rate();
-  post('loaded', { sampleRate });
+  const features = cpu_features();
+  post('loaded', { sampleRate, features });
 }
 
 async function handleGenerate(text, voiceName, temperature) {
@@ -239,17 +240,37 @@ async function handleGenerate(text, voiceName, temperature) {
 
   post('gen_start', { numTokens: tokenIds.length });
 
+  // Time the prompt step: `start_generation` runs `prompt_text` on the
+  // transformer state, which is the bulk of the prefill cost.
+  const promptT0 = performance.now();
   model.start_generation(voiceIndex, tokenIds, framesAfterEos, temperature);
+  const promptMs = performance.now() - promptT0;
 
   let step = 0;
+  let stepMsTotal = 0;
+  let stepMsMin = Infinity;
+  let stepMsMax = 0;
   while (true) {
+    const t0 = performance.now();
     const chunk = model.generation_step();
+    const dt = performance.now() - t0;
     if (!chunk) break;
+    stepMsTotal += dt;
+    if (dt < stepMsMin) stepMsMin = dt;
+    if (dt > stepMsMax) stepMsMax = dt;
     post('chunk', { data: chunk, step }, [chunk.buffer]);
     step++;
   }
 
-  post('done');
+  const stepMsAvg = step > 0 ? stepMsTotal / step : 0;
+  if (step === 0) stepMsMin = 0;
+  post('done', {
+    promptMs,
+    numSteps: step,
+    stepMsAvg,
+    stepMsMin,
+    stepMsMax,
+  });
 }
 
 self.onmessage = async (e) => {

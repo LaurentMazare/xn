@@ -438,3 +438,19 @@ impl Model {
         }
     }
 }
+
+/// CPU SIMD features the wasm module was compiled with. The relevant one
+/// for browser builds is `simd128`; `avx`/`neon`/`f16c` are reported for
+/// completeness so it's clear which native-target builds enabled them.
+#[wasm_bindgen]
+pub fn cpu_features() -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    let set = |k: &str, v: bool| {
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k), &JsValue::from_bool(v));
+    };
+    set("avx", xn::with_avx());
+    set("neon", xn::with_neon());
+    set("simd128", xn::with_simd128());
+    set("f16c", xn::with_f16c());
+    obj
+}
