@@ -90,19 +90,23 @@ mod bench {
         const ITERS: usize = Q_WEIGHTS;
     }
 
+    type FTensor = xn::Tensor<f32, xn::CpuDevice>;
+
     struct FData {
-        lhs: Vec<f32>,
-        rhs: Vec<Vec<f32>>,
+        lhs: FTensor,
+        rhs: Vec<FTensor>,
         counter: std::sync::atomic::AtomicUsize,
     }
 
     fn f_preprocess() -> Result<FData> {
-        let lhs = vec![0f32; QM * QK];
-        let rhs = (0..Q_WEIGHTS).map(|_| vec![0f32; QN * QK]).collect();
+        let lhs = FTensor::zeros((QM, QK), &xn::CPU)?;
+        let rhs = (0..Q_WEIGHTS)
+            .map(|_| FTensor::zeros((QK, QN), &xn::CPU))
+            .collect::<Result<Vec<_>>>()?;
         Ok(FData { lhs, rhs, counter: std::sync::atomic::AtomicUsize::new(0) })
     }
 
-    fn f_pick_rhs(d: &FData) -> &[f32] {
+    fn f_pick_rhs(d: &FData) -> &FTensor {
         let idx = d.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % d.rhs.len();
         &d.rhs[idx]
     }
@@ -110,29 +114,13 @@ mod bench {
     struct MatMulF32;
     impl Benchmark for MatMulF32 {
         type PreProcessData = FData;
-        type RunResult = Vec<f32>;
+        type RunResult = FTensor;
         fn preprocess() -> Result<Self::PreProcessData> {
             f_preprocess()
         }
 
         fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
-            let rhs = f_pick_rhs(d);
-            let mut dst = vec![0f32; QM * QN];
-            for row_idx in 0..QM {
-                let lhs_row = &d.lhs[row_idx * QK..(row_idx + 1) * QK];
-                let dst_row = &mut dst[row_idx * QN..(row_idx + 1) * QN];
-                dst_row.into_par_iter().enumerate().with_min_len(128).with_max_len(512).for_each(
-                    |(col_idx, dst)| {
-                        let rhs_col = &rhs[col_idx * QK..(col_idx + 1) * QK];
-                        let mut acc = 0f32;
-                        for i in 0..QK {
-                            acc += lhs_row[i] * rhs_col[i];
-                        }
-                        *dst = acc;
-                    },
-                );
-            }
-            Ok(dst)
+            d.lhs.matmul(f_pick_rhs(d))
         }
 
         const ITERS: usize = Q_WEIGHTS;
