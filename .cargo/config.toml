@@ -2,11 +2,11 @@
 rustflags = ["-C", "target-cpu=native"]
 
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+simd128", "--cfg", "getrandom_backend=\"wasm_js\""]
+rustflags = ["-C", "target-feature=+simd128,+relaxed-simd", "--cfg", "getrandom_backend=\"wasm_js\""]
 
 [target.wasm32-wasip1]
 runner = "wasmtime"
-rustflags = ["-C", "target-feature=+simd128"]
+rustflags = ["-C", "target-feature=+simd128,+relaxed-simd"]
 
 # `cc-rs` build scripts (e.g. for `onig_sys`) need a sysroot when targeting
 # wasi. These vars are target-prefixed so they're harmless on host builds.

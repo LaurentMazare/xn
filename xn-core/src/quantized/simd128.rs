@@ -333,7 +333,7 @@ impl TinyBlasQ0Simd128 {
                         s = i32x4_add(s, i32x4_dot_i16x8(av[2], bv[2]));
                         s = i32x4_add(s, i32x4_dot_i16x8(av[3], bv[3]));
                         let scale = f32x4_splat(a_ds[i] * b_d);
-                        cv[j][i] = f32x4_add(cv[j][i], f32x4_mul(f32x4_convert_i32x4(s), scale));
+                        cv[j][i] = f32x4_relaxed_madd(f32x4_convert_i32x4(s), scale, cv[j][i]);
                     }
                 }
             }
