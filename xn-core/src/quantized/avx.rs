@@ -145,19 +145,43 @@ pub fn sgemm_q8_0_q8_0(
     if c.len() < ldc * (n - 1) + m {
         crate::bail!("sgemm_q8_0_q8_0: c slice too small ({} < {})", c.len(), ldc * (n - 1) + m)
     }
-    let blas = TinyBlasQ0Avx {
-        k,
-        a: a.as_ptr(),
-        lda,
-        b: b.as_ptr(),
-        ldb,
-        c: c.as_mut_ptr(),
-        ldc,
-        ith,
-        nth,
+    unsafe {
+        sgemm_q8_0_q8_0_raw(
+            m,
+            n,
+            k,
+            a.as_ptr(),
+            lda,
+            b.as_ptr(),
+            ldb,
+            c.as_mut_ptr(),
+            ldc,
+            ith,
+            nth,
+        )
     };
-    unsafe { blas.matmul(m, n) };
     Ok(())
+}
+
+/// Raw-pointer entry point for `sgemm_q8_0_q8_0` used by the parallel
+/// `BlockQ8_0::matmul` override. The caller is responsible for bounds and
+/// for ensuring different `ith` values write to disjoint output tiles.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sgemm_q8_0_q8_0_raw(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: *const BlockQ8_0,
+    lda: usize,
+    b: *const BlockQ8_0,
+    ldb: usize,
+    c: *mut f32,
+    ldc: usize,
+    ith: usize,
+    nth: usize,
+) {
+    let blas = TinyBlasQ0Avx { k, a, lda, b, ldb, c, ldc, ith, nth };
+    unsafe { blas.matmul(m, n) };
 }
 
 struct TinyBlasQ0Avx {

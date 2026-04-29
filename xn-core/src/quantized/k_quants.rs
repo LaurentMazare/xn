@@ -679,6 +679,100 @@ impl GgmlType for BlockQ8_0 {
         }
         Ok(sumf)
     }
+
+    #[allow(unused_variables, unreachable_code)]
+    fn matmul(
+        lhs_b: &[Self::VecDotType],
+        rhs_t: &[Self],
+        dst: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        #[cfg(any(target_feature = "avx", target_feature = "neon"))]
+        if k.is_multiple_of(QK8_0) {
+            return matmul_q8_0_sgemm(lhs_b, rhs_t, dst, m, n, k);
+        }
+        matmul_by_row::<Self>(lhs_b, rhs_t, dst, m, n, k)
+    }
+}
+
+// Q8_0 matmul backed by the cache-tiling AVX/NEON sgemm kernels. The
+// per-thread sgemm dispatch already partitions tiles via `ith`/`nth`, so
+// we just fan out across rayon workers with disjoint tile assignments.
+//
+// `dst` is row-major (`dst[i * n + j]`) while sgemm produces column-major
+// output (`c[ldc * j + i]`). To match layouts without a transpose, we
+// swap roles: pass `rhs_t` as sgemm-A, `lhs_b` as sgemm-B, and call
+// sgemm with `(m', n') = (n, m)` and `ldc = n`. Then sgemm's
+// `c[n * i + j]` lines up with `dst[i * n + j]`.
+#[cfg(any(target_feature = "avx", target_feature = "neon"))]
+fn matmul_q8_0_sgemm(
+    lhs_b: &[BlockQ8_0],
+    rhs_t: &[BlockQ8_0],
+    dst: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    if m == 0 || n == 0 {
+        return Ok(());
+    }
+    let k_blocks = k / QK8_0;
+    if lhs_b.len() < m * k_blocks {
+        crate::bail!("matmul_q8_0: lhs too small ({} < {})", lhs_b.len(), m * k_blocks)
+    }
+    if rhs_t.len() < n * k_blocks {
+        crate::bail!("matmul_q8_0: rhs too small ({} < {})", rhs_t.len(), n * k_blocks)
+    }
+    if dst.len() < m * n {
+        crate::bail!("matmul_q8_0: dst too small ({} < {})", dst.len(), m * n)
+    }
+
+    // Pass pointers as `usize` so the closure is `Send + Sync` without
+    // unsafe wrapper types. Each `ith` writes to a disjoint tile range,
+    // so concurrent access through the recovered `*mut f32` does not
+    // alias.
+    let a_addr = rhs_t.as_ptr() as usize;
+    let b_addr = lhs_b.as_ptr() as usize;
+    let c_addr = dst.as_mut_ptr() as usize;
+    let nth = rayon::current_num_threads().max(1);
+    (0..nth).into_par_iter().for_each(|ith| {
+        // SAFETY: tile assignments are disjoint across `ith` values, so
+        // writes through `c_addr` do not alias. Bounds were checked
+        // above against the slice lengths.
+        unsafe {
+            #[cfg(target_feature = "avx")]
+            super::avx::sgemm_q8_0_q8_0_raw(
+                n,
+                m,
+                k_blocks,
+                a_addr as *const BlockQ8_0,
+                k_blocks,
+                b_addr as *const BlockQ8_0,
+                k_blocks,
+                c_addr as *mut f32,
+                n,
+                ith,
+                nth,
+            );
+            #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
+            super::neon::sgemm_q8_0_q8_0_raw(
+                n,
+                m,
+                k_blocks,
+                a_addr as *const BlockQ8_0,
+                k_blocks,
+                b_addr as *const BlockQ8_0,
+                k_blocks,
+                c_addr as *mut f32,
+                n,
+                ith,
+                nth,
+            );
+        }
+    });
+    Ok(())
 }
 
 impl GgmlType for BlockQ8_1 {
