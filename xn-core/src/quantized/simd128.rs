@@ -38,10 +38,8 @@ pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) ->
 
             let sum_xy = f32x4_convert_i32x4(sum_xy);
 
-            // f32x4_relaxed_madd is nightly only.
             let d = f32x4_splat(f16::to_f32(x.d) * f16::to_f32(y.d));
-            let scaled = f32x4_mul(sum_xy, d);
-            acc = f32x4_add(acc, scaled)
+            acc = f32x4_relaxed_madd(sum_xy, d, acc);
         }
         let res = f32x4_extract_lane::<0>(acc)
             + f32x4_extract_lane::<1>(acc)
@@ -78,10 +76,8 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
 
             let sum_xy = f32x4_convert_i32x4(sum_xy);
 
-            // f32x4_relaxed_madd is nightly only.
             let d = f32x4_splat(f16::to_f32(x.d) * f16::to_f32(y.d));
-            let scaled = f32x4_mul(sum_xy, d);
-            acc = f32x4_add(acc, scaled)
+            acc = f32x4_relaxed_madd(sum_xy, d, acc);
         }
         let res = f32x4_extract_lane::<0>(acc)
             + f32x4_extract_lane::<1>(acc)
