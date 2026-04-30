@@ -58,8 +58,6 @@
     <select id="quant">
       <option value="f32" selected>f32</option>
       <option value="q8">q8</option>
-      <option value="q6">q6</option>
-      <option value="q4">q4</option>
     </select>
   </div>
   <button id="load-btn">Load Weights (240MB)</button>
@@ -91,6 +89,14 @@ const tempValue = document.getElementById('temp-value');
 tempSlider.addEventListener('input', () => {
   tempValue.textContent = tempSlider.value;
 });
+
+const QUANT_SIZE_MB = { f32: 240, q8: 146 };
+function updateLoadBtnLabel() {
+  const size = QUANT_SIZE_MB[quantSelect.value] ?? 240;
+  loadBtn.textContent = `Load Weights (${size}MB)`;
+}
+quantSelect.addEventListener('change', updateLoadBtnLabel);
+updateLoadBtnLabel();
 
 function log(msg) {
   statusEl.textContent = msg;
