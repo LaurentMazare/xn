@@ -1,5 +1,5 @@
 use numpy::{PyArray1, PyReadonlyArray1};
-use ptts::tts_model::{TTSConfig, TTSModel, TTSState};
+use ptts::tts_model::{MimiEnc, TTSConfig, TTSModel, TTSState};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use xn::nn::VB;
@@ -54,6 +54,7 @@ const VOICES: &[&str] =
 
 struct ModelB<B: xn::Backend> {
     inner: Arc<TTSModel<Unquantized<f32, B>>>,
+    mimi_enc: MimiEnc<Unquantized<f32, B>>,
     voices: std::collections::HashMap<String, Tensor<f32, B>>,
 }
 
@@ -74,12 +75,12 @@ impl<B: xn::Backend> ModelB<B> {
         }
         let dev = self.inner.device();
         let pcm = xn::Tensor::from_vec(audio_prompt.to_vec(), (1, 1, ()), dev)?;
-        let voice_emb = self.inner.encode_audio(&pcm)?;
+        let voice_emb = self.mimi_enc.encode_audio(&pcm)?;
         let mut state = self.inner.init_flow_lm_state(1, max_seq_len)?;
         self.inner.prompt_audio(&mut state, &voice_emb)?;
         let cfg_state = if let Some(cfg_coef) = cfg_coef {
             let null_pcm = pcm.zeros_like()?;
-            let null_emb = self.inner.encode_audio(&null_pcm)?;
+            let null_emb = self.mimi_enc.encode_audio(&null_pcm)?;
             let mut null_state = self.inner.init_flow_lm_state(1, max_seq_len)?;
             self.inner.prompt_audio(&mut null_state, &null_emb)?;
             Some((cfg_coef, null_state))
@@ -549,12 +550,13 @@ fn load_model_<B: xn::Backend>(
     } else {
         model
     };
+    let mimi_enc = MimiEnc::load(&vb.pp("mimi"), &cfg)?;
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
             || v.starts_with("mimi.quantizer")
     })?;
 
-    Ok(ModelB { inner: Arc::new(model), voices })
+    Ok(ModelB { inner: Arc::new(model), mimi_enc, voices })
 }
 
 #[pyfunction]

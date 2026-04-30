@@ -12,7 +12,7 @@ macro_rules! console_log {
 }
 
 use ptts::flow_lm::{self, FlowLMState};
-use ptts::mimi::MimiState;
+use ptts::mimi::MimiDecoderState;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
@@ -187,7 +187,7 @@ macro_rules! dispatch {
 
 struct GenState {
     tts_state: StateInner,
-    mimi_state: MimiState<f32, CpuDevice>,
+    mimi_state: MimiDecoderState<f32, CpuDevice>,
     prev_latent: Tensor<f32, CpuDevice>,
     rng: WasmRng,
     max_frames: usize,

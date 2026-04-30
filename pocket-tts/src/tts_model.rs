@@ -1,5 +1,5 @@
 use crate::flow_lm::{FlowLM, FlowLMConfig, FlowLMState};
-use crate::mimi::{MimiConfig, MimiModel, MimiState};
+use crate::mimi::{MimiConfig, MimiDecoder, MimiDecoderState, MimiEncoder};
 use xn::nn::{Linear, var_builder::Path};
 use xn::{BackendQ, Result, Tensor, Unquantized};
 
@@ -98,8 +98,7 @@ impl TTSConfig {
 
 pub struct TTSModel<Q: BackendQ> {
     pub flow_lm: FlowLM<Q>,
-    pub mimi: MimiModel<Unquantized<f32, Q::B>>,
-    speaker_proj: Option<Linear<Q::T, Q::B>>,
+    pub mimi: MimiDecoder<Unquantized<f32, Q::B>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
 }
@@ -116,20 +115,11 @@ impl<Q: BackendQ> TTSModel<Q> {
         cfg: &TTSConfig,
     ) -> Result<Self> {
         let flow_lm = FlowLM::load(&vb.pp("flow_lm"), tokenizer, &cfg.flow_lm)?;
-        let mimi = MimiModel::load(&vb.pp("mimi"), &cfg.mimi)?;
-
-        let speaker_proj = if vb.contains("flow_lm.speaker_proj_weight") {
-            let weights = vb
-                .tensor("flow_lm.speaker_proj_weight", (cfg.flow_lm.d_model, cfg.mimi.dimension))?;
-            Some(Linear::new(weights))
-        } else {
-            None
-        };
+        let mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi)?;
 
         Ok(Self {
             flow_lm,
             mimi,
-            speaker_proj,
             lsd_decode_steps: cfg.lsd_decode_steps,
             eos_threshold: cfg.eos_threshold,
         })
@@ -151,19 +141,6 @@ impl<Q: BackendQ> TTSModel<Q> {
         sequence_length: usize,
     ) -> Result<TTSState<Q>> {
         Ok(TTSState { flow_lm_state: self.flow_lm.init_state(batch_size, sequence_length)? })
-    }
-
-    /// Encode audio for voice conditioning. Returns [1, T', dim].
-    pub fn encode_audio(&self, audio: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
-        let f32_audio = audio.to::<f32>()?;
-        let encoded = self.mimi.encode_to_latent(&f32_audio)?;
-        // [B, C, T] -> [B, T, C]
-        let latents = encoded.transpose(1, 2)?.contiguous()?;
-        let latents = latents.to::<Q::T>()?;
-        match self.speaker_proj.as_ref() {
-            Some(p) => p.forward(&latents),
-            None => Ok(latents),
-        }
     }
 
     /// Run flow LM step with text tokens. Increments state.
@@ -279,7 +256,7 @@ impl<Q: BackendQ> TTSModel<Q> {
     pub fn decode_latent(
         &self,
         latent: &Tensor<Q::T, Q::B>,
-        mimi_state: &mut MimiState<f32, Q::B>,
+        mimi_state: &mut MimiDecoderState<f32, Q::B>,
     ) -> Result<Tensor<f32, Q::B>> {
         let denorm =
             latent.broadcast_mul(&self.flow_lm.emb_std)?.broadcast_add(&self.flow_lm.emb_mean)?;
@@ -297,7 +274,7 @@ impl<Q: BackendQ> TTSModel<Q> {
         &self,
         batch_size: usize,
         context: usize,
-    ) -> Result<MimiState<f32, Q::B>> {
+    ) -> Result<MimiDecoderState<f32, Q::B>> {
         self.mimi.init_state(batch_size, context)
     }
 
@@ -316,6 +293,38 @@ impl<Q: BackendQ> TTSModel<Q> {
 
     pub fn device(&self) -> &Q::B {
         self.flow_lm.input_linear.device()
+    }
+}
+
+pub struct MimiEnc<Q: BackendQ> {
+    speaker_proj: Option<Linear<Q::T, Q::B>>,
+    mimi: MimiEncoder<Unquantized<f32, Q::B>>,
+}
+
+impl<Q: BackendQ> MimiEnc<Q> {
+    pub fn load(vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<Self> {
+        let mimi = MimiEncoder::load(&vb.pp("mimi"), &cfg.mimi)?;
+        let speaker_proj = if vb.contains("flow_lm.speaker_proj_weight") {
+            let weights = vb
+                .tensor("flow_lm.speaker_proj_weight", (cfg.flow_lm.d_model, cfg.mimi.dimension))?;
+            Some(Linear::new(weights))
+        } else {
+            None
+        };
+        Ok(Self { speaker_proj, mimi })
+    }
+
+    /// Encode audio for voice conditioning. Returns [1, T', dim].
+    pub fn encode_audio(&self, audio: &Tensor<Q::T, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
+        let f32_audio = audio.to::<f32>()?;
+        let encoded = self.mimi.encode_to_latent(&f32_audio)?;
+        // [B, C, T] -> [B, T, C]
+        let latents = encoded.transpose(1, 2)?.contiguous()?;
+        let latents = latents.to::<Q::T>()?;
+        match self.speaker_proj.as_ref() {
+            Some(p) => p.forward(&latents),
+            None => Ok(latents),
+        }
     }
 }
 

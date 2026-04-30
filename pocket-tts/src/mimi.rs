@@ -46,12 +46,13 @@ pub struct MimiDecoder<Q: BackendQ> {
     decoder: SEANetDecoder<Q::T, Q::B>,
     decoder_transformer: ProjectedTransformer<Q>,
     upsample: Option<ConvTrUpsample1d<Q::T, Q::B>>,
+    pub quantizer: DummyQuantizer<Q::T, Q::B>,
+    pub sample_rate: usize,
 }
 
 pub struct MimiModel<Q: BackendQ> {
     encoder: MimiEncoder<Q>,
     decoder: MimiDecoder<Q>,
-    pub quantizer: DummyQuantizer<Q::T, Q::B>,
     frame_rate: f64,
     pub sample_rate: usize,
 }
@@ -199,6 +200,11 @@ impl<Q: BackendQ> MimiDecoder<Q> {
             cfg.compress,
         )?;
 
+        let quantizer = DummyQuantizer::load(
+            &vb.pp("quantizer"),
+            cfg.quantizer_dimension,
+            cfg.quantizer_output_dimension,
+        )?;
         let output_dimensions = vec![cfg.dimension];
         let decoder_transformer = ProjectedTransformer::load(
             &vb.pp("decoder_transformer"),
@@ -222,7 +228,7 @@ impl<Q: BackendQ> MimiDecoder<Q> {
         } else {
             None
         };
-        Ok(Self { decoder, decoder_transformer, upsample })
+        Ok(Self { decoder, decoder_transformer, upsample, quantizer, sample_rate: cfg.sample_rate })
     }
 
     pub fn init_state(
@@ -263,21 +269,10 @@ impl<Q: BackendQ> MimiDecoder<Q> {
 
 impl<Q: BackendQ> MimiModel<Q> {
     pub fn load(vb: &Path<Q::B>, cfg: &MimiConfig) -> Result<Self> {
-        let quantizer = DummyQuantizer::load(
-            &vb.pp("quantizer"),
-            cfg.quantizer_dimension,
-            cfg.quantizer_output_dimension,
-        )?;
         let encoder = MimiEncoder::load(vb, cfg)?;
         let decoder = MimiDecoder::load(vb, cfg)?;
 
-        Ok(Self {
-            encoder,
-            decoder,
-            quantizer,
-            frame_rate: cfg.frame_rate,
-            sample_rate: cfg.sample_rate,
-        })
+        Ok(Self { encoder, decoder, frame_rate: cfg.frame_rate, sample_rate: cfg.sample_rate })
     }
 
     pub fn frame_size(&self) -> usize {
