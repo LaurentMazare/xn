@@ -12,11 +12,11 @@ macro_rules! console_log {
 }
 
 use ptts::flow_lm::{self, FlowLMState};
-use ptts::mimi::MimiState;
+use ptts::mimi::MimiDecoderState;
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
 use ptts::tts_model::{TTSConfig, TTSModel, TTSState, prepare_text_prompt};
 use xn::nn::VB;
-use xn::quantized::{Q6kF32, Q40F32, Q80F32};
+use xn::quantized::Q80F32;
 use xn::{BackendQ, CPU, CpuDevice, Tensor, TypedTensor, Unquantized};
 
 /// Tokenizer that returns pre-set token IDs (set from JS before each generation).
@@ -151,8 +151,6 @@ fn resize_state(cached: &RawState, new_seq_budget: usize) -> xn::Result<RawState
 enum Quant {
     F32,
     Q8,
-    Q6,
-    Q4,
 }
 
 impl Quant {
@@ -160,8 +158,6 @@ impl Quant {
         match s {
             "f32" => Ok(Self::F32),
             "q8" => Ok(Self::Q8),
-            "q6" => Ok(Self::Q6),
-            "q4" => Ok(Self::Q4),
             other => xn::bail!("unsupported quantization '{other}'"),
         }
     }
@@ -170,15 +166,11 @@ impl Quant {
 enum ModelInner {
     F32(TTSModel<Unquantized<f32, CpuDevice>>),
     Q8(TTSModel<Q80F32>),
-    Q6(TTSModel<Q6kF32>),
-    Q4(TTSModel<Q40F32>),
 }
 
 enum StateInner {
     F32(TTSState<Unquantized<f32, CpuDevice>>),
     Q8(TTSState<Q80F32>),
-    Q6(TTSState<Q6kF32>),
-    Q4(TTSState<Q40F32>),
 }
 
 /// Dispatch a block of code over the currently active (model, state) pair. Within the
@@ -188,8 +180,6 @@ macro_rules! dispatch {
         match ($inner, $state) {
             (ModelInner::F32($m), StateInner::F32($s)) => $body,
             (ModelInner::Q8($m), StateInner::Q8($s)) => $body,
-            (ModelInner::Q6($m), StateInner::Q6($s)) => $body,
-            (ModelInner::Q4($m), StateInner::Q4($s)) => $body,
             _ => xn::bail!("model/state quantization mismatch"),
         }
     };
@@ -197,7 +187,7 @@ macro_rules! dispatch {
 
 struct GenState {
     tts_state: StateInner,
-    mimi_state: MimiState<f32, CpuDevice>,
+    mimi_state: MimiDecoderState<f32, CpuDevice>,
     prev_latent: Tensor<f32, CpuDevice>,
     rng: WasmRng,
     max_frames: usize,
@@ -221,7 +211,15 @@ impl Model {
         console_log!("[new] loading model with quant={quant:?}");
         let cfg = TTSConfig::v202601(0.7);
 
-        let vb = VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?;
+        let is_gguf = model_weights.len() >= 4 && &model_weights[..4] == b"GGUF";
+        let vb = if is_gguf {
+            console_log!("[new] detected gguf format");
+            let cursor = std::io::Cursor::new(model_weights.to_vec());
+            VB::load_gguf_with_key_map(cursor, CPU, remap_key)?
+        } else {
+            console_log!("[new] detected safetensors format");
+            VB::from_bytes_with_key_map(vec![model_weights.to_vec()], CPU, remap_key)?
+        };
         let root = vb.root();
         let tokenizer = std::sync::Arc::new(PresetTokenizer::new());
         let tokenizer_box: Box<dyn ptts::Tokenizer + Send + Sync> =
@@ -234,8 +232,6 @@ impl Model {
                 &cfg,
             )?),
             Quant::Q8 => ModelInner::Q8(TTSModel::<Q80F32>::load(&root, tokenizer_box, &cfg)?),
-            Quant::Q6 => ModelInner::Q6(TTSModel::<Q6kF32>::load(&root, tokenizer_box, &cfg)?),
-            Quant::Q4 => ModelInner::Q4(TTSModel::<Q40F32>::load(&root, tokenizer_box, &cfg)?),
         };
 
         Ok(Model { inner, tokenizer, cfg, gen_state: None, voice_states: Vec::new() })
@@ -315,8 +311,6 @@ impl Model {
         let mut tts_state = match &self.inner {
             ModelInner::F32(_) => StateInner::F32(wrap_state(raw)),
             ModelInner::Q8(_) => StateInner::Q8(wrap_state(raw)),
-            ModelInner::Q6(_) => StateInner::Q6(wrap_state(raw)),
-            ModelInner::Q4(_) => StateInner::Q4(wrap_state(raw)),
         };
 
         console_log!("[start_generation] running prompt_text...");
@@ -433,8 +427,6 @@ impl Model {
         match &self.inner {
             ModelInner::F32(m) => m.sample_rate(),
             ModelInner::Q8(m) => m.sample_rate(),
-            ModelInner::Q6(m) => m.sample_rate(),
-            ModelInner::Q4(m) => m.sample_rate(),
         }
     }
 }

@@ -1,8 +1,13 @@
 import init, { Model, cpu_features } from './ptts_wasm.js';
 
 const HF_BASE = 'https://huggingface.co/kyutai/pocket-tts-without-voice-cloning/resolve/main';
-const MODEL_URL = `${HF_BASE}/tts_b6369a24.safetensors`;
+const HF_BASE_Q8 = 'https://huggingface.co/lmz/pocket-tts-without-voice-cloning-q8/resolve/main';
 const TOKENIZER_URL = `${HF_BASE}/tokenizer.model`;
+
+function modelUrl(quant) {
+  if (quant === 'q8') return `${HF_BASE_Q8}/tts_b6369a24.gguf`;
+  return `${HF_BASE}/tts_b6369a24.safetensors`;
+}
 
 function voiceUrl(name) {
   return `${HF_BASE}/embeddings_v2/${name}.safetensors`;
@@ -216,7 +221,7 @@ async function handleLoad(quant) {
   tokenizer = new UnigramTokenizer(pieces);
   post('status', { message: `Tokenizer loaded (${pieces.length} pieces)` });
 
-  const modelWeights = await fetchWithProgress(MODEL_URL, 'Model weights');
+  const modelWeights = await fetchWithProgress(modelUrl(quant), 'Model weights');
 
   post('status', { message: `Initializing model (quant=${quant})...` });
   model = new Model(modelWeights, quant);

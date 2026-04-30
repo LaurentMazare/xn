@@ -184,6 +184,7 @@ impl VBData {
 }
 
 impl Reader for std::io::BufReader<std::fs::File> {}
+impl Reader for std::io::Cursor<Vec<u8>> {}
 
 /// A self-contained VarBuilder that owns its data (memory-mapped files or byte buffers).
 pub struct VB<B: Backend> {
