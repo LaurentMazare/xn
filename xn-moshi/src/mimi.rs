@@ -55,8 +55,6 @@ impl Config {
             bias_attn: false,
             layer_scale: Some(0.01),
             context: 250,
-            conv_kernel_size: 5,
-            use_conv_bias: true,
             use_conv_block: false,
             max_period: 10000,
             gating: None,

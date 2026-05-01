@@ -8,7 +8,7 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 // Config
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub d_model: usize,
     pub num_heads: usize,
@@ -20,8 +20,6 @@ pub struct Config {
     pub layer_scale: Option<f64>,
     pub positional_embedding: PositionalEmbedding,
     pub use_conv_block: bool,
-    pub conv_kernel_size: usize,
-    pub use_conv_bias: bool,
     pub gating: Option<crate::seanet::Activation>,
     pub norm: crate::NormType,
     pub context: usize,
@@ -31,7 +29,8 @@ pub struct Config {
     pub conv_layout: bool,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PositionalEmbedding {
     Rope,
     Sin,

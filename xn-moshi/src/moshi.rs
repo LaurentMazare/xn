@@ -84,8 +84,6 @@ impl Config {
             context: self.context,
             max_period: self.max_period,
             use_conv_block: false,
-            conv_kernel_size: 3,
-            use_conv_bias: true,
             gating: Some(crate::seanet::Activation::Silu),
             norm: crate::NormType::RmsNorm,
             positional_embedding: crate::transformer::PositionalEmbedding::Rope,
