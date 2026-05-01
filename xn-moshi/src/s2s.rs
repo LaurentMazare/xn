@@ -29,11 +29,17 @@ pub struct Config {
 pub struct DepformerSlice<Q: BackendQ> {
     transformer: transformer::BatchedTransformer<Q>,
     emb: LowRankEmbeddings<Q>,
+    linear_in: Q::LinearQ,
+    linear_out: Q::LinearQ,
 }
 
 pub struct Model<Q: BackendQ> {
+    text_emb: xn::nn::Embedding<Q::T, Q::B>,
+    audio_embs: Vec<xn::nn::Embedding<Q::T, Q::B>>,
     transformer: transformer::BatchedTransformer<Q>,
     depformer: Vec<DepformerSlice<Q>>,
+    out_norm: crate::transformer::Norm<Q::T, Q::B>,
+    text_linear: Q::LinearQ,
 }
 
 pub struct State<Q: BackendQ> {
@@ -84,7 +90,6 @@ impl<Q: BackendQ> Model<Q> {
         let transformer =
             transformer::BatchedTransformer::load(&vb.pp("transformer"), &cfg.transformer)?;
         let n_q = cfg.depformer.weights_per_step_schedule.len();
-        let mut depformer = Vec::with_capacity(n_q);
         let depformer_config = crate::transformer::Config {
             d_model: cfg.depformer.dim,
             num_heads: cfg.depformer.num_heads,
@@ -104,7 +109,10 @@ impl<Q: BackendQ> Model<Q> {
             positional_embedding: transformer::PositionalEmbedding::None,
             use_conv_block: false,
         };
+        let mut depformer = Vec::with_capacity(n_q);
+        let mut audio_embs = Vec::with_capacity(n_q);
         let df_vb = vb.pp("depformer");
+        let emb_vb = vb.pp("emb");
         // The safetensor exporter merges the weights per step appropriately.
         for slice_idx in 0..n_q {
             let df_vb = df_vb.pp(slice_idx);
@@ -117,10 +125,29 @@ impl<Q: BackendQ> Model<Q> {
                 cfg.transformer.d_model,
                 cfg.depformer.low_rank_embeddings,
             )?;
-            let df = DepformerSlice { transformer, emb };
+            let linear_in =
+                Q::linear_load(df_vb.pp("linear_in"), cfg.transformer.d_model, cfg.depformer.dim)?;
+            let linear_out =
+                Q::linear_load(df_vb.pp("linear_out"), cfg.depformer.dim, cfg.audio_card)?;
+            let df = DepformerSlice { transformer, emb, linear_in, linear_out };
             depformer.push(df);
+            let audio_emb = xn::nn::Embedding::load(
+                emb_vb.pp(slice_idx),
+                cfg.audio_card + 1,
+                cfg.transformer.d_model,
+            )?;
+            audio_embs.push(audio_emb);
         }
-        Ok(Self { transformer, depformer })
+        let text_emb =
+            xn::nn::Embedding::load(vb.pp("text_emb"), cfg.text_card + 1, cfg.transformer.d_model)?;
+        let text_linear =
+            Q::linear_load(vb.pp("text_linear"), cfg.transformer.d_model, cfg.text_card_out)?;
+        let out_norm = crate::transformer::Norm::load(
+            vb.pp("out_norm"),
+            cfg.transformer.d_model,
+            cfg.transformer.norm,
+        )?;
+        Ok(Self { transformer, depformer, audio_embs, text_emb, text_linear, out_norm })
     }
 
     pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<State<Q>> {
