@@ -550,7 +550,7 @@ fn load_model_<B: xn::Backend>(
     } else {
         model
     };
-    let mimi_enc = MimiEnc::load(&vb.pp("mimi"), &cfg)?;
+    let mimi_enc = MimiEnc::load(&vb, &cfg)?;
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
             || v.starts_with("mimi.quantizer")

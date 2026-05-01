@@ -48,12 +48,12 @@ pub struct MimiDecoder<Q: BackendQ> {
     upsample: Option<ConvTrUpsample1d<Q::T, Q::B>>,
     pub quantizer: DummyQuantizer<Q::T, Q::B>,
     pub sample_rate: usize,
+    pub frame_rate: f64,
 }
 
 pub struct MimiModel<Q: BackendQ> {
     encoder: MimiEncoder<Q>,
     decoder: MimiDecoder<Q>,
-    frame_rate: f64,
     pub sample_rate: usize,
 }
 
@@ -179,6 +179,10 @@ impl<Q: BackendQ> MimiEncoder<Q> {
             _ => Ok(emb),
         }
     }
+
+    pub fn frame_size(&self) -> usize {
+        self.frame_size
+    }
 }
 
 impl<Q: BackendQ> MimiDecoder<Q> {
@@ -228,7 +232,14 @@ impl<Q: BackendQ> MimiDecoder<Q> {
         } else {
             None
         };
-        Ok(Self { decoder, decoder_transformer, upsample, quantizer, sample_rate: cfg.sample_rate })
+        Ok(Self {
+            decoder,
+            decoder_transformer,
+            upsample,
+            quantizer,
+            sample_rate: cfg.sample_rate,
+            frame_rate: cfg.frame_rate,
+        })
     }
 
     pub fn init_state(
@@ -265,6 +276,10 @@ impl<Q: BackendQ> MimiDecoder<Q> {
         let outs = self.decoder_transformer.forward(&emb, &mut state.decoder_transformer_state)?;
         self.decoder.forward(&outs[0], &mut state.decoder_state)
     }
+
+    pub fn frame_size(&self) -> usize {
+        (self.sample_rate as f64 / self.frame_rate).round() as usize
+    }
 }
 
 impl<Q: BackendQ> MimiModel<Q> {
@@ -272,11 +287,11 @@ impl<Q: BackendQ> MimiModel<Q> {
         let encoder = MimiEncoder::load(vb, cfg)?;
         let decoder = MimiDecoder::load(vb, cfg)?;
 
-        Ok(Self { encoder, decoder, frame_rate: cfg.frame_rate, sample_rate: cfg.sample_rate })
+        Ok(Self { encoder, decoder, sample_rate: cfg.sample_rate })
     }
 
     pub fn frame_size(&self) -> usize {
-        (self.sample_rate as f64 / self.frame_rate).round() as usize
+        self.encoder.frame_size
     }
 
     pub fn init_state(
