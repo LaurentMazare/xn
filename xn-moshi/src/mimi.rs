@@ -77,6 +77,60 @@ impl Config {
             quantizer_dim: 256,
         }
     }
+
+    pub fn v0_1_48khz(num_codebooks: Option<usize>) -> Self {
+        let seanet_cfg = seanet::Config {
+            dimension: 512,
+            channels: 1,
+            causal: true,
+            n_filters: 64,
+            n_residual_layers: 1,
+            activation: seanet::Activation::Elu(1.),
+            compress: 2,
+            dilation_base: 2,
+            disable_norm_outer_blocks: 0,
+            final_activation: None,
+            kernel_size: 7,
+            residual_kernel_size: 3,
+            last_kernel_size: 3,
+            lstm: 0,
+            norm: conv::Norm::WeightNorm,
+            pad_mode: conv::PadMode::Constant,
+            ratios: vec![8, 8, 6, 5],
+            true_skip: true,
+        };
+        let transformer_cfg = transformer::Config {
+            d_model: seanet_cfg.dimension,
+            num_heads: 8,
+            num_layers: 8,
+            causal: true,
+            norm_first: true,
+            bias_ff: false,
+            bias_attn: false,
+            layer_scale: Some(0.01),
+            context: 250,
+            use_conv_block: false,
+            max_period: 10000,
+            gating: None,
+            norm: crate::NormType::LayerNorm,
+            positional_embedding: transformer::PositionalEmbedding::Rope,
+            dim_feedforward: 2048,
+            kv_repeat: 1,
+            conv_layout: true,
+        };
+        Config {
+            channels: 1,
+            sample_rate: 48_000.,
+            frame_rate: 12.5,
+            renormalize: true,
+            resample_method: ResampleMethod::Conv,
+            seanet: seanet_cfg,
+            transformer: transformer_cfg,
+            quantizer_n_q: num_codebooks.unwrap_or(16),
+            quantizer_bins: 2048,
+            quantizer_dim: 256,
+        }
+    }
 }
 
 // ============================================================================

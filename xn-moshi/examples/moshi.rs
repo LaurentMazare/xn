@@ -406,34 +406,37 @@ fn run_s2s<Q: xn::BackendQ>(
     let config = std::fs::read_to_string(&config)?;
     let config: Config = serde_json::from_str(&config)?;
     println!("S2S config: {:#?}", config);
-    let lm = {
+    let _lm = {
         let weights = config_dir.join(&config.moshi_name);
         let vb = VB::load_with_key_map(&[weights], dev.clone(), key_map_s2s)?.root();
         let lm: Model<Q> = Model::load(&vb, &config)?;
-        vb.check_all_used()?;
+        vb.check_all_used_with_ignore(|s| s.starts_with("condition_provider.conditioners"))?;
         println!("LM loaded successfully");
         lm
-    };
-
-    let _mimi = {
-        let weights = config_dir.join(&config.mimi_name);
-        let vb = VB::load(&[weights], dev.clone())?.root();
-        let mimi_config = mimi::Config::v0_1(Some(32));
-        let mimi: Mimi<f32, Q::B> = Mimi::load(&vb, mimi_config)?;
-        println!("Mimi loaded successfully");
-        vb.check_all_used()?;
-        mimi
     };
 
     let _speaker_wavs_mimi = {
         let weights = config_dir.join(&config.speaker_wavs_mimi_name);
         let vb = VB::load(&[weights], dev.clone())?.root();
-        let mimi_config = mimi::Config::v0_1(Some(32));
+        let mimi_config = mimi::Config::v0_1(Some(16));
         let mimi: Mimi<f32, Q::B> = Mimi::load(&vb, mimi_config)?;
         println!("Speaker Wavs Mimi loaded successfully");
-        vb.check_all_used()?;
+        vb.check_all_used_with_ignore(|s| s.ends_with("_codebook._initialized"))?;
         mimi
     };
+
+    let _mimi = {
+        let weights = config_dir.join(&config.mimi_name);
+        let vb = VB::load(&[weights], dev.clone())?.root();
+        let mimi_config = mimi::Config::v0_1_48khz(Some(32));
+        let mimi: Mimi<f32, Q::B> = Mimi::load(&vb, mimi_config)?;
+        println!("Mimi loaded successfully");
+        vb.check_all_used_with_ignore(|s| {
+            s.ends_with("_codebook._initialized") || s.starts_with("wavlm_")
+        })?;
+        mimi
+    };
+
     anyhow::bail!("S2S is not implemented yet");
 }
 
