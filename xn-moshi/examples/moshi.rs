@@ -387,6 +387,10 @@ fn audio_to_audio<Dev: Backend>(
     Ok(())
 }
 
+fn key_map_s2s(s: &str) -> Option<String> {
+    Some(s.to_string())
+}
+
 fn run_s2s<Q: xn::BackendQ>(
     _input: std::path::PathBuf,
     config: std::path::PathBuf,
@@ -403,7 +407,7 @@ fn run_s2s<Q: xn::BackendQ>(
     let config: Config = serde_json::from_str(&config)?;
     println!("S2S config: {:#?}", config);
     let weights = config_dir.join(&config.weights_name);
-    let vb = VB::load(&[weights], dev.clone())?.root();
+    let vb = VB::load_with_key_map(&[weights], dev.clone(), key_map_s2s)?.root();
     let _lm: Model<Q> = Model::load(&vb, &config)?;
     vb.check_all_used()?;
     anyhow::bail!("S2S is not implemented yet");

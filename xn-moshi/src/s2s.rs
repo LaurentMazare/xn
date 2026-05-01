@@ -10,7 +10,7 @@ pub struct DepformerConfig {
     pub dim: usize,
     pub num_heads: usize,
     pub dim_feedforward: usize,
-    pub low_rank_embeddings: usize,
+    pub low_rank_embeddings: Option<usize>,
     pub norm: crate::NormType,
     pub weights_per_step_schedule: Vec<usize>,
 }
@@ -21,11 +21,14 @@ pub struct Config {
     pub weights_name: String,
     pub delays: Vec<usize>,
     pub depformer: DepformerConfig,
+    pub text_card: usize,
+    pub audio_card: usize,
+    pub text_card_out: usize,
 }
 
 pub struct DepformerSlice<Q: BackendQ> {
     transformer: transformer::BatchedTransformer<Q>,
-    linear: Linear<Q::T, Q::B>,
+    emb: LowRankEmbeddings<Q>,
 }
 
 pub struct Model<Q: BackendQ> {
@@ -51,12 +54,15 @@ impl<Q: BackendQ> LowRankEmbeddings<Q> {
         dim: usize,
         low_rank_dim: Option<usize>,
     ) -> Result<Self> {
-        let embeddings = xn::nn::Embedding::load(vb, in_vocab_size, dim)?;
-        let low_rank = match low_rank_dim {
-            None => None,
+        let (low_rank, embeddings) = match low_rank_dim {
+            None => {
+                let embeddings = xn::nn::Embedding::load(vb, in_vocab_size, dim)?;
+                (None, embeddings)
+            }
             Some(low_rank_dim) => {
                 let low_rank = Q::linear_load(vb.pp("low_rank"), low_rank_dim, dim)?;
-                Some(low_rank)
+                let embeddings = xn::nn::Embedding::load(vb, in_vocab_size, low_rank_dim)?;
+                (Some(low_rank), embeddings)
             }
         };
         Ok(Self { embeddings, low_rank })
@@ -84,13 +90,13 @@ impl<Q: BackendQ> Model<Q> {
             num_heads: cfg.depformer.num_heads,
             dim_feedforward: cfg.depformer.dim_feedforward,
             num_layers: cfg.depformer.num_layers,
-            norm: cfg.depformer.norm,
+            norm: crate::NormType::RmsNorm,
             bias_attn: false,
             bias_ff: false,
             causal: true,
             context: n_q,
             conv_layout: false,
-            gating: None,
+            gating: Some(crate::seanet::Activation::Silu),
             kv_repeat: 1,
             layer_scale: None,
             max_period: 10_000,
@@ -99,15 +105,19 @@ impl<Q: BackendQ> Model<Q> {
             use_conv_block: false,
         };
         let df_vb = vb.pp("depformer");
-        for (slice_idx, weights_idx) in cfg.depformer.weights_per_step_schedule.iter().enumerate() {
+        // The safetensor exporter merges the weights per step appropriately.
+        for slice_idx in 0..n_q {
+            let df_vb = df_vb.pp(slice_idx);
             let transformer =
-                transformer::BatchedTransformer::load(&df_vb.pp(weights_idx), &depformer_config)?;
-            let linear = Linear::load(
-                df_vb.pp("linears").pp(slice_idx),
-                depformer_config.d_model,
+                transformer::BatchedTransformer::load(&df_vb.pp("transformer"), &depformer_config)?;
+            let in_vocab_size = if slice_idx == 0 { cfg.text_card } else { cfg.audio_card };
+            let emb = LowRankEmbeddings::load(
+                &df_vb.pp("emb"),
+                in_vocab_size + 1,
                 cfg.transformer.d_model,
+                cfg.depformer.low_rank_embeddings,
             )?;
-            let df = DepformerSlice { transformer, linear };
+            let df = DepformerSlice { transformer, emb };
             depformer.push(df);
         }
         Ok(Self { transformer, depformer })
