@@ -1,5 +1,5 @@
 #![allow(unused)]
-use crate::transformer::{self, BatchedTransformerState, Config as TransformerConfig, Norm};
+use crate::transformer::{BatchedTransformerState, Config as TransformerConfig, Norm};
 use xn::nn::{Embedding, Linear, var_builder::Path};
 use xn::streaming::StreamMask;
 use xn::{BackendQ, Result, Tensor};
@@ -27,7 +27,7 @@ pub struct Config {
 }
 
 pub struct DepformerSlice<Q: BackendQ> {
-    transformer: transformer::BatchedTransformer<Q>,
+    transformer: crate::transformer::BatchedTransformer<Q>,
     emb: LowRankEmbeddings<Q>,
     linear_in: Q::LinearQ,
     linear_out: Q::LinearQ,
@@ -36,7 +36,7 @@ pub struct DepformerSlice<Q: BackendQ> {
 pub struct Model<Q: BackendQ> {
     text_emb: xn::nn::Embedding<Q::T, Q::B>,
     audio_embs: Vec<xn::nn::Embedding<Q::T, Q::B>>,
-    transformer: transformer::BatchedTransformer<Q>,
+    transformer: crate::transformer_with_ca::Transformer<Q>,
     depformer: Vec<DepformerSlice<Q>>,
     out_norm: crate::transformer::Norm<Q::T, Q::B>,
     text_linear: Q::LinearQ,
@@ -88,7 +88,7 @@ impl<Q: BackendQ> LowRankEmbeddings<Q> {
 impl<Q: BackendQ> Model<Q> {
     pub fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         let transformer =
-            transformer::BatchedTransformer::load(&vb.pp("transformer"), &cfg.transformer)?;
+            crate::transformer_with_ca::Transformer::load(&vb.pp("transformer"), &cfg.transformer)?;
         let n_q = cfg.depformer.weights_per_step_schedule.len();
         let depformer_config = crate::transformer::Config {
             d_model: cfg.depformer.dim,
@@ -106,7 +106,7 @@ impl<Q: BackendQ> Model<Q> {
             layer_scale: None,
             max_period: 10_000,
             norm_first: true,
-            positional_embedding: transformer::PositionalEmbedding::None,
+            positional_embedding: crate::transformer::PositionalEmbedding::None,
             use_conv_block: false,
         };
         let mut depformer = Vec::with_capacity(n_q);
@@ -116,8 +116,10 @@ impl<Q: BackendQ> Model<Q> {
         // The safetensor exporter merges the weights per step appropriately.
         for slice_idx in 0..n_q {
             let df_vb = df_vb.pp(slice_idx);
-            let transformer =
-                transformer::BatchedTransformer::load(&df_vb.pp("transformer"), &depformer_config)?;
+            let transformer = crate::transformer::BatchedTransformer::load(
+                &df_vb.pp("transformer"),
+                &depformer_config,
+            )?;
             let in_vocab_size = if slice_idx == 0 { cfg.text_card } else { cfg.audio_card };
             let emb = LowRankEmbeddings::load(
                 &df_vb.pp("emb"),

@@ -8,6 +8,7 @@ pub mod quantization;
 pub mod s2s;
 pub mod seanet;
 pub mod transformer;
+pub mod transformer_with_ca;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
