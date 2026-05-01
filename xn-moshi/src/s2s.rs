@@ -18,7 +18,9 @@ pub struct DepformerConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub transformer: crate::transformer::Config,
-    pub weights_name: String,
+    pub moshi_name: String,
+    pub mimi_name: String,
+    pub speaker_wavs_mimi_name: String,
     pub delays: Vec<usize>,
     pub depformer: DepformerConfig,
     pub text_card: usize,
