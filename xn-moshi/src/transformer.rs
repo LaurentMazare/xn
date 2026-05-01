@@ -8,7 +8,7 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 // Config
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub d_model: usize,
     pub num_heads: usize,
@@ -20,8 +20,6 @@ pub struct Config {
     pub layer_scale: Option<f64>,
     pub positional_embedding: PositionalEmbedding,
     pub use_conv_block: bool,
-    pub conv_kernel_size: usize,
-    pub use_conv_bias: bool,
     pub gating: Option<crate::seanet::Activation>,
     pub norm: crate::NormType,
     pub context: usize,
@@ -31,7 +29,8 @@ pub struct Config {
     pub conv_layout: bool,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PositionalEmbedding {
     Rope,
     Sin,
@@ -223,18 +222,18 @@ impl<T: WithDTypeF, B: Backend> BatchedTransformerState<T, B> {
 // Rotary Embeddings (per-batch positions)
 // ============================================================================
 
-struct RotaryEmbedding<B: Backend> {
+pub(crate) struct RotaryEmbedding<B: Backend> {
     inv_freq: Tensor<f32, B>, // (1, 1, half_dim)
 }
 
 /// Precomputed cos/sin for a specific forward pass.
-struct Rope<B: Backend> {
+pub(crate) struct Rope<B: Backend> {
     cos: Tensor<f32, B>, // (batch, t, half_dim)
     sin: Tensor<f32, B>, // (batch, t, half_dim)
 }
 
 impl<B: Backend> RotaryEmbedding<B> {
-    fn new(head_dim: usize, max_period: f32, device: &B) -> Result<Self> {
+    pub(crate) fn new(head_dim: usize, max_period: f32, device: &B) -> Result<Self> {
         let half_dim = head_dim / 2;
         let inv_freq: Vec<f32> =
             (0..half_dim).map(|i| 1.0 / max_period.powf(i as f32 / half_dim as f32)).collect();
@@ -243,7 +242,7 @@ impl<B: Backend> RotaryEmbedding<B> {
     }
 
     /// Compute per-batch rope from a positions tensor of shape (batch, t).
-    fn rope(&self, pos: &Tensor<i64, B>) -> Result<Rope<B>> {
+    pub(crate) fn rope(&self, pos: &Tensor<i64, B>) -> Result<Rope<B>> {
         // pos: (batch, t) -> unsqueeze to (batch, t, 1)
         let pos = pos.to::<f32>()?;
         let pos = pos.unsqueeze(2)?;
@@ -258,7 +257,7 @@ impl<B: Backend> RotaryEmbedding<B> {
 }
 
 impl<B: Backend> Rope<B> {
-    fn apply_rotary_emb<T: WithDTypeF>(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    pub(crate) fn apply_rotary_emb<T: WithDTypeF>(&self, x: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         x.to::<f32>()?.rope_i(&self.cos, &self.sin, 0)?.to::<T>()
     }
 }
@@ -267,7 +266,7 @@ impl<B: Backend> Rope<B> {
 // Multi-head Self-Attention (with ScatteredKvCache)
 // ============================================================================
 
-struct BatchedMultiheadAttention<Q: BackendQ> {
+pub(crate) struct BatchedMultiheadAttention<Q: BackendQ> {
     in_proj: Q::LinearQ,
     out_proj: Q::LinearQ,
     num_heads: usize,
@@ -276,7 +275,7 @@ struct BatchedMultiheadAttention<Q: BackendQ> {
 }
 
 impl<Q: BackendQ> BatchedMultiheadAttention<Q> {
-    fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
+    pub(crate) fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         let d_model = cfg.d_model;
         let num_heads = cfg.num_heads;
         let head_dim = d_model / num_heads;
@@ -300,7 +299,7 @@ impl<Q: BackendQ> BatchedMultiheadAttention<Q> {
     }
 
     #[tracing::instrument(name = "batched-mha", skip_all)]
-    fn forward(
+    pub(crate) fn forward(
         &self,
         xs: &Tensor<Q::T, Q::B>,
         rope: Option<&Rope<Q::B>>,

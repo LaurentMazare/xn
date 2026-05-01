@@ -67,6 +67,36 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    S2s {
+        /// Input audio file to process.
+        input: std::path::PathBuf,
+
+        #[arg(long)]
+        config: std::path::PathBuf,
+
+        /// Sampling temperature (0 for greedy).
+        #[arg(short, long, default_value_t = 0.0)]
+        temperature: f64,
+
+        /// Use CPU even if CUDA is available.
+        #[arg(long, default_value_t = false)]
+        cpu: bool,
+
+        /// The dtype to be used, can be f32, bf16, or fp8 when using CUDA.
+        #[arg(long, default_value = "bf16")]
+        dtype: String,
+
+        /// Batch size for computation (ASR output uses first element only).
+        #[arg(short, long, default_value_t = 1)]
+        batch_size: usize,
+
+        /// Write a chrome tracing profile.
+        #[arg(long)]
+        chrome_tracing: bool,
+
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 fn download_mimi_model() -> Result<std::path::PathBuf> {
@@ -128,6 +158,30 @@ impl xn::WithQ for AsrQ {
     }
 }
 
+struct S2s {
+    input: std::path::PathBuf,
+    config: std::path::PathBuf,
+    temperature: f64,
+    batch_size: usize,
+    verbose: bool,
+}
+
+impl xn::WithQ for S2s {
+    fn run<Q: xn::BackendQ>(self, dev: Q::B) -> xn::Result<()> {
+        match run_s2s::<Q>(
+            self.input,
+            self.config,
+            self.temperature,
+            self.batch_size,
+            self.verbose,
+            dev,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => xn::bail!("S2s failed: {e}"),
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -163,6 +217,22 @@ fn main() -> Result<()> {
             let dtype = xn::DTypeQ::from_str(&dtype)?;
             let asr = AsrQ { input, temperature, batch_size, verbose };
             xn::Runner::new().cpu_only(cpu).dtype(dtype).run(asr, 0)?;
+        }
+        Command::S2s {
+            input,
+            temperature,
+            cpu,
+            dtype,
+            batch_size,
+            chrome_tracing,
+            config,
+            verbose,
+        } => {
+            use std::str::FromStr;
+            let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
+            let dtype = xn::DTypeQ::from_str(&dtype)?;
+            let s2s = S2s { input, temperature, batch_size, verbose, config };
+            xn::Runner::new().cpu_only(cpu).dtype(dtype).run(s2s, 0)?;
         }
     }
 
@@ -315,6 +385,59 @@ fn audio_to_audio<Dev: Backend>(
     );
 
     Ok(())
+}
+
+fn key_map_s2s(s: &str) -> Option<String> {
+    Some(s.to_string())
+}
+
+fn run_s2s<Q: xn::BackendQ>(
+    _input: std::path::PathBuf,
+    config: std::path::PathBuf,
+    _temperature: f64,
+    _batch_size: usize,
+    _verbose: bool,
+    dev: Q::B,
+) -> Result<()> {
+    use xn_moshi::s2s::{Config, Model};
+
+    let config = config.canonicalize()?;
+    let config_dir = config.parent().context("config must have a parent directory")?;
+    let config = std::fs::read_to_string(&config)?;
+    let config: Config = serde_json::from_str(&config)?;
+    println!("S2S config: {:#?}", config);
+    let _lm = {
+        let weights = config_dir.join(&config.moshi_name);
+        let vb = VB::load_with_key_map(&[weights], dev.clone(), key_map_s2s)?.root();
+        let lm: Model<Q> = Model::load(&vb, &config)?;
+        vb.check_all_used_with_ignore(|s| s.starts_with("condition_provider.conditioners"))?;
+        println!("LM loaded successfully");
+        lm
+    };
+
+    let _speaker_wavs_mimi = {
+        let weights = config_dir.join(&config.speaker_wavs_mimi_name);
+        let vb = VB::load(&[weights], dev.clone())?.root();
+        let mimi_config = mimi::Config::v0_1(Some(16));
+        let mimi: Mimi<f32, Q::B> = Mimi::load(&vb, mimi_config)?;
+        println!("Speaker Wavs Mimi loaded successfully");
+        vb.check_all_used_with_ignore(|s| s.ends_with("_codebook._initialized"))?;
+        mimi
+    };
+
+    let _mimi = {
+        let weights = config_dir.join(&config.mimi_name);
+        let vb = VB::load(&[weights], dev.clone())?.root();
+        let mimi_config = mimi::Config::v0_1_48khz(Some(32));
+        let mimi: Mimi<f32, Q::B> = Mimi::load(&vb, mimi_config)?;
+        println!("Mimi loaded successfully");
+        vb.check_all_used_with_ignore(|s| {
+            s.ends_with("_codebook._initialized") || s.starts_with("wavlm_")
+        })?;
+        mimi
+    };
+
+    anyhow::bail!("S2S is not implemented yet");
 }
 
 fn run_asr<Q: xn::BackendQ>(
