@@ -72,6 +72,9 @@ enum Command {
         input: std::path::PathBuf,
 
         #[arg(long)]
+        voice: std::path::PathBuf,
+
+        #[arg(long)]
         config: std::path::PathBuf,
 
         /// Sampling temperature (0 for greedy).
@@ -160,6 +163,7 @@ impl xn::WithQ for AsrQ {
 
 struct S2s {
     input: std::path::PathBuf,
+    voice: std::path::PathBuf,
     config: std::path::PathBuf,
     temperature: f64,
     batch_size: usize,
@@ -170,6 +174,7 @@ impl xn::WithQ for S2s {
     fn run<Q: xn::BackendQ>(self, dev: Q::B) -> xn::Result<()> {
         match run_s2s::<Q>(
             self.input,
+            self.voice,
             self.config,
             self.temperature,
             self.batch_size,
@@ -220,6 +225,7 @@ fn main() -> Result<()> {
         }
         Command::S2s {
             input,
+            voice,
             temperature,
             cpu,
             dtype,
@@ -231,7 +237,7 @@ fn main() -> Result<()> {
             use std::str::FromStr;
             let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
             let dtype = xn::DTypeQ::from_str(&dtype)?;
-            let s2s = S2s { input, temperature, batch_size, verbose, config };
+            let s2s = S2s { input, voice, temperature, batch_size, verbose, config };
             xn::Runner::new().cpu_only(cpu).dtype(dtype).run(s2s, 0)?;
         }
     }
@@ -391,8 +397,23 @@ fn key_map_s2s(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+fn load_pcm_data(input: &std::path::PathBuf, target_sample_rate: usize) -> Result<Vec<f32>> {
+    let (pcm_data, sample_rate) = kaudio::pcm_decode(&input)?;
+    let len = pcm_data.len();
+    println!("  {len} samples at {sample_rate} Hz ({:.2}s)", len as f64 / sample_rate as f64);
+
+    let pcm_data = if sample_rate as usize != target_sample_rate {
+        println!("  Resampling {} Hz -> {} Hz", sample_rate, target_sample_rate);
+        kaudio::resample(&pcm_data, sample_rate as usize, target_sample_rate)?
+    } else {
+        pcm_data
+    };
+    Ok(pcm_data)
+}
+
 fn run_s2s<Q: xn::BackendQ>(
-    _input: std::path::PathBuf,
+    input: std::path::PathBuf,
+    voice_input: std::path::PathBuf,
     config: std::path::PathBuf,
     _temperature: f64,
     _batch_size: usize,
@@ -400,6 +421,10 @@ fn run_s2s<Q: xn::BackendQ>(
     dev: Q::B,
 ) -> Result<()> {
     use xn_moshi::s2s::{Config, Model};
+
+    let pcm_input = load_pcm_data(&voice_input, 48000)?;
+    let mut pcm_voice = load_pcm_data(&input, 24000)?;
+    pcm_voice.resize(24000 * 10, 0.0);
 
     let config = config.canonicalize()?;
     let config_dir = config.parent().context("config must have a parent directory")?;
@@ -415,7 +440,7 @@ fn run_s2s<Q: xn::BackendQ>(
         lm
     };
 
-    let _speaker_wavs_mimi = {
+    let speaker_wavs_mimi = {
         let weights = config_dir.join(&config.speaker_wavs_mimi_name);
         let vb = VB::load(&[weights], dev.clone())?.root();
         let mimi_config = mimi::Config::v0_1(Some(16));
@@ -425,7 +450,7 @@ fn run_s2s<Q: xn::BackendQ>(
         mimi
     };
 
-    let _mimi = {
+    let mimi = {
         let weights = config_dir.join(&config.mimi_name);
         let vb = VB::load(&[weights], dev.clone())?.root();
         let mimi_config = mimi::Config::v0_1_48khz(Some(32));
@@ -436,6 +461,16 @@ fn run_s2s<Q: xn::BackendQ>(
         })?;
         mimi
     };
+
+    println!("Encoding voice...");
+    let pcm_voice = Tensor::from_vec(pcm_voice, (1, 1, ()), &dev)?;
+    let voice = speaker_wavs_mimi.encode(&pcm_voice)?;
+    println!("  Voice encoded to shape {voice:?}");
+
+    println!("Encoding input...");
+    let pcm_input = Tensor::from_vec(pcm_input, (1, 1, ()), &dev)?;
+    let input = mimi.encode(&pcm_input)?;
+    println!("  Input encoded to shape {input:?}");
 
     anyhow::bail!("S2S is not implemented yet");
 }
