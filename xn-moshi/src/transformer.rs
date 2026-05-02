@@ -356,9 +356,8 @@ impl<Q: BackendQ> BatchedMultiheadAttention<Q> {
         let attn_weights = q.matmul_t(&k)?.scale(scale)?; // (b, h, t, k)
 
         let mask = iam.mask(); // &Tensor<T, B>, shape (b, 1, t, context)
-        let mask_dims = mask.dims();
+        let mask_context = mask.dim(3)?;
         // Trim mask to match k/v length if needed
-        let mask_context = mask_dims[3];
         let mask_t = if k_target_len < mask_context {
             mask.narrow(3, mask_context - k_target_len..mask_context)?.contiguous()?
         } else {
