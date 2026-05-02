@@ -362,10 +362,10 @@ impl<Q: BackendQ> State<Q> {
 
     pub fn last_audio_tokens(&self) -> Option<Vec<u32>> {
         let mut last_tokens = vec![];
-        for (i, delay) in self.model.audio_delays.iter().enumerate() {
+        for (cb_idx, delay) in self.model.audio_delays.iter().enumerate() {
             if self.index > *delay {
-                let prev_tokens = self.audio_tokens.last()?;
-                last_tokens.push(prev_tokens[i][0]);
+                let step_idx = self.index - delay - 1;
+                last_tokens.push(self.audio_tokens[step_idx][cb_idx][0]);
             } else {
                 return None;
             }
