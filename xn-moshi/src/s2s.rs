@@ -234,4 +234,52 @@ impl<Q: BackendQ> State<Q> {
         let logits = model.text_linear.forward(&ys)?;
         Ok((logits, ys))
     }
+
+    /// Sample one audio token per codebook via the depformer, conditioned on the
+    /// main transformer hidden state `ys` (shape `(batch, 1, d_model)`) and the
+    /// previously sampled `text_token` (one per batch element).
+    /// Returns a `Vec` of length `n_slices`, each entry of length `batch_size`.
+    pub fn depformer_sample(
+        &self,
+        ys: &Tensor<Q::T, Q::B>,
+        text_token: &[u32],
+    ) -> Result<Vec<Vec<u32>>> {
+        use xn::ModuleT;
+        let model = &self.model;
+        let device = model.device();
+        let batch_size = self.transformer.batch_size();
+        if text_token.len() != batch_size {
+            xn::bail!("text_token len {} does not match batch_size {batch_size}", text_token.len())
+        }
+        // The depformer slices share the same architecture, so a single state
+        // can be reused: every slice extends the kv-cache by one position,
+        // matching the moshi-rs `copy_state` propagation.
+        let mut state = model.depformer[0].transformer.init_state(batch_size)?;
+        let mask = StreamMask::all_active(batch_size);
+
+        let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(model.depformer.len());
+        let mut last_token: Vec<u32> = text_token.to_vec();
+
+        for slice in model.depformer.iter() {
+            let xs = slice.linear_in.forward(ys)?;
+            let token_id = Tensor::from_vec(
+                last_token.iter().map(|&x| x as i64).collect(),
+                batch_size,
+                device,
+            )?;
+            let token_emb = slice.emb.forward(&token_id)?.unsqueeze(1)?;
+            let xs = xs.add(&token_emb)?;
+            let xs = slice.transformer.forward(&xs, &mut state, &mask)?;
+            let logits = slice.linear_out.forward(&xs)?;
+            let dims = logits.dims();
+            let (b, _t, vocab) = (dims[0], dims[1], dims[2]);
+            let logits_2d = logits.reshape((b, vocab))?;
+            let sampled: Tensor<i64, Q::B> = logits_2d.argmax(xn::D::Minus1)?;
+            let sampled_v: Vec<i64> = sampled.to_vec()?;
+            let tokens: Vec<u32> = sampled_v.into_iter().map(|x| x as u32).collect();
+            last_token = tokens.clone();
+            all_tokens.push(tokens);
+        }
+        Ok(all_tokens)
+    }
 }

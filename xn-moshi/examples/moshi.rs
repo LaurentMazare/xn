@@ -397,6 +397,10 @@ fn key_map_s2s(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+fn first_per_slice(slices: &[Vec<u32>]) -> Vec<u32> {
+    slices.iter().map(|s| *s.first().unwrap_or(&u32::MAX)).collect()
+}
+
 fn load_pcm_data(input: &std::path::PathBuf, target_sample_rate: usize) -> Result<Vec<f32>> {
     let (pcm_data, sample_rate) = kaudio::pcm_decode(&input)?;
     let len = pcm_data.len();
@@ -514,11 +518,28 @@ fn run_s2s<Q: xn::BackendQ>(
             let audio_id_refs: Vec<Option<&[u32]>> =
                 audio_ids.iter().map(|ids| Some(ids.as_slice())).collect();
 
-            let (text_logits, _ys) = lm_state.forward(None, &audio_id_refs, &ca_src, &mask)?;
+            let (text_logits, ys) = lm_state.forward(None, &audio_id_refs, &ca_src, &mask)?;
+
+            // Greedy text token sample: (batch, 1, vocab) -> (batch,).
+            let tl_dims = text_logits.dims();
+            let (batch_size, _one, vocab_size) = (tl_dims[0], tl_dims[1], tl_dims[2]);
+            let text_logits_2d = text_logits.reshape((batch_size, vocab_size))?;
+            let text_sampled: Tensor<i64, Q::B> = text_logits_2d.argmax(xn::D::Minus1)?;
+            let text_tokens: Vec<u32> =
+                text_sampled.to_vec()?.into_iter().map(|x| x as u32).collect();
+
+            // Depformer sampling conditioned on the transformer hidden state.
+            let audio_tokens = lm_state.depformer_sample(&ys, &text_tokens)?;
 
             frames_processed += 1;
             if frames_processed == 1 {
                 println!("  first text_logits shape: {:?}", text_logits.dims());
+                println!(
+                    "  first depformer slices: {} x {} tokens",
+                    audio_tokens.len(),
+                    audio_tokens.first().map(|v| v.len()).unwrap_or(0)
+                );
+                println!("  first audio token per codebook: {:?}", first_per_slice(&audio_tokens));
             }
         }
 
