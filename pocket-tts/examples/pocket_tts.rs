@@ -3,7 +3,9 @@ mod audio_helpers;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ptts::tts_model::{TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences};
+use ptts::tts_model::{
+    MimiEnc, TTSConfig, TTSModel, prepare_text_prompt, split_into_best_sentences,
+};
 use xn::Tensor;
 use xn::nn::VB;
 
@@ -353,6 +355,7 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
     };
     let vb = vb.root();
     let model: TTSModel<Q> = TTSModel::load(&vb, Box::new(tokenizer), &cfg)?;
+    let mimi_enc: MimiEnc<Q> = MimiEnc::load(&vb, &cfg)?;
     vb.check_all_used_with_ignore(|v| {
         v == "flow_lm.condition_provider.conditioners.speaker_wavs.learnt_padding"
             || v.starts_with("mimi.quantizer")
@@ -425,11 +428,11 @@ fn run_for_device<Q: xn::BackendQ + 'static>(args: Args, dev: Q::B) -> Result<()
                     pcm
                 };
                 let pcm_tensor = Tensor::from_vec(pcm, (1, 1, ()), &dev)?.to::<Q::T>()?;
-                let emb = model.encode_audio(&pcm_tensor)?;
+                let emb = mimi_enc.encode_audio(&pcm_tensor)?;
                 tracing::info!(?emb, "encoded audio to latent");
                 let null_emb = if cfg_state.is_some() {
                     let null_pcm_tensor = pcm_tensor.zeros_like()?;
-                    Some(model.encode_audio(&null_pcm_tensor)?)
+                    Some(mimi_enc.encode_audio(&null_pcm_tensor)?)
                 } else {
                     None
                 };

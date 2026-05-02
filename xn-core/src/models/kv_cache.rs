@@ -510,7 +510,12 @@ impl<B: Backend> ScatteredCacheBuilder<B> {
         seq_len: usize,
         batch_mask: &[bool],
     ) -> Result<IndicesAndMask<T, B>> {
-        let mask = self.get_mask_abs(seq_len, seq_len)?;
+        let mask = self.get_mask_abs(seq_len, seq_len)?.reshape((
+            self.batch_size(),
+            1,
+            seq_len,
+            seq_len,
+        ))?;
         let mut cache_indices = Vec::with_capacity(self.batch_size());
         for (batch_i, &batch_mask) in batch_mask.iter().enumerate() {
             if !batch_mask {
