@@ -77,6 +77,10 @@ enum Command {
         #[arg(long)]
         config: std::path::PathBuf,
 
+        /// Output WAV file path.
+        #[arg(short, long, default_value = "out.wav")]
+        output: std::path::PathBuf,
+
         /// Sampling temperature (0 for greedy).
         #[arg(short, long, default_value_t = 0.0)]
         temperature: f64,
@@ -165,6 +169,7 @@ struct S2s {
     input: std::path::PathBuf,
     voice: std::path::PathBuf,
     config: std::path::PathBuf,
+    output: std::path::PathBuf,
     temperature: f64,
     batch_size: usize,
     verbose: bool,
@@ -176,6 +181,7 @@ impl xn::WithQ for S2s {
             self.input,
             self.voice,
             self.config,
+            self.output,
             self.temperature,
             self.batch_size,
             self.verbose,
@@ -232,12 +238,13 @@ fn main() -> Result<()> {
             batch_size,
             chrome_tracing,
             config,
+            output,
             verbose,
         } => {
             use std::str::FromStr;
             let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
             let dtype = xn::DTypeQ::from_str(&dtype)?;
-            let s2s = S2s { input, voice, temperature, batch_size, verbose, config };
+            let s2s = S2s { input, voice, temperature, batch_size, verbose, config, output };
             xn::Runner::new().cpu_only(cpu).dtype(dtype).run(s2s, 0)?;
         }
     }
@@ -415,6 +422,7 @@ fn run_s2s<Q: xn::BackendQ>(
     input: std::path::PathBuf,
     voice_input: std::path::PathBuf,
     config: std::path::PathBuf,
+    output: std::path::PathBuf,
     temperature: f64,
     _batch_size: usize,
     _verbose: bool,
@@ -482,10 +490,12 @@ fn run_s2s<Q: xn::BackendQ>(
     println!("\nStreaming encode + LM step ({} chunks of {} samples)...", num_chunks, frame_size);
 
     let mut enc_state = mimi.init_encode_state(1)?;
+    let mut dec_state = mimi.init_decode_state(1)?;
     let mut state = lm.init_state(1, temperature as f32)?;
     let mask = StreamMask::all_active(1);
 
     let start_time = std::time::Instant::now();
+    let mut decoded_pcm: Vec<Tensor<f32, Q::B>> = Vec::new();
 
     for chunk_idx in 0..num_chunks {
         let start = chunk_idx * frame_size;
@@ -501,10 +511,21 @@ fn run_s2s<Q: xn::BackendQ>(
         let Some(codes) = codes.as_option() else { continue };
 
         let (_b, _n_cb, t) = codes.dims3()?;
-        let _codes_vec: Vec<i64> = codes.to_vec()?;
 
         for _step in 0..t {
             state.step(&ca_src, &mask)?;
+            if let Some(audio_tokens) = state.last_audio_tokens() {
+                let n_cb = audio_tokens.len();
+                let codes_t: Tensor<i64, Q::B> = Tensor::from_vec(
+                    audio_tokens.iter().map(|&x| x as i64).collect(),
+                    (1, n_cb, 1),
+                    &dev,
+                )?;
+                let pcm = dec_state.decode_step(&StreamTensor::from_tensor(codes_t), &mask)?;
+                if let Some(pcm) = pcm.as_option() {
+                    decoded_pcm.push(pcm.copy()?);
+                }
+            }
         }
 
         if (chunk_idx + 1) % 25 == 0 || chunk_idx == num_chunks - 1 {
@@ -514,6 +535,23 @@ fn run_s2s<Q: xn::BackendQ>(
 
     let elapsed = start_time.elapsed();
     println!("Done: {} frames in {:.2}s", state.frames_processed(), elapsed.as_secs_f64());
+
+    if decoded_pcm.is_empty() {
+        println!("No audio was decoded; skipping WAV write.");
+        return Ok(());
+    }
+
+    let pcm_refs: Vec<&Tensor<f32, Q::B>> = decoded_pcm.iter().collect();
+    let pcm_concat = Tensor::cat(&pcm_refs, 2)?;
+    let pcm_concat = pcm_concat.narrow(0, ..1)?.contiguous()?;
+    println!("  Decoded PCM shape: {:?}", pcm_concat.dims());
+    let pcm_vec: Vec<f32> = pcm_concat.to_vec()?;
+
+    let out_sample_rate: u32 = 48000;
+    println!("Writing {} samples to {}...", pcm_vec.len(), output.display());
+    let file = std::fs::File::create(&output)?;
+    let mut writer = std::io::BufWriter::new(file);
+    kaudio::wav::write_pcm_as_wav(&mut writer, &pcm_vec, out_sample_rate, 1)?;
 
     Ok(())
 }
