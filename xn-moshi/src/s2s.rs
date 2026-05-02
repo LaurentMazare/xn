@@ -43,11 +43,18 @@ pub struct Model<Q: BackendQ> {
     depformer: Vec<DepformerSlice<Q>>,
     out_norm: crate::transformer::Norm<Q::T, Q::B>,
     text_linear: Q::LinearQ,
+    text_card: usize,
+    audio_card: usize,
+    audio_delays: Vec<usize>,
 }
 
 pub struct State<Q: BackendQ> {
     pub model: std::sync::Arc<Model<Q>>,
     pub transformer: BatchedTransformerState<Q::T, Q::B>,
+    pub temperature: Tensor<f32, Q::B>,
+    pub index: usize,
+    // Time-step, codebook, batch element.
+    pub audio_tokens: Vec<Vec<Vec<u32>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,11 +159,40 @@ impl<Q: BackendQ> Model<Q> {
             cfg.transformer.d_model,
             cfg.transformer.norm,
         )?;
-        Ok(Self { transformer, depformer, audio_embs, text_emb, text_linear, out_norm })
+        let last_delay = match cfg.delays.last() {
+            Some(&d) => d,
+            None => xn::bail!("at least one delay must be specified"),
+        };
+        let n_q = depformer.len();
+        let audio_delays: Vec<_> =
+            (0..n_q).map(|i| cfg.delays.get(i).cloned().unwrap_or(last_delay)).collect();
+        Ok(Self {
+            transformer,
+            depformer,
+            audio_embs,
+            text_emb,
+            text_linear,
+            out_norm,
+            text_card: cfg.text_card,
+            audio_card: cfg.audio_card,
+            audio_delays,
+        })
     }
 
-    pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<State<Q>> {
-        Ok(State { model: self.clone(), transformer: self.transformer.init_state(batch_size)? })
+    pub fn init_state(
+        self: &std::sync::Arc<Self>,
+        batch_size: usize,
+        temperature: f32,
+    ) -> Result<State<Q>> {
+        let temperature: Tensor<f32, Q::B> =
+            Tensor::full(temperature, (batch_size, 1), self.device())?;
+        Ok(State {
+            model: self.clone(),
+            transformer: self.transformer.init_state(batch_size)?,
+            temperature,
+            index: 0,
+            audio_tokens: Vec::new(),
+        })
     }
 
     pub fn device(&self) -> &Q::B {
@@ -191,6 +227,10 @@ impl<Q: BackendQ> Model<Q> {
 }
 
 impl<Q: BackendQ> State<Q> {
+    pub fn frames_processed(&self) -> usize {
+        self.index
+    }
+
     pub fn device(&self) -> &Q::B {
         self.model.device()
     }
@@ -199,10 +239,10 @@ impl<Q: BackendQ> State<Q> {
     /// `(batch_size,)`. Returns `(text_logits, transformer_out)` of shape
     /// `(batch, 1, text_card_out)` and `(batch, 1, d_model)` respectively.
     #[allow(clippy::type_complexity)]
-    pub fn forward(
+    fn forward(
         &mut self,
         text_ids: Option<&[u32]>,
-        audio_ids: &[Option<&[u32]>],
+        audio_ids: &[Vec<u32>],
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
@@ -221,13 +261,11 @@ impl<Q: BackendQ> State<Q> {
                 Tensor::zeros((batch_size, 1, d_model), device)?
             }
         };
-        for (audio_emb, audio_ids) in model.audio_embs.iter().zip(audio_ids.iter()) {
-            if let Some(ids) = audio_ids {
-                let ids_t =
-                    Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
-                let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
-                emb = emb.add(&e)?;
-            }
+        for (audio_emb, ids) in model.audio_embs.iter().zip(audio_ids.iter()) {
+            let ids_t =
+                Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
+            let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
+            emb = emb.add(&e)?;
         }
         let ys = model.transformer.forward(&emb, ca_src, &mut self.transformer, mask)?;
         let ys = model.out_norm.forward(&ys)?;
@@ -241,7 +279,7 @@ impl<Q: BackendQ> State<Q> {
     /// `temperature` has shape `(batch, 1)` — when zero this collapses to greedy
     /// argmax sampling.
     /// Returns a `Vec` of length `n_slices`, each entry of length `batch_size`.
-    pub fn depformer_sample(
+    fn depformer_sample(
         &self,
         ys: &Tensor<Q::T, Q::B>,
         text_token: &[u32],
@@ -283,5 +321,45 @@ impl<Q: BackendQ> State<Q> {
             all_tokens.push(tokens);
         }
         Ok(all_tokens)
+    }
+
+    pub fn step(&mut self, ca_src: &CaSrc<Q>, mask: &StreamMask) -> Result<()> {
+        use xn::Context;
+
+        // TODO(laurent): support for batch size greater than 1.
+        let pad_token = 3;
+        let text_token =
+            if self.index == 0 { &[self.model.text_card as u32] } else { &[pad_token] };
+        let mut audio_tokens = vec![];
+
+        for (i, delay) in self.model.audio_delays.iter().enumerate() {
+            let audio_token = if self.index > *delay {
+                let prev_tokens =
+                    self.audio_tokens.last().context("audio_tokens should not be empty")?;
+                prev_tokens[i][0]
+            } else {
+                self.model.audio_card as u32
+            };
+            audio_tokens.push(vec![audio_token]);
+        }
+        // TODO(laurent): teacher force the semantic token.
+        let (_text_logits, ys) = self.forward(Some(text_token), &audio_tokens, ca_src, mask)?;
+        let audio_tokens = self.depformer_sample(&ys, &[pad_token], &self.temperature)?;
+        self.audio_tokens.push(audio_tokens);
+        self.index += 1;
+        Ok(())
+    }
+
+    pub fn last_audio_tokens(&self) -> Option<Vec<u32>> {
+        let mut last_tokens = vec![];
+        for (i, delay) in self.model.audio_delays.iter().enumerate() {
+            if self.index > *delay {
+                let prev_tokens = self.audio_tokens.last()?;
+                last_tokens.push(prev_tokens[i][0]);
+            } else {
+                return None;
+            }
+        }
+        Some(last_tokens)
     }
 }

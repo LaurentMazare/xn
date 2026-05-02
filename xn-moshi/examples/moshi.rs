@@ -397,10 +397,6 @@ fn key_map_s2s(s: &str) -> Option<String> {
     Some(s.to_string())
 }
 
-fn first_per_slice(slices: &[Vec<u32>]) -> Vec<u32> {
-    slices.iter().map(|s| *s.first().unwrap_or(&u32::MAX)).collect()
-}
-
 fn load_pcm_data(input: &std::path::PathBuf, target_sample_rate: usize) -> Result<Vec<f32>> {
     let (pcm_data, sample_rate) = kaudio::pcm_decode(&input)?;
     let len = pcm_data.len();
@@ -486,12 +482,10 @@ fn run_s2s<Q: xn::BackendQ>(
     println!("\nStreaming encode + LM step ({} chunks of {} samples)...", num_chunks, frame_size);
 
     let mut enc_state = mimi.init_encode_state(1)?;
-    let mut lm_state = lm.init_state(1)?;
+    let mut state = lm.init_state(1, temperature as f32)?;
     let mask = StreamMask::all_active(1);
-    let temperature_t: Tensor<f32, Q::B> = Tensor::full(temperature as f32, (1, 1), &dev)?;
 
     let start_time = std::time::Instant::now();
-    let mut frames_processed: usize = 0;
 
     for chunk_idx in 0..num_chunks {
         let start = chunk_idx * frame_size;
@@ -506,42 +500,11 @@ fn run_s2s<Q: xn::BackendQ>(
 
         let Some(codes) = codes.as_option() else { continue };
 
-        let dims = codes.dims();
-        let (b, n_cb, t) = (dims[0], dims[1], dims[2]);
-        let codes_vec: Vec<i64> = codes.to_vec()?;
+        let (_b, _n_cb, t) = codes.dims3()?;
+        let _codes_vec: Vec<i64> = codes.to_vec()?;
 
-        for step in 0..t {
-            let audio_ids: Vec<Vec<u32>> = (0..n_cb)
-                .map(|cb| {
-                    (0..b).map(|bi| codes_vec[bi * n_cb * t + cb * t + step] as u32).collect()
-                })
-                .collect();
-            let audio_id_refs: Vec<Option<&[u32]>> =
-                audio_ids.iter().map(|ids| Some(ids.as_slice())).collect();
-
-            let (text_logits, ys) = lm_state.forward(None, &audio_id_refs, &ca_src, &mask)?;
-
-            // Sample text token via Gumbel-max with the configured temperature
-            // (zero collapses to greedy argmax).
-            let (batch_size, _one, vocab_size) = text_logits.dims3()?;
-            let text_logits_2d = text_logits.reshape((batch_size, vocab_size))?;
-            let text_sampled = xn_moshi::sampling::gumbel_max(&text_logits_2d, &temperature_t)?;
-            let text_tokens: Vec<u32> =
-                text_sampled.to_vec()?.into_iter().map(|x| x as u32).collect();
-
-            // Depformer sampling conditioned on the transformer hidden state.
-            let audio_tokens = lm_state.depformer_sample(&ys, &text_tokens, &temperature_t)?;
-
-            frames_processed += 1;
-            if frames_processed == 1 {
-                println!("  first text_logits shape: {:?}", text_logits.dims());
-                println!(
-                    "  first depformer slices: {} x {} tokens",
-                    audio_tokens.len(),
-                    audio_tokens.first().map(|v| v.len()).unwrap_or(0)
-                );
-                println!("  first audio token per codebook: {:?}", first_per_slice(&audio_tokens));
-            }
+        for _step in 0..t {
+            state.step(&ca_src, &mask)?;
         }
 
         if (chunk_idx + 1) % 25 == 0 || chunk_idx == num_chunks - 1 {
@@ -550,7 +513,7 @@ fn run_s2s<Q: xn::BackendQ>(
     }
 
     let elapsed = start_time.elapsed();
-    println!("Done: {} frames in {:.2}s", frames_processed, elapsed.as_secs_f64());
+    println!("Done: {} frames in {:.2}s", state.frames_processed(), elapsed.as_secs_f64());
 
     Ok(())
 }
