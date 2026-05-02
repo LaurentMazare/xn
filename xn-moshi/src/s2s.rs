@@ -284,6 +284,7 @@ impl<Q: BackendQ> State<Q> {
         ys: &Tensor<Q::T, Q::B>,
         text_token: &[u32],
         temperature: &Tensor<f32, Q::B>,
+        semantic_token: i64,
     ) -> Result<Vec<Vec<u32>>> {
         use xn::ModuleT;
         let model = &self.model;
@@ -301,7 +302,7 @@ impl<Q: BackendQ> State<Q> {
         let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(model.depformer.len());
         let mut last_token: Vec<u32> = text_token.to_vec();
 
-        for slice in model.depformer.iter() {
+        for (slice_idx, slice) in model.depformer.iter().enumerate() {
             let xs = slice.linear_in.forward(ys)?;
             let token_id = Tensor::from_vec(
                 last_token.iter().map(|&x| x as i64).collect(),
@@ -315,7 +316,10 @@ impl<Q: BackendQ> State<Q> {
             let (b, _t, vocab) = logits.dims3()?;
             let logits_2d = logits.reshape((b, vocab))?;
             let sampled = crate::sampling::gumbel_max(&logits_2d, temperature)?;
-            let sampled_v: Vec<i64> = sampled.to_vec()?;
+            let mut sampled_v: Vec<i64> = sampled.to_vec()?;
+            if slice_idx == 0 {
+                sampled_v.fill(semantic_token);
+            }
             let tokens: Vec<u32> = sampled_v.into_iter().map(|x| x as u32).collect();
             last_token = tokens.clone();
             all_tokens.push(tokens);
@@ -323,7 +327,12 @@ impl<Q: BackendQ> State<Q> {
         Ok(all_tokens)
     }
 
-    pub fn step(&mut self, ca_src: &CaSrc<Q>, mask: &StreamMask) -> Result<()> {
+    pub fn step(
+        &mut self,
+        ca_src: &CaSrc<Q>,
+        mask: &StreamMask,
+        semantic_token: i64,
+    ) -> Result<()> {
         use xn::Context;
 
         // TODO(laurent): support for batch size greater than 1.
@@ -344,7 +353,8 @@ impl<Q: BackendQ> State<Q> {
         }
         // TODO(laurent): teacher force the semantic token.
         let (_text_logits, ys) = self.forward(Some(text_token), &audio_tokens, ca_src, mask)?;
-        let audio_tokens = self.depformer_sample(&ys, &[pad_token], &self.temperature)?;
+        let audio_tokens =
+            self.depformer_sample(&ys, &[pad_token], &self.temperature, semantic_token)?;
         self.audio_tokens.push(audio_tokens);
         self.index += 1;
         Ok(())

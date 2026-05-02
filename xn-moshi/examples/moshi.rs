@@ -512,8 +512,10 @@ fn run_s2s<Q: xn::BackendQ>(
 
         let (_b, _n_cb, t) = codes.dims3()?;
 
-        for _step in 0..t {
-            state.step(&ca_src, &mask)?;
+        for step in 0..t {
+            let codes = codes.narrow(2, step..step + 1)?.contiguous()?;
+            let codes = codes.to_vec()?;
+            state.step(&ca_src, &mask, codes[0])?;
             if let Some(audio_tokens) = state.last_audio_tokens() {
                 let n_cb = audio_tokens.len();
                 let codes_t: Tensor<i64, Q::B> = Tensor::from_vec(
