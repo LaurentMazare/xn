@@ -421,6 +421,7 @@ fn run_s2s<Q: xn::BackendQ>(
     dev: Q::B,
 ) -> Result<()> {
     use xn_moshi::s2s::{Config, Model};
+    use xn_moshi::transformer_with_ca::CaSrc;
 
     let pcm_input = load_pcm_data(&voice_input, 48000)?;
     let mut pcm_voice = load_pcm_data(&input, 24000)?;
@@ -431,13 +432,13 @@ fn run_s2s<Q: xn::BackendQ>(
     let config = std::fs::read_to_string(&config)?;
     let config: Config = serde_json::from_str(&config)?;
     println!("S2S config: {:#?}", config);
-    let _lm = {
+    let lm = {
         let weights = config_dir.join(&config.moshi_name);
         let vb = VB::load_with_key_map(&[weights], dev.clone(), key_map_s2s)?.root();
         let lm: Model<Q> = Model::load(&vb, &config)?;
         vb.check_all_used_with_ignore(|s| s.starts_with("condition_provider.conditioners"))?;
         println!("LM loaded successfully");
-        lm
+        std::sync::Arc::new(lm)
     };
 
     let speaker_wavs_mimi = {
@@ -459,20 +460,77 @@ fn run_s2s<Q: xn::BackendQ>(
         vb.check_all_used_with_ignore(|s| {
             s.ends_with("_codebook._initialized") || s.starts_with("wavlm_")
         })?;
-        mimi
+        std::sync::Arc::new(mimi)
     };
 
     println!("Encoding voice...");
     let pcm_voice = Tensor::from_vec(pcm_voice, (1, 1, ()), &dev)?;
     let voice = speaker_wavs_mimi.encode(&pcm_voice)?;
-    println!("  Voice encoded to shape {voice:?}");
+    println!("  Voice encoded to shape {:?}", voice.dims());
 
-    println!("Encoding input...");
-    let pcm_input = Tensor::from_vec(pcm_input, (1, 1, ()), &dev)?;
-    let input = mimi.encode(&pcm_input)?;
-    println!("  Input encoded to shape {input:?}");
+    // Build the cross-attention source from the voice codes and pre-compute its
+    // K/V projections so they can be reused at every decoding step.
+    let voice_emb = lm.embed_audio_codes(&voice)?;
+    println!("  Voice embedded to shape {:?}", voice_emb.dims());
+    let ca_src = lm.maybe_precompute_ca_kv(CaSrc::Tokens(voice_emb))?;
 
-    anyhow::bail!("S2S is not implemented yet");
+    // Streaming encode of the input audio: chunks of 3940 samples are fed
+    // through `encode_step`, and on every emitted frame the LM is run to
+    // predict the next time slice.
+    let frame_size: usize = 3840;
+    let num_chunks = pcm_input.len().div_ceil(frame_size);
+    println!("\nStreaming encode + LM step ({} chunks of {} samples)...", num_chunks, frame_size);
+
+    let mut enc_state = mimi.init_encode_state(1)?;
+    let mut lm_state = lm.init_state(1)?;
+    let mask = StreamMask::all_active(1);
+
+    let start_time = std::time::Instant::now();
+    let mut frames_processed: usize = 0;
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * frame_size;
+        let end = (start + frame_size).min(pcm_input.len());
+        let mut chunk: Vec<f32> = pcm_input[start..end].to_vec();
+        if chunk.len() < frame_size {
+            chunk.resize(frame_size, 0.0);
+        }
+
+        let audio: Tensor<f32, Q::B> = Tensor::from_vec(chunk, (1, 1, frame_size), &dev)?;
+        let codes = enc_state.encode_step(&StreamTensor::from_tensor(audio), &mask)?;
+
+        let Some(codes) = codes.as_option() else { continue };
+
+        let dims = codes.dims();
+        let (b, n_cb, t) = (dims[0], dims[1], dims[2]);
+        let codes_vec: Vec<i64> = codes.to_vec()?;
+
+        for step in 0..t {
+            let audio_ids: Vec<Vec<u32>> = (0..n_cb)
+                .map(|cb| {
+                    (0..b).map(|bi| codes_vec[bi * n_cb * t + cb * t + step] as u32).collect()
+                })
+                .collect();
+            let audio_id_refs: Vec<Option<&[u32]>> =
+                audio_ids.iter().map(|ids| Some(ids.as_slice())).collect();
+
+            let (text_logits, _ys) = lm_state.forward(None, &audio_id_refs, &ca_src, &mask)?;
+
+            frames_processed += 1;
+            if frames_processed == 1 {
+                println!("  first text_logits shape: {:?}", text_logits.dims());
+            }
+        }
+
+        if (chunk_idx + 1) % 25 == 0 || chunk_idx == num_chunks - 1 {
+            println!("  chunk {}/{}", chunk_idx + 1, num_chunks);
+        }
+    }
+
+    let elapsed = start_time.elapsed();
+    println!("Done: {} frames in {:.2}s", frames_processed, elapsed.as_secs_f64());
+
+    Ok(())
 }
 
 fn run_asr<Q: xn::BackendQ>(

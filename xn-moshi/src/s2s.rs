@@ -1,5 +1,6 @@
 #![allow(unused)]
 use crate::transformer::{BatchedTransformerState, Config as TransformerConfig, Norm};
+use crate::transformer_with_ca::CaSrc;
 use xn::nn::{Embedding, Linear, var_builder::Path};
 use xn::streaming::StreamMask;
 use xn::{BackendQ, Result, Tensor};
@@ -156,5 +157,81 @@ impl<Q: BackendQ> Model<Q> {
 
     pub fn init_state(self: &std::sync::Arc<Self>, batch_size: usize) -> Result<State<Q>> {
         Ok(State { model: self.clone(), transformer: self.transformer.init_state(batch_size)? })
+    }
+
+    pub fn device(&self) -> &Q::B {
+        self.text_emb.device()
+    }
+
+    /// Pre-compute the K/V projections for the cross-attention source so they
+    /// can be reused across timesteps.
+    pub fn maybe_precompute_ca_kv(&self, ca_src: CaSrc<Q>) -> Result<CaSrc<Q>> {
+        self.transformer.maybe_precompute_ca_kv(ca_src)
+    }
+
+    /// Embed audio codes by summing the per-codebook embeddings.
+    /// `codes` shape: `(batch, codebooks, frames)`. Returns `(batch, frames, d_model)`.
+    pub fn embed_audio_codes(&self, codes: &Tensor<i64, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
+        let (b, n_cb, t) = codes.dims3()?;
+        let n = n_cb.min(self.audio_embs.len());
+        if n == 0 {
+            xn::bail!("no audio embeddings available")
+        }
+        let mut acc: Option<Tensor<Q::T, Q::B>> = None;
+        for cb in 0..n {
+            let codes_cb = codes.narrow(1, cb..cb + 1)?.reshape((b, t))?.contiguous()?;
+            let e = self.audio_embs[cb].forward(&codes_cb)?;
+            acc = Some(match acc {
+                None => e,
+                Some(prev) => prev.add(&e)?,
+            });
+        }
+        Ok(acc.unwrap())
+    }
+}
+
+impl<Q: BackendQ> State<Q> {
+    pub fn device(&self) -> &Q::B {
+        self.model.device()
+    }
+
+    /// Single forward step. `text_ids` and per-codebook `audio_ids` are
+    /// `(batch_size,)`. Returns `(text_logits, transformer_out)` of shape
+    /// `(batch, 1, text_card_out)` and `(batch, 1, d_model)` respectively.
+    #[allow(clippy::type_complexity)]
+    pub fn forward(
+        &mut self,
+        text_ids: Option<&[u32]>,
+        audio_ids: &[Option<&[u32]>],
+        ca_src: &CaSrc<Q>,
+        mask: &StreamMask,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        use xn::ModuleT;
+        let model = &self.model;
+        let device = model.device();
+        let mut emb = match text_ids {
+            Some(ids) => {
+                let ids_t =
+                    Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
+                model.text_emb.forward(&ids_t)?.unsqueeze(1)?
+            }
+            None => {
+                let d_model = model.text_emb.hidden_size();
+                let batch_size = self.transformer.batch_size();
+                Tensor::zeros((batch_size, 1, d_model), device)?
+            }
+        };
+        for (audio_emb, audio_ids) in model.audio_embs.iter().zip(audio_ids.iter()) {
+            if let Some(ids) = audio_ids {
+                let ids_t =
+                    Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
+                let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
+                emb = emb.add(&e)?;
+            }
+        }
+        let ys = model.transformer.forward(&emb, ca_src, &mut self.transformer, mask)?;
+        let ys = model.out_norm.forward(&ys)?;
+        let logits = model.text_linear.forward(&ys)?;
+        Ok((logits, ys))
     }
 }
