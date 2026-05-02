@@ -238,11 +238,14 @@ impl<Q: BackendQ> State<Q> {
     /// Sample one audio token per codebook via the depformer, conditioned on the
     /// main transformer hidden state `ys` (shape `(batch, 1, d_model)`) and the
     /// previously sampled `text_token` (one per batch element).
+    /// `temperature` has shape `(batch, 1)` — when zero this collapses to greedy
+    /// argmax sampling.
     /// Returns a `Vec` of length `n_slices`, each entry of length `batch_size`.
     pub fn depformer_sample(
         &self,
         ys: &Tensor<Q::T, Q::B>,
         text_token: &[u32],
+        temperature: &Tensor<f32, Q::B>,
     ) -> Result<Vec<Vec<u32>>> {
         use xn::ModuleT;
         let model = &self.model;
@@ -271,10 +274,9 @@ impl<Q: BackendQ> State<Q> {
             let xs = xs.add(&token_emb)?;
             let xs = slice.transformer.forward(&xs, &mut state, &mask)?;
             let logits = slice.linear_out.forward(&xs)?;
-            let dims = logits.dims();
-            let (b, _t, vocab) = (dims[0], dims[1], dims[2]);
+            let (b, _t, vocab) = logits.dims3()?;
             let logits_2d = logits.reshape((b, vocab))?;
-            let sampled: Tensor<i64, Q::B> = logits_2d.argmax(xn::D::Minus1)?;
+            let sampled = crate::sampling::gumbel_max(&logits_2d, temperature)?;
             let sampled_v: Vec<i64> = sampled.to_vec()?;
             let tokens: Vec<u32> = sampled_v.into_iter().map(|x| x as u32).collect();
             last_token = tokens.clone();

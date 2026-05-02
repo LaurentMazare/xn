@@ -419,7 +419,7 @@ fn run_s2s<Q: xn::BackendQ>(
     input: std::path::PathBuf,
     voice_input: std::path::PathBuf,
     config: std::path::PathBuf,
-    _temperature: f64,
+    temperature: f64,
     _batch_size: usize,
     _verbose: bool,
     dev: Q::B,
@@ -488,6 +488,7 @@ fn run_s2s<Q: xn::BackendQ>(
     let mut enc_state = mimi.init_encode_state(1)?;
     let mut lm_state = lm.init_state(1)?;
     let mask = StreamMask::all_active(1);
+    let temperature_t: Tensor<f32, Q::B> = Tensor::full(temperature as f32, (1, 1), &dev)?;
 
     let start_time = std::time::Instant::now();
     let mut frames_processed: usize = 0;
@@ -520,16 +521,16 @@ fn run_s2s<Q: xn::BackendQ>(
 
             let (text_logits, ys) = lm_state.forward(None, &audio_id_refs, &ca_src, &mask)?;
 
-            // Greedy text token sample: (batch, 1, vocab) -> (batch,).
-            let tl_dims = text_logits.dims();
-            let (batch_size, _one, vocab_size) = (tl_dims[0], tl_dims[1], tl_dims[2]);
+            // Sample text token via Gumbel-max with the configured temperature
+            // (zero collapses to greedy argmax).
+            let (batch_size, _one, vocab_size) = text_logits.dims3()?;
             let text_logits_2d = text_logits.reshape((batch_size, vocab_size))?;
-            let text_sampled: Tensor<i64, Q::B> = text_logits_2d.argmax(xn::D::Minus1)?;
+            let text_sampled = xn_moshi::sampling::gumbel_max(&text_logits_2d, &temperature_t)?;
             let text_tokens: Vec<u32> =
                 text_sampled.to_vec()?.into_iter().map(|x| x as u32).collect();
 
             // Depformer sampling conditioned on the transformer hidden state.
-            let audio_tokens = lm_state.depformer_sample(&ys, &text_tokens)?;
+            let audio_tokens = lm_state.depformer_sample(&ys, &text_tokens, &temperature_t)?;
 
             frames_processed += 1;
             if frames_processed == 1 {

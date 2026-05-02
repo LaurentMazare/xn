@@ -2,8 +2,9 @@ use crate::conditioners::Conditioners;
 use crate::lm::{LmModel, LmState};
 use crate::mimi::{Mimi, MimiEncodeState};
 use crate::moshi;
+use crate::sampling::gumbel_max;
 use xn::streaming::{StreamMask, StreamTensor};
-use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
+use xn::{BackendQ, Result, Tensor, WithDTypeF};
 
 const TOKEN_EOP: u32 = 0;
 const TOKEN_PAD: u32 = 3;
@@ -247,18 +248,6 @@ impl<Q: BackendQ> Asr<Q> {
             default_condition,
         })
     }
-}
-
-/// Sample according to the Gumbel-Softmax distribution.
-fn gumbel_max<T: WithDTypeF, B: Backend>(
-    logits: &Tensor<T, B>,
-    temperature: &Tensor<f32, B>,
-) -> Result<Tensor<i64, B>> {
-    // Cast to f32, doing the Gumbel softmax in bf16 is a bit unstable.
-    let logits = logits.to::<f32>()?;
-    let gumbel_noise = logits.rand_uniform_like(1e-7, 0.999)?.log()?.neg()?.log()?;
-    let adjusted_logits = logits.sub(&gumbel_noise.broadcast_mul(temperature)?)?;
-    adjusted_logits.argmax(xn::D::Minus1)
 }
 
 impl<Q: BackendQ> AsrState<Q> {

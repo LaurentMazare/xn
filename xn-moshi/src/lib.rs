@@ -6,6 +6,7 @@ pub mod mimi;
 pub mod moshi;
 pub mod quantization;
 pub mod s2s;
+pub mod sampling;
 pub mod seanet;
 pub mod transformer;
 pub mod transformer_with_ca;
