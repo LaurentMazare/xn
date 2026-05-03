@@ -233,33 +233,29 @@ impl<Q: BackendQ> State<Q> {
         self.model.device()
     }
 
-    /// Single forward step. `text_ids` and per-codebook `audio_ids` are
+    /// Single forward step. `text_ids` and per-codebook `audio_tokens` are
     /// `(batch_size,)`. Returns `(text_logits, transformer_out)` of shape
     /// `(batch, 1, text_card_out)` and `(batch, 1, d_model)` respectively.
     #[allow(clippy::type_complexity)]
     fn forward(
         &mut self,
-        text_ids: Option<&[u32]>,
-        audio_ids: &[Vec<u32>],
+        text_tokens: &[u32],
+        audio_tokens: &[Vec<u32>],
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
         use xn::ModuleT;
         let model = &self.model;
         let device = model.device();
-        let mut emb = match text_ids {
-            Some(ids) => {
-                let ids_t =
-                    Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
-                model.text_emb.forward(&ids_t)?.unsqueeze(1)?
-            }
-            None => {
-                let d_model = model.text_emb.hidden_size();
-                let batch_size = self.transformer.batch_size();
-                Tensor::zeros((batch_size, 1, d_model), device)?
-            }
+        let mut emb = {
+            let ids_t = Tensor::from_vec(
+                text_tokens.iter().map(|&x| x as i64).collect(),
+                text_tokens.len(),
+                device,
+            )?;
+            model.text_emb.forward(&ids_t)?.unsqueeze(1)?
         };
-        for (audio_emb, ids) in model.audio_embs.iter().zip(audio_ids.iter()) {
+        for (audio_emb, ids) in model.audio_embs.iter().zip(audio_tokens.iter()) {
             let ids_t =
                 Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
             let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
@@ -273,14 +269,14 @@ impl<Q: BackendQ> State<Q> {
 
     /// Sample one audio token per codebook via the depformer, conditioned on the
     /// main transformer hidden state `ys` (shape `(batch, 1, d_model)`) and the
-    /// previously sampled `text_token` (one per batch element).
+    /// previously sampled `text_tokens` (one per batch element).
     /// `temperature` has shape `(batch, 1)` — when zero this collapses to greedy
     /// argmax sampling.
     /// Returns a `Vec` of length `n_slices`, each entry of length `batch_size`.
     fn depformer_sample(
         &self,
         ys: &Tensor<Q::T, Q::B>,
-        text_token: &[u32],
+        text_tokens: &[u32],
         temperature: &Tensor<f32, Q::B>,
         semantic_token: i64,
     ) -> Result<Vec<Vec<u32>>> {
@@ -288,8 +284,11 @@ impl<Q: BackendQ> State<Q> {
         let model = &self.model;
         let device = model.device();
         let batch_size = self.transformer.batch_size();
-        if text_token.len() != batch_size {
-            xn::bail!("text_token len {} does not match batch_size {batch_size}", text_token.len())
+        if text_tokens.len() != batch_size {
+            xn::bail!(
+                "text_tokens len {} does not match batch_size {batch_size}",
+                text_tokens.len()
+            )
         }
         // The depformer slices share the same architecture, so a single state
         // can be reused: every slice extends the kv-cache by one position,
@@ -298,7 +297,7 @@ impl<Q: BackendQ> State<Q> {
         let mask = StreamMask::all_active(batch_size);
 
         let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(model.depformer.len());
-        let mut last_token: Vec<u32> = text_token.to_vec();
+        let mut last_token: Vec<u32> = text_tokens.to_vec();
 
         for (slice_idx, slice) in model.depformer.iter().enumerate() {
             let xs = slice.linear_in.forward(ys)?;
@@ -356,7 +355,7 @@ impl<Q: BackendQ> State<Q> {
         let pad_token = 3;
         let text_tokens = self.text_token_for_current_step();
         let audio_tokens = self.audio_tokens_for_current_step()?;
-        let (_text_logits, ys) = self.forward(Some(&text_tokens), &audio_tokens, ca_src, mask)?;
+        let (_text_logits, ys) = self.forward(&text_tokens, &audio_tokens, ca_src, mask)?;
         let audio_tokens =
             self.depformer_sample(&ys, &[pad_token], &self.temperature, semantic_token)?;
         self.audio_tokens.push(audio_tokens);
