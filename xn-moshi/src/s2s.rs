@@ -327,20 +327,10 @@ impl<Q: BackendQ> State<Q> {
         Ok(all_tokens)
     }
 
-    pub fn step(
-        &mut self,
-        ca_src: &CaSrc<Q>,
-        mask: &StreamMask,
-        semantic_token: i64,
-    ) -> Result<()> {
+    fn audio_tokens_for_current_step(&self) -> Result<Vec<Vec<u32>>> {
         use xn::Context;
 
-        // TODO(laurent): support for batch size greater than 1.
-        let pad_token = 3;
-        let text_token =
-            if self.index == 0 { &[self.model.text_card as u32] } else { &[pad_token] };
         let mut audio_tokens = vec![];
-
         for (i, delay) in self.model.audio_delays.iter().enumerate() {
             let audio_token = if self.index > *delay {
                 let prev_tokens =
@@ -351,8 +341,24 @@ impl<Q: BackendQ> State<Q> {
             };
             audio_tokens.push(vec![audio_token]);
         }
-        // TODO(laurent): teacher force the semantic token.
-        let (_text_logits, ys) = self.forward(Some(text_token), &audio_tokens, ca_src, mask)?;
+        Ok(audio_tokens)
+    }
+
+    fn text_token_for_current_step(&self) -> Vec<u32> {
+        if self.index == 0 { vec![self.model.text_card as u32] } else { vec![3] }
+    }
+
+    pub fn step(
+        &mut self,
+        ca_src: &CaSrc<Q>,
+        mask: &StreamMask,
+        semantic_token: i64,
+    ) -> Result<()> {
+        // TODO(laurent): support for batch size greater than 1.
+        let pad_token = 3;
+        let text_tokens = self.text_token_for_current_step();
+        let audio_tokens = self.audio_tokens_for_current_step()?;
+        let (_text_logits, ys) = self.forward(Some(&text_tokens), &audio_tokens, ca_src, mask)?;
         let audio_tokens =
             self.depformer_sample(&ys, &[pad_token], &self.temperature, semantic_token)?;
         self.audio_tokens.push(audio_tokens);
