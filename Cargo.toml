@@ -22,10 +22,8 @@ byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 cudarc = { version = "0.19.4", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"] }
 gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
-getrandom = "0.3"
 half = { version = "2.7.1", features = ["num-traits"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
-js-sys = "0.3"
 kaudio = "0.2.1"
 libc = "0.2"
 libm = "0.2"
@@ -36,18 +34,15 @@ paste = "1"
 rand = { version = "0.9.0", default-features = false }
 rand_distr = "0.5.0"
 rayon = "1.11.0"
-rubato = "0.15.0"
 safetensors = "0.7"
 sentencepiece = "0.13.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
-symphonia = { version = "0.5.3", features = ["all"] }
 thiserror = "2.0.17"
 tokenizers = "0.21"
 tracing = "0.1.44"
 tracing-chrome = "0.7.2"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-wasm-bindgen = "0.2"
 yoke = { version = "0.8.1", features = ["derive"] }
 
 [profile.release]
