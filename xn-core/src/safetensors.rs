@@ -127,7 +127,7 @@ pub fn save<K: AsRef<str> + Ord + std::fmt::Display, B: Backend>(
         .iter()
         .map(|(name, tensor)| Ok((name, typed_tensor_to_save_view(tensor)?)))
         .collect::<Result<_>>()?;
-    Ok(safetensors::tensor::serialize_to_file(views, &None, path.as_ref())?)
+    Ok(safetensors::tensor::serialize_to_file(views, None, path.as_ref())?)
 }
 
 impl<T: WithDType, B: Backend> Tensor<T, B> {
@@ -138,6 +138,6 @@ impl<T: WithDType, B: Backend> Tensor<T, B> {
             shape: self.shape().dims().to_vec(),
             dtype: dtype_to_safetensors(T::DTYPE),
         };
-        Ok(safetensors::tensor::serialize_to_file([(name, view)], &None, path.as_ref())?)
+        Ok(safetensors::tensor::serialize_to_file([(name, view)], None, path.as_ref())?)
     }
 }
