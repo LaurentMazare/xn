@@ -235,10 +235,12 @@ fn main() -> Result<()> {
 
 fn peak_rss_mb() -> f64 {
     let mut usage = std::mem::MaybeUninit::uninit();
-    unsafe {
+    let maxrss = unsafe {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
-        usage.assume_init().ru_maxrss as f64 / 1024.0
-    }
+        usage.assume_init().ru_maxrss as f64
+    };
+    // ru_maxrss is in bytes on macOS but kilobytes on Linux.
+    if cfg!(target_os = "macos") { maxrss / (1024.0 * 1024.0) } else { maxrss / 1024.0 }
 }
 
 enum Rng {
