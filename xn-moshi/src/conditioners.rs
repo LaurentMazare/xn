@@ -140,7 +140,7 @@ impl<T: WithDTypeF, B: Backend> ContinuousConditioner<T, B> {
 pub struct LutConfig {
     pub n_bins: usize,
     pub dim: usize,
-    pub default_value: String,
+    pub default_value: Option<String>,
     pub possible_values: Vec<String>,
 }
 
