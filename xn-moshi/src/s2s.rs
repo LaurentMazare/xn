@@ -1,7 +1,5 @@
-#![allow(unused)]
-use crate::transformer::{BatchedTransformerState, Config as TransformerConfig, Norm};
 use crate::transformer_with_ca::CaSrc;
-use xn::nn::{Embedding, Linear, var_builder::Path};
+use xn::nn::var_builder::Path;
 use xn::streaming::StreamMask;
 use xn::{BackendQ, Result, Tensor};
 
@@ -50,7 +48,7 @@ pub struct Model<Q: BackendQ> {
 
 pub struct State<Q: BackendQ> {
     pub model: std::sync::Arc<Model<Q>>,
-    pub transformer: BatchedTransformerState<Q::T, Q::B>,
+    pub transformer: crate::transformer::BatchedTransformerState<Q::T, Q::B>,
     pub temperature: Tensor<f32, Q::B>,
     pub index: usize,
     // Time-step, codebook, batch element.
