@@ -1,17 +1,34 @@
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand_distr::{Distribution, Normal};
 use xn::quantized::{GgmlDType, QLinear};
 use xn::{CpuDevice, ModuleT, Result, Tensor};
 
+const TEST_SEED: u64 = 299792458;
+
+fn randn_vec(rng: &mut StdRng, len: usize, mean: f32, std: f32) -> Vec<f32> {
+    let dist = Normal::new(mean, std).unwrap();
+    (0..len).map(|_| dist.sample(rng)).collect()
+}
+
 #[test]
 fn qlinear_vs_linear_no_bias() -> Result<()> {
+    let mut rng = StdRng::seed_from_u64(TEST_SEED);
     let dev = CpuDevice;
     let in_features = 64;
     let out_features = 32;
     let batch = 4;
 
-    // Create a random weight and input.
-    let dummy: Tensor<f32, _> = Tensor::zeros((), &dev)?;
-    let weight = dummy.randn((out_features, in_features), 0.0, 1.0)?;
-    let xs = dummy.randn((batch, in_features), 0.0, 1.0)?;
+    let weight: Tensor<f32, _> = Tensor::from_vec(
+        randn_vec(&mut rng, out_features * in_features, 0.0, 1.0),
+        (out_features, in_features),
+        &dev,
+    )?;
+    let xs: Tensor<f32, _> = Tensor::from_vec(
+        randn_vec(&mut rng, batch * in_features, 0.0, 1.0),
+        (batch, in_features),
+        &dev,
+    )?;
 
     // Reference: standard linear (no bias).
     let linear = xn::nn::Linear::new(weight);
@@ -33,15 +50,24 @@ fn qlinear_vs_linear_no_bias() -> Result<()> {
 
 #[test]
 fn qlinear_vs_linear_with_bias() -> Result<()> {
+    let mut rng = StdRng::seed_from_u64(TEST_SEED);
     let dev = CpuDevice;
     let in_features = 64;
     let out_features = 32;
     let batch = 4;
 
-    let dummy: Tensor<f32, _> = Tensor::zeros((), &dev)?;
-    let weight = dummy.randn((out_features, in_features), 0.0, 1.0)?;
-    let bias = dummy.randn((out_features,), 0.0, 1.0)?;
-    let xs = dummy.randn((batch, in_features), 0.0, 1.0)?;
+    let weight: Tensor<f32, _> = Tensor::from_vec(
+        randn_vec(&mut rng, out_features * in_features, 0.0, 1.0),
+        (out_features, in_features),
+        &dev,
+    )?;
+    let bias: Tensor<f32, _> =
+        Tensor::from_vec(randn_vec(&mut rng, out_features, 0.0, 1.0), (out_features,), &dev)?;
+    let xs: Tensor<f32, _> = Tensor::from_vec(
+        randn_vec(&mut rng, batch * in_features, 0.0, 1.0),
+        (batch, in_features),
+        &dev,
+    )?;
 
     let linear = xn::nn::Linear::new(weight).with_bias(bias);
     let ref_out = linear.forward(&xs)?;
@@ -59,15 +85,23 @@ fn qlinear_vs_linear_with_bias() -> Result<()> {
 
 #[test]
 fn qlinear_3d_input() -> Result<()> {
+    let mut rng = StdRng::seed_from_u64(TEST_SEED);
     let dev = CpuDevice;
     let in_features = 64;
     let out_features = 32;
     let batch = 2;
     let seq_len = 3;
 
-    let dummy: Tensor<f32, _> = Tensor::zeros((), &dev)?;
-    let weight = dummy.randn((out_features, in_features), 0.0, 1.0)?;
-    let xs = dummy.randn((batch, seq_len, in_features), 0.0, 1.0)?;
+    let weight: Tensor<f32, _> = Tensor::from_vec(
+        randn_vec(&mut rng, out_features * in_features, 0.0, 1.0),
+        (out_features, in_features),
+        &dev,
+    )?;
+    let xs: Tensor<f32, _> = Tensor::from_vec(
+        randn_vec(&mut rng, batch * seq_len * in_features, 0.0, 1.0),
+        (batch, seq_len, in_features),
+        &dev,
+    )?;
 
     let linear = xn::nn::Linear::new(weight);
     let ref_out = linear.forward(&xs)?;
@@ -111,10 +145,9 @@ fn check_sgemm_q8_0_matches_vec_dot(
 
     assert!(k.is_multiple_of(QK8_0), "k={k} not a multiple of {QK8_0}");
 
-    let dev = CpuDevice;
-    let dummy: Tensor<f32, _> = Tensor::zeros((), &dev)?;
-    let lhs = dummy.randn((m, k), 0.0, 1.0)?.to_vec()?;
-    let rhs = dummy.randn((n, k), 0.0, 1.0)?.to_vec()?;
+    let mut rng = StdRng::seed_from_u64(TEST_SEED);
+    let lhs = randn_vec(&mut rng, m * k, 0.0, 1.0);
+    let rhs = randn_vec(&mut rng, n * k, 0.0, 1.0);
 
     let k_blocks = k / QK8_0;
     let mut lhs_q = vec![BlockQ8_0::zeros(); m * k_blocks];
