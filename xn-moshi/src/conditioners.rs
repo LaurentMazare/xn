@@ -227,3 +227,36 @@ impl<T: xn::WithDTypeF, B: xn::Backend> Conditioners<T, B> {
         Ok(result)
     }
 }
+
+/// Load conditioners from weights based on the config.
+pub fn load<T: xn::WithDTypeF, B: xn::Backend>(
+    output_dim: usize,
+    conditioner_configs: &std::collections::HashMap<String, ConditionerConfig>,
+    vb: &xn::nn::var_builder::Path<B>,
+) -> xn::Result<Conditioners<T, B>> {
+    let mut lut = std::collections::HashMap::new();
+    let mut continuous = std::collections::HashMap::new();
+    for (name, cond_config) in conditioner_configs {
+        match cond_config {
+            ConditionerConfig::Lut { lut: lut_cfg } => {
+                let conditioner = crate::conditioners::LUTConditioner::load(
+                    &vb.pp("condition_provider").pp("conditioners").pp(name),
+                    None,
+                    output_dim,
+                    lut_cfg.clone(),
+                )?;
+                lut.insert(name.clone(), conditioner);
+            }
+            ConditionerConfig::Continuous { continuous: cont_cfg } => {
+                let conditioner = crate::conditioners::ContinuousConditioner::load(
+                    &vb.pp("condition_provider").pp("conditioners").pp(name),
+                    cont_cfg.dim,
+                    output_dim,
+                    cont_cfg.scale_factor,
+                )?;
+                continuous.insert(name.clone(), conditioner);
+            }
+        }
+    }
+    Ok(Conditioners { lut, continuous })
+}

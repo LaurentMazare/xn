@@ -15,6 +15,13 @@ pub struct DepformerConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConditionerConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub inner: crate::conditioners::ConditionerConfig,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub transformer: crate::transformer::Config,
     pub moshi_name: String,
@@ -25,6 +32,7 @@ pub struct Config {
     pub text_card: usize,
     pub audio_card: usize,
     pub text_card_out: usize,
+    pub conditioners: Vec<ConditionerConfig>,
 }
 
 pub struct DepformerSlice<Q: BackendQ> {
@@ -44,6 +52,10 @@ pub struct Model<Q: BackendQ> {
     text_card: usize,
     audio_card: usize,
     audio_delays: Vec<usize>,
+    #[allow(dead_code)]
+    conditioners: crate::conditioners::Conditioners<Q::T, Q::B>,
+    #[allow(dead_code)]
+    default_conditions: Option<Tensor<Q::T, Q::B>>,
 }
 
 pub struct State<Q: BackendQ> {
@@ -164,6 +176,10 @@ impl<Q: BackendQ> Model<Q> {
         let n_q = depformer.len();
         let audio_delays: Vec<_> =
             (0..n_q).map(|i| cfg.delays.get(i).cloned().unwrap_or(last_delay)).collect();
+        let conditioners =
+            cfg.conditioners.iter().map(|c| (c.name.clone(), c.inner.clone())).collect();
+        let conditioners = crate::conditioners::load(cfg.transformer.d_model, &conditioners, vb)?;
+        let default_conditions = conditioners.condition_sum(&std::collections::HashMap::new())?;
         Ok(Self {
             transformer,
             depformer,
@@ -174,6 +190,8 @@ impl<Q: BackendQ> Model<Q> {
             text_card: cfg.text_card,
             audio_card: cfg.audio_card,
             audio_delays,
+            conditioners,
+            default_conditions,
         })
     }
 
