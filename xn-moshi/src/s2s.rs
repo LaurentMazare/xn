@@ -195,6 +195,13 @@ impl<Q: BackendQ> Model<Q> {
         })
     }
 
+    pub fn condition_sum(
+        &self,
+        values: &std::collections::HashMap<String, crate::conditioners::Value>,
+    ) -> Result<Option<Tensor<Q::T, Q::B>>> {
+        self.conditioners.condition_sum(values)
+    }
+
     pub fn init_state(
         self: &std::sync::Arc<Self>,
         batch_size: usize,

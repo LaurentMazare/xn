@@ -482,6 +482,18 @@ fn run_s2s<Q: xn::BackendQ>(
     println!("  Voice embedded to shape {:?}", voice_emb.dims());
     let ca_src = lm.maybe_precompute_ca_kv(CaSrc::Tokens(voice_emb))?;
 
+    let condition_sum = lm.condition_sum(
+        &[
+            ("version".to_string(), "3".into()),
+            ("lang".to_string(), "fr".into()),
+            ("languages_in_segment".to_string(), "fr".into()),
+        ]
+        .into(),
+    )?;
+    if let Some(condition_sum) = &condition_sum {
+        println!("Condition sum:\n{condition_sum}");
+    }
+
     // Streaming encode of the input audio: chunks of 3940 samples are fed
     // through `encode_step`, and on every emitted frame the LM is run to
     // predict the next time slice.
