@@ -264,7 +264,10 @@ impl<Q: BackendQ> State<Q> {
     #[allow(clippy::type_complexity)]
     fn forward(
         &mut self,
-        text_tokens: &[u32],
+        // TODO(laurent): to handle batch inference properly, we should use
+        // a slice of options and have an index_select like operation that
+        // supports zeros for some sentinel token index.
+        text_tokens: Option<&[u32]>,
         audio_tokens: &[Vec<u32>],
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
@@ -272,13 +275,16 @@ impl<Q: BackendQ> State<Q> {
         use xn::ModuleT;
         let model = &self.model;
         let device = model.device();
-        let mut emb = {
+        let d_model = model.text_emb.hidden_size();
+        let mut emb = Tensor::zeros((1, 1, d_model), device)?;
+        if let Some(text_tokens) = text_tokens {
             let ids_t = Tensor::from_vec(
                 text_tokens.iter().map(|&x| x as i64).collect(),
                 text_tokens.len(),
                 device,
             )?;
-            model.text_emb.forward(&ids_t)?.unsqueeze(1)?
+            let e = model.text_emb.forward(&ids_t)?.unsqueeze(1)?;
+            emb = emb.add(&e)?;
         };
         for (audio_emb, ids) in model.audio_embs.iter().zip(audio_tokens.iter()) {
             let ids_t =
@@ -366,8 +372,8 @@ impl<Q: BackendQ> State<Q> {
         Ok(audio_tokens)
     }
 
-    fn text_token_for_current_step(&self) -> Vec<u32> {
-        if self.index == 0 { vec![self.model.text_card as u32] } else { vec![3] }
+    fn text_token_for_current_step(&self) -> Option<Vec<u32>> {
+        if self.index == 0 { Some(vec![self.model.text_card as u32]) } else { None }
     }
 
     pub fn step(
@@ -380,7 +386,8 @@ impl<Q: BackendQ> State<Q> {
         let pad_token = 3;
         let text_tokens = self.text_token_for_current_step();
         let audio_tokens = self.audio_tokens_for_current_step()?;
-        let (_text_logits, ys) = self.forward(&text_tokens, &audio_tokens, ca_src, mask)?;
+        let (_text_logits, ys) =
+            self.forward(text_tokens.as_deref(), &audio_tokens, ca_src, mask)?;
         let audio_tokens =
             self.depformer_sample(&ys, &[pad_token], &self.temperature, semantic_token)?;
         self.audio_tokens.push(audio_tokens);
