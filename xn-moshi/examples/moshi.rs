@@ -431,9 +431,6 @@ fn run_s2s<Q: xn::BackendQ>(
     use xn_moshi::s2s::{Config, Model};
     use xn_moshi::transformer_with_ca::CaSrc;
 
-    let mut pcm_voice = load_pcm_data(&voice_input, 24000)?;
-    pcm_voice.resize(24000 * 10, 0.0);
-
     let config = config.canonicalize()?;
     let config_dir = config.parent().context("config must have a parent directory")?;
     let config = std::fs::read_to_string(&config)?;
@@ -473,14 +470,25 @@ fn run_s2s<Q: xn::BackendQ>(
     };
 
     println!("Encoding voice...");
-    let ca_src = {
-        let pcm_voice = Tensor::from_vec(pcm_voice, (1, 1, ()), &dev)?;
-        let voice_emb = speaker_wavs_mimi.encode_pre_quantize(&pcm_voice)?;
-        println!("  Voice embedded to shape {:?}", voice_emb.dims());
-        let voice_emb = voice_emb.to()?;
-        let ca_src = lm.speaker_wavs_ca_src(&voice_emb)?;
-        // TODO(laurent): pre-compute the kv values.
-        CaSrc::Tokens(ca_src)
+    let ca_src = match voice_input.extension() {
+        Some(ext) if ext == "safetensors" => {
+            let ca_src = xn::safetensors::load_from_file(&voice_input, &dev)?;
+            let ca_src = ca_src.get("ca_src").context("ca_src not found in safetensors")?;
+            let ca_src = ca_src.to()?;
+            CaSrc::Tokens(ca_src)
+        }
+        _ => {
+            let mut pcm_voice = load_pcm_data(&voice_input, 24000)?;
+            pcm_voice.resize(24000 * 10, 0.0);
+
+            let pcm_voice = Tensor::from_vec(pcm_voice, (1, 1, ()), &dev)?;
+            let voice_emb = speaker_wavs_mimi.encode_pre_quantize(&pcm_voice)?;
+            println!("  Voice embedded to shape {:?}", voice_emb.dims());
+            let voice_emb = voice_emb.to()?;
+            let ca_src = lm.speaker_wavs_ca_src(&voice_emb)?;
+            // TODO(laurent): pre-compute the kv values.
+            CaSrc::Tokens(ca_src)
+        }
     };
 
     let condition_sum = lm.condition_sum(

@@ -63,6 +63,16 @@ impl<B: Backend> TypedTensor<B> {
             Self::U8(t) => t.shape(),
         }
     }
+
+    pub fn to<T: WithDType>(&self) -> Result<Tensor<T, B>> {
+        match self {
+            Self::F16(t) => t.to(),
+            Self::BF16(t) => t.to(),
+            Self::F32(t) => t.to(),
+            Self::I64(t) => t.to(),
+            Self::U8(t) => t.to(),
+        }
+    }
 }
 
 impl<T: WithDType, B: Backend> Tensor<T, B> {
