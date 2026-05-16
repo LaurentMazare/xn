@@ -272,15 +272,19 @@ impl<T: WithDTypeF, B: Backend> Mimi<T, B> {
         Ok(state)
     }
 
-    /// Encode audio to codes (non-streaming).
-    pub fn encode(&self, xs: &Tensor<T, B>) -> Result<Tensor<i64, B>> {
+    pub fn encode_pre_quantize(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
         let batch_size = xs.dim(0)?;
         let xs = self.encoder.forward(xs)?;
         let mut tf_state = self.encoder_transformer.init_state(batch_size)?;
         let mask = StreamMask::all_active(batch_size);
         let xs = self.encoder_transformer.forward(&xs, &mut tf_state, &mask)?;
         let xs = &xs[0];
-        let xs = self.downsample.forward(xs)?;
+        self.downsample.forward(xs)
+    }
+
+    /// Encode audio to codes (non-streaming).
+    pub fn encode(&self, xs: &Tensor<T, B>) -> Result<Tensor<i64, B>> {
+        let xs = self.encode_pre_quantize(xs)?;
         self.quantizer.encode(&xs)
     }
 
