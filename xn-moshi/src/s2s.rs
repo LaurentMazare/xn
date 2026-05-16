@@ -307,7 +307,6 @@ impl<Q: BackendQ> State<Q> {
     fn depformer_sample(
         &self,
         ys: &Tensor<Q::T, Q::B>,
-        text_tokens: &[u32],
         temperature: &Tensor<f32, Q::B>,
         semantic_token: i64,
     ) -> Result<Vec<Vec<u32>>> {
@@ -315,12 +314,6 @@ impl<Q: BackendQ> State<Q> {
         let model = &self.model;
         let device = model.device();
         let batch_size = self.transformer.batch_size();
-        if text_tokens.len() != batch_size {
-            xn::bail!(
-                "text_tokens len {} does not match batch_size {batch_size}",
-                text_tokens.len()
-            )
-        }
         // The depformer slices share the same architecture, so a single state
         // can be reused: every slice extends the kv-cache by one position,
         // matching the moshi-rs `copy_state` propagation.
@@ -328,17 +321,21 @@ impl<Q: BackendQ> State<Q> {
         let mask = StreamMask::all_active(batch_size);
 
         let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(model.depformer.len());
-        let mut last_token: Vec<u32> = text_tokens.to_vec();
 
         for (slice_idx, slice) in model.depformer.iter().enumerate() {
             let xs = slice.linear_in.forward(ys)?;
-            let token_id = Tensor::from_vec(
-                last_token.iter().map(|&x| x as i64).collect(),
-                batch_size,
-                device,
-            )?;
-            let token_emb = slice.emb.forward(&token_id)?.unsqueeze(1)?;
-            let xs = xs.add(&token_emb)?;
+            let xs = match all_tokens.last() {
+                None => xs,
+                Some(tokens) => {
+                    let token_id = Tensor::from_vec(
+                        tokens.iter().map(|&x| x as i64).collect(),
+                        batch_size,
+                        device,
+                    )?;
+                    let token_emb = slice.emb.forward(&token_id)?.unsqueeze(1)?;
+                    xs.add(&token_emb)?
+                }
+            };
             let xs = slice.transformer.forward(&xs, &mut state, &mask)?;
             let logits = slice.linear_out.forward(&xs)?;
             let (b, _t, vocab) = logits.dims3()?;
@@ -349,7 +346,6 @@ impl<Q: BackendQ> State<Q> {
                 sampled_v.fill(semantic_token);
             }
             let tokens: Vec<u32> = sampled_v.into_iter().map(|x| x as u32).collect();
-            last_token = tokens.clone();
             all_tokens.push(tokens);
         }
         Ok(all_tokens)
@@ -382,14 +378,11 @@ impl<Q: BackendQ> State<Q> {
         mask: &StreamMask,
         semantic_token: i64,
     ) -> Result<()> {
-        // TODO(laurent): support for batch size greater than 1.
-        let pad_token = 3;
         let text_tokens = self.text_token_for_current_step();
         let audio_tokens = self.audio_tokens_for_current_step()?;
         let (_text_logits, ys) =
             self.forward(text_tokens.as_deref(), &audio_tokens, ca_src, mask)?;
-        let audio_tokens =
-            self.depformer_sample(&ys, &[pad_token], &self.temperature, semantic_token)?;
+        let audio_tokens = self.depformer_sample(&ys, &self.temperature, semantic_token)?;
         self.audio_tokens.push(audio_tokens);
         self.index += 1;
         Ok(())
