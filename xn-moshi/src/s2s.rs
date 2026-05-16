@@ -269,6 +269,7 @@ impl<Q: BackendQ> State<Q> {
         audio_tokens: &[Vec<u32>],
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
+        condition_sum: Option<&Tensor<Q::T, Q::B>>,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
         use xn::ModuleT;
         let model = &self.model;
@@ -283,6 +284,10 @@ impl<Q: BackendQ> State<Q> {
             let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
             emb = emb.add(&e)?;
         }
+        let emb = match condition_sum {
+            None => emb,
+            Some(cond) => emb.add(cond)?,
+        };
         let ys = model.transformer.forward(&emb, ca_src, &mut self.transformer, mask)?;
         let ys = model.out_norm.forward(&ys)?;
         let logits = model.text_linear.forward(&ys)?;
@@ -363,10 +368,11 @@ impl<Q: BackendQ> State<Q> {
         &mut self,
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
+        condition_sum: Option<&Tensor<Q::T, Q::B>>,
         semantic_token: i64,
     ) -> Result<()> {
         let audio_tokens = self.audio_tokens_for_current_step()?;
-        let (_text_logits, ys) = self.forward(&audio_tokens, ca_src, mask)?;
+        let (_text_logits, ys) = self.forward(&audio_tokens, ca_src, mask, condition_sum)?;
         let audio_tokens = self.depformer_sample(&ys, &self.temperature, semantic_token)?;
         self.audio_tokens.push(audio_tokens);
         self.index += 1;

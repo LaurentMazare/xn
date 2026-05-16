@@ -544,7 +544,7 @@ fn run_s2s<Q: xn::BackendQ>(
     println!("\nStreaming LM step, {num_codes} chunks...");
 
     for (code_idx, &code) in codes.iter().enumerate() {
-        state.step(&ca_src, &mask, code)?;
+        state.step(&ca_src, &mask, condition_sum.as_ref(), code)?;
         if let Some(audio_tokens) = state.last_audio_tokens() {
             let n_cb = audio_tokens.len();
             let codes_t: Tensor<i64, Q::B> = Tensor::from_vec(
