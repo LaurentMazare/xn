@@ -224,12 +224,6 @@ impl<Q: BackendQ> Model<Q> {
         self.text_emb.device()
     }
 
-    /// Pre-compute the K/V projections for the cross-attention source so they
-    /// can be reused across timesteps.
-    pub fn maybe_precompute_ca_kv(&self, ca_src: CaSrc<Q>) -> Result<CaSrc<Q>> {
-        self.transformer.maybe_precompute_ca_kv(ca_src)
-    }
-
     /// Embed audio codes by summing the per-codebook embeddings.
     /// `codes` shape: `(batch, codebooks, frames)`. Returns `(batch, frames, d_model)`.
     pub fn embed_audio_codes(&self, codes: &Tensor<i64, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
@@ -284,10 +278,15 @@ impl<Q: BackendQ> State<Q> {
             let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
             emb = emb.add(&e)?;
         }
+        println!("INPUT\n{emb}");
         let emb = match condition_sum {
             None => emb,
             Some(cond) => emb.add(cond)?,
         };
+        println!("FUSED INPUT\n{emb}");
+        if let CaSrc::Tokens(ca_src) = ca_src {
+            println!("CA_SRC\n{ca_src}");
+        }
         let ys = model.transformer.forward(&emb, ca_src, &mut self.transformer, mask)?;
         let ys = model.out_norm.forward(&ys)?;
         let logits = model.text_linear.forward(&ys)?;

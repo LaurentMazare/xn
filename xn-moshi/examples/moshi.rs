@@ -479,7 +479,8 @@ fn run_s2s<Q: xn::BackendQ>(
     // K/V projections so they can be reused at every decoding step.
     let voice_emb = lm.embed_audio_codes(&voice)?;
     println!("  Voice embedded to shape {:?}", voice_emb.dims());
-    let ca_src = lm.maybe_precompute_ca_kv(CaSrc::Tokens(voice_emb))?;
+    // TODO(laurent): pre-compute the kv values.
+    let ca_src = CaSrc::Tokens(voice_emb);
 
     let condition_sum = lm.condition_sum(
         &[

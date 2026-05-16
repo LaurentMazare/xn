@@ -292,25 +292,6 @@ impl<Q: BackendQ> Transformer<Q> {
         Ok(BatchedTransformerState { builder, kv_caches })
     }
 
-    /// Pre-compute the KV projections of the cross-attention source so they can
-    /// be reused across timesteps. Only the first layer's projection is used:
-    /// when layers don't share weights this is wrong, but it matches the
-    /// behaviour of the moshi reference implementation for shared
-    /// cross-attention.
-    pub fn maybe_precompute_ca_kv(&self, ca_src: CaSrc<Q>) -> Result<CaSrc<Q>> {
-        match ca_src {
-            CaSrc::KeysValues(_, _) => Ok(ca_src),
-            CaSrc::Tokens(_) => {
-                if self.layers.is_empty() {
-                    Ok(ca_src)
-                } else {
-                    let (k, v) = self.layers[0].cross_attn.compute_kv(&ca_src)?;
-                    Ok(CaSrc::KeysValues(k, v))
-                }
-            }
-        }
-    }
-
     pub fn forward(
         &self,
         xs: &Tensor<Q::T, Q::B>,
