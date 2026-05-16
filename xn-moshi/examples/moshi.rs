@@ -443,7 +443,9 @@ fn run_s2s<Q: xn::BackendQ>(
         let weights = config_dir.join(&config.moshi_name);
         let vb = VB::load_with_key_map(&[weights], dev.clone(), key_map_s2s)?.root();
         let lm: Model<Q> = Model::load(&vb, &config)?;
-        vb.check_all_used_with_ignore(|s| s.starts_with("condition_provider.conditioners"))?;
+        vb.check_all_used_with_ignore(|s| {
+            s.starts_with("condition_provider.conditioners.volumes.embeddings")
+        })?;
         println!("LM loaded successfully");
         std::sync::Arc::new(lm)
     };
@@ -471,16 +473,15 @@ fn run_s2s<Q: xn::BackendQ>(
     };
 
     println!("Encoding voice...");
-    let pcm_voice = Tensor::from_vec(pcm_voice, (1, 1, ()), &dev)?;
-    let voice = speaker_wavs_mimi.encode(&pcm_voice)?;
-    println!("  Voice encoded to shape {:?}", voice.dims());
-
-    // Build the cross-attention source from the voice codes and pre-compute its
-    // K/V projections so they can be reused at every decoding step.
-    let voice_emb = lm.embed_audio_codes(&voice)?;
-    println!("  Voice embedded to shape {:?}", voice_emb.dims());
-    // TODO(laurent): pre-compute the kv values.
-    let ca_src = CaSrc::Tokens(voice_emb);
+    let ca_src = {
+        let pcm_voice = Tensor::from_vec(pcm_voice, (1, 1, ()), &dev)?;
+        let voice_emb = speaker_wavs_mimi.encode_pre_quantize(&pcm_voice)?;
+        println!("  Voice embedded to shape {:?}", voice_emb.dims());
+        let voice_emb = voice_emb.to()?;
+        let ca_src = lm.speaker_wavs_ca_src(&voice_emb)?;
+        // TODO(laurent): pre-compute the kv values.
+        CaSrc::Tokens(ca_src)
+    };
 
     let condition_sum = lm.condition_sum(
         &[

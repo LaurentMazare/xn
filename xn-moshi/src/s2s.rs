@@ -1,7 +1,21 @@
 use crate::transformer_with_ca::CaSrc;
 use xn::nn::var_builder::Path;
 use xn::streaming::StreamMask;
-use xn::{BackendQ, Result, Tensor};
+use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
+
+pub fn add_sin_embeddings<T: WithDTypeF, B: Backend>(xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+    let (_b, seq_len, dim) = xs.dims3()?;
+    let device = xs.device();
+    let half_dim = dim / 2;
+    let positions: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
+    let positions = Tensor::from_vec(positions, (seq_len, 1), device)?;
+    let inv_freq: Vec<f32> =
+        (0..half_dim).map(|i| 1f32 / 10000f32.powf(i as f32 / (half_dim - 1) as f32)).collect();
+    let inv_freq = Tensor::from_vec(inv_freq, (1, half_dim), device)?;
+    let freqs = positions.broadcast_mul(&inv_freq)?;
+    let pos_emb = Tensor::cat(&[&freqs.cos()?, &freqs.sin()?], xn::D::Minus1)?;
+    xs.to::<f32>()?.broadcast_add(&pos_emb)?.to::<T>()
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DepformerConfig {
@@ -51,6 +65,8 @@ pub struct Model<Q: BackendQ> {
     text_linear: Q::LinearQ,
     audio_card: usize,
     audio_delays: Vec<usize>,
+    speaker_wavs_output_proj: Q::LinearQ,
+    speaker_wavs_learnt_padding: Tensor<Q::T, Q::B>,
     #[allow(dead_code)]
     conditioners: crate::conditioners::Conditioners<Q::T, Q::B>,
     #[allow(dead_code)]
@@ -182,6 +198,15 @@ impl<Q: BackendQ> Model<Q> {
             cfg.conditioners.iter().map(|c| (c.name.clone(), c.inner.clone())).collect();
         let conditioners = crate::conditioners::load(cfg.transformer.d_model, &conditioners, vb)?;
         let default_conditions = conditioners.condition_sum(&std::collections::HashMap::new())?;
+        let speaker_wavs_output_proj = Q::linear_load(
+            vb.pp("condition_provider.conditioners.speaker_wavs.output_proj"),
+            512, // TODO(laurent): get the mimi dim from some config.
+            cfg.transformer.d_model,
+        )?;
+        let speaker_wavs_learnt_padding = vb.tensor(
+            "condition_provider.conditioners.speaker_wavs.learnt_padding",
+            (1, 1, cfg.transformer.d_model),
+        )?;
         Ok(Self {
             transformer,
             depformer,
@@ -193,7 +218,24 @@ impl<Q: BackendQ> Model<Q> {
             audio_delays,
             conditioners,
             default_conditions,
+            speaker_wavs_output_proj,
+            speaker_wavs_learnt_padding,
         })
+    }
+
+    pub fn speaker_wavs_ca_src(
+        &self,
+        speaker_wavs: &Tensor<Q::T, Q::B>,
+    ) -> Result<Tensor<Q::T, Q::B>> {
+        use xn::ModuleT;
+        let speaker_wavs = speaker_wavs.t()?.contiguous()?;
+        let projected = self.speaker_wavs_output_proj.forward(&speaker_wavs)?;
+        let (_b, embs, dim) = projected.dims3()?;
+        let learnt_padding =
+            self.speaker_wavs_learnt_padding.expand((1, 2 * embs, dim))?.contiguous()?;
+        let projected = Tensor::cat(&[&projected, &learnt_padding], 1)?;
+        let projected = add_sin_embeddings(&projected)?;
+        Ok(projected)
     }
 
     pub fn condition_sum(
@@ -222,26 +264,6 @@ impl<Q: BackendQ> Model<Q> {
 
     pub fn device(&self) -> &Q::B {
         self.text_emb.device()
-    }
-
-    /// Embed audio codes by summing the per-codebook embeddings.
-    /// `codes` shape: `(batch, codebooks, frames)`. Returns `(batch, frames, d_model)`.
-    pub fn embed_audio_codes(&self, codes: &Tensor<i64, Q::B>) -> Result<Tensor<Q::T, Q::B>> {
-        let (b, n_cb, t) = codes.dims3()?;
-        let n = n_cb.min(self.audio_embs.len());
-        if n == 0 {
-            xn::bail!("no audio embeddings available")
-        }
-        let mut acc: Option<Tensor<Q::T, Q::B>> = None;
-        for cb in 0..n {
-            let codes_cb = codes.narrow(1, cb..cb + 1)?.reshape((b, t))?.contiguous()?;
-            let e = self.audio_embs[cb].forward(&codes_cb)?;
-            acc = Some(match acc {
-                None => e,
-                Some(prev) => prev.add(&e)?,
-            });
-        }
-        Ok(acc.unwrap())
     }
 }
 
