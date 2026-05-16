@@ -431,8 +431,7 @@ fn run_s2s<Q: xn::BackendQ>(
     use xn_moshi::s2s::{Config, Model};
     use xn_moshi::transformer_with_ca::CaSrc;
 
-    let pcm_input = load_pcm_data(&voice_input, 48000)?;
-    let mut pcm_voice = load_pcm_data(&input, 24000)?;
+    let mut pcm_voice = load_pcm_data(&voice_input, 24000)?;
     pcm_voice.resize(24000 * 10, 0.0);
 
     let config = config.canonicalize()?;
@@ -493,57 +492,73 @@ fn run_s2s<Q: xn::BackendQ>(
     if let Some(condition_sum) = &condition_sum {
         println!("Condition sum:\n{condition_sum}");
     }
+    let mask = StreamMask::all_active(1);
 
-    // Streaming encode of the input audio: chunks of 3940 samples are fed
-    // through `encode_step`, and on every emitted frame the LM is run to
-    // predict the next time slice.
-    let frame_size: usize = 3840;
-    let num_chunks = pcm_input.len().div_ceil(frame_size);
-    println!("\nStreaming encode + LM step ({} chunks of {} samples)...", num_chunks, frame_size);
+    let codes = match input.extension() {
+        Some(ext) if ext == "json" => {
+            let codes: Vec<i64> = serde_json::from_str(&std::fs::read_to_string(&input)?)?;
+            codes
+        }
+        _ => {
+            let mut enc_state = mimi.init_encode_state(1)?;
+            let pcm_input = load_pcm_data(&input, 48000)?;
+            // Streaming encode of the input audio: chunks of 3940 samples are fed
+            // through `encode_step`, and on every emitted frame the LM is run to
+            // predict the next time slice.
+            let frame_size: usize = 3840;
+            let num_chunks = pcm_input.len().div_ceil(frame_size);
+            println!("\nStreaming encode, {num_chunks} chunks of {frame_size} samples...");
+            let mut all_codes = vec![];
+            for chunk_idx in 0..num_chunks {
+                let start = chunk_idx * frame_size;
+                let end = (start + frame_size).min(pcm_input.len());
+                let mut chunk: Vec<f32> = pcm_input[start..end].to_vec();
+                if chunk.len() < frame_size {
+                    chunk.resize(frame_size, 0.0);
+                }
 
-    let mut enc_state = mimi.init_encode_state(1)?;
+                let audio: Tensor<f32, Q::B> = Tensor::from_vec(chunk, (1, 1, frame_size), &dev)?;
+                let codes = enc_state.encode_step(&StreamTensor::from_tensor(audio), &mask)?;
+
+                let Some(codes) = codes.as_option() else { continue };
+
+                let (_b, _n_cb, t) = codes.dims3()?;
+
+                for step in 0..t {
+                    let codes = codes.narrow(2, step..step + 1)?.contiguous()?;
+                    let codes = codes.to_vec()?;
+                    all_codes.push(codes[0]);
+                }
+            }
+            all_codes
+        }
+    };
+    println!("    Codes: {codes:?}");
     let mut dec_state = mimi.init_decode_state(1)?;
     let mut state = lm.init_state(1, temperature as f32)?;
-    let mask = StreamMask::all_active(1);
 
     let start_time = std::time::Instant::now();
     let mut decoded_pcm: Vec<Tensor<f32, Q::B>> = Vec::new();
 
-    for chunk_idx in 0..num_chunks {
-        let start = chunk_idx * frame_size;
-        let end = (start + frame_size).min(pcm_input.len());
-        let mut chunk: Vec<f32> = pcm_input[start..end].to_vec();
-        if chunk.len() < frame_size {
-            chunk.resize(frame_size, 0.0);
-        }
+    let num_codes = codes.len();
+    println!("\nStreaming LM step, {num_codes} chunks...");
 
-        let audio: Tensor<f32, Q::B> = Tensor::from_vec(chunk, (1, 1, frame_size), &dev)?;
-        let codes = enc_state.encode_step(&StreamTensor::from_tensor(audio), &mask)?;
-
-        let Some(codes) = codes.as_option() else { continue };
-
-        let (_b, _n_cb, t) = codes.dims3()?;
-
-        for step in 0..t {
-            let codes = codes.narrow(2, step..step + 1)?.contiguous()?;
-            let codes = codes.to_vec()?;
-            state.step(&ca_src, &mask, codes[0])?;
-            if let Some(audio_tokens) = state.last_audio_tokens() {
-                let n_cb = audio_tokens.len();
-                let codes_t: Tensor<i64, Q::B> = Tensor::from_vec(
-                    audio_tokens.iter().map(|&x| x as i64).collect(),
-                    (1, n_cb, 1),
-                    &dev,
-                )?;
-                let pcm = dec_state.decode_step(&StreamTensor::from_tensor(codes_t), &mask)?;
-                if let Some(pcm) = pcm.as_option() {
-                    decoded_pcm.push(pcm.copy()?);
-                }
+    for (code_idx, &code) in codes.iter().enumerate() {
+        state.step(&ca_src, &mask, code)?;
+        if let Some(audio_tokens) = state.last_audio_tokens() {
+            let n_cb = audio_tokens.len();
+            let codes_t: Tensor<i64, Q::B> = Tensor::from_vec(
+                audio_tokens.iter().map(|&x| x as i64).collect(),
+                (1, n_cb, 1),
+                &dev,
+            )?;
+            let pcm = dec_state.decode_step(&StreamTensor::from_tensor(codes_t), &mask)?;
+            if let Some(pcm) = pcm.as_option() {
+                decoded_pcm.push(pcm.copy()?);
             }
         }
-
-        if (chunk_idx + 1) % 25 == 0 || chunk_idx == num_chunks - 1 {
-            println!("  chunk {}/{}", chunk_idx + 1, num_chunks);
+        if (code_idx + 1) % 25 == 0 || code_idx == num_codes - 1 {
+            println!("  chunk {}/{num_codes}", code_idx + 1);
         }
     }
 
