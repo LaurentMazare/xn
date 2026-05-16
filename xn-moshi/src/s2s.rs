@@ -49,7 +49,6 @@ pub struct Model<Q: BackendQ> {
     depformer: Vec<DepformerSlice<Q>>,
     out_norm: crate::transformer::Norm<Q::T, Q::B>,
     text_linear: Q::LinearQ,
-    text_card: usize,
     audio_card: usize,
     audio_delays: Vec<usize>,
     #[allow(dead_code)]
@@ -65,6 +64,7 @@ pub struct State<Q: BackendQ> {
     pub index: usize,
     // Time-step, codebook, batch element.
     pub audio_tokens: Vec<Vec<Vec<u32>>>,
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +187,6 @@ impl<Q: BackendQ> Model<Q> {
             text_emb,
             text_linear,
             out_norm,
-            text_card: cfg.text_card,
             audio_card: cfg.audio_card,
             audio_delays,
             conditioners,
@@ -215,6 +214,7 @@ impl<Q: BackendQ> Model<Q> {
             temperature,
             index: 0,
             audio_tokens: Vec::new(),
+            batch_size,
         })
     }
 
@@ -264,10 +264,6 @@ impl<Q: BackendQ> State<Q> {
     #[allow(clippy::type_complexity)]
     fn forward(
         &mut self,
-        // TODO(laurent): to handle batch inference properly, we should use
-        // a slice of options and have an index_select like operation that
-        // supports zeros for some sentinel token index.
-        text_tokens: Option<&[u32]>,
         audio_tokens: &[Vec<u32>],
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
@@ -276,16 +272,9 @@ impl<Q: BackendQ> State<Q> {
         let model = &self.model;
         let device = model.device();
         let d_model = model.text_emb.hidden_size();
-        let mut emb = Tensor::zeros((1, 1, d_model), device)?;
-        if let Some(text_tokens) = text_tokens {
-            let ids_t = Tensor::from_vec(
-                text_tokens.iter().map(|&x| x as i64).collect(),
-                text_tokens.len(),
-                device,
-            )?;
-            let e = model.text_emb.forward(&ids_t)?.unsqueeze(1)?;
-            emb = emb.add(&e)?;
-        };
+        let mut emb = Tensor::zeros((self.batch_size, 1, d_model), device)?;
+        // There are only audio embeddings and no text embeddings as gen_text is false for
+        // this model.
         for (audio_emb, ids) in model.audio_embs.iter().zip(audio_tokens.iter()) {
             let ids_t =
                 Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
@@ -368,20 +357,14 @@ impl<Q: BackendQ> State<Q> {
         Ok(audio_tokens)
     }
 
-    fn text_token_for_current_step(&self) -> Option<Vec<u32>> {
-        if self.index == 0 { Some(vec![self.model.text_card as u32]) } else { None }
-    }
-
     pub fn step(
         &mut self,
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
         semantic_token: i64,
     ) -> Result<()> {
-        let text_tokens = self.text_token_for_current_step();
         let audio_tokens = self.audio_tokens_for_current_step()?;
-        let (_text_logits, ys) =
-            self.forward(text_tokens.as_deref(), &audio_tokens, ca_src, mask)?;
+        let (_text_logits, ys) = self.forward(&audio_tokens, ca_src, mask)?;
         let audio_tokens = self.depformer_sample(&ys, &self.temperature, semantic_token)?;
         self.audio_tokens.push(audio_tokens);
         self.index += 1;
