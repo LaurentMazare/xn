@@ -151,15 +151,39 @@ pub struct ContinuousConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceLevelConfig {
+    pub relative_silence_volume: f64,
+    pub min_duration: f64,
+    pub volumes_for_silence_or_missing: Vec<f64>,
+    pub mask_missing: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConditionerConfig {
     Lut { lut: LutConfig },
     Continuous { continuous: ContinuousConfig },
+    SourceLevel { source_level: SourceLevelConfig },
+}
+
+// This is not a full implementation of source level conditioning.
+// Instead we just rely on the learnt padding so the models must have been
+// trained with dropout.
+pub struct SourceLevelConditioner<T: WithDTypeF, B: Backend> {
+    pub learnt_padding: Tensor<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> SourceLevelConditioner<T, B> {
+    pub fn load(vb: &Path<B>, output_dim: usize, _config: &SourceLevelConfig) -> Result<Self> {
+        let learnt_padding = vb.tensor("learnt_padding", (1, 1, output_dim))?;
+        Ok(Self { learnt_padding })
+    }
 }
 
 pub struct Conditioners<T: xn::WithDTypeF, B: xn::Backend> {
     pub lut: std::collections::HashMap<String, LUTConditioner<T, B>>,
     pub continuous: std::collections::HashMap<String, ContinuousConditioner<T, B>>,
+    pub source_level: std::collections::HashMap<String, SourceLevelConditioner<T, B>>,
 }
 
 pub enum Value {
@@ -224,6 +248,12 @@ impl<T: xn::WithDTypeF, B: xn::Backend> Conditioners<T, B> {
                 None => emb,
             });
         }
+        for (_name, source_level) in self.source_level.iter() {
+            result = Some(match result {
+                Some(acc) => acc.add(&source_level.learnt_padding)?,
+                None => source_level.learnt_padding.clone(),
+            });
+        }
         Ok(result)
     }
 }
@@ -236,6 +266,7 @@ pub fn load<T: xn::WithDTypeF, B: xn::Backend>(
 ) -> xn::Result<Conditioners<T, B>> {
     let mut lut = std::collections::HashMap::new();
     let mut continuous = std::collections::HashMap::new();
+    let mut source_level = std::collections::HashMap::new();
     for (name, cond_config) in conditioner_configs {
         match cond_config {
             ConditionerConfig::Lut { lut: lut_cfg } => {
@@ -256,7 +287,15 @@ pub fn load<T: xn::WithDTypeF, B: xn::Backend>(
                 )?;
                 continuous.insert(name.clone(), conditioner);
             }
+            ConditionerConfig::SourceLevel { source_level: cfg } => {
+                let conditioner = crate::conditioners::SourceLevelConditioner::load(
+                    &vb.pp("condition_provider").pp("conditioners").pp(name),
+                    output_dim,
+                    cfg,
+                )?;
+                source_level.insert(name.clone(), conditioner);
+            }
         }
     }
-    Ok(Conditioners { lut, continuous })
+    Ok(Conditioners { lut, continuous, source_level })
 }
