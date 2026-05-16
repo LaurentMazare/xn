@@ -61,6 +61,7 @@ pub struct State<Q: BackendQ> {
     pub model: std::sync::Arc<Model<Q>>,
     pub transformer: crate::transformer::BatchedTransformerState<Q::T, Q::B>,
     pub temperature: Tensor<f32, Q::B>,
+    // TODO(laurent): we should have one index per batch element.
     pub index: usize,
     // Time-step, codebook, batch element.
     pub audio_tokens: Vec<Vec<Vec<u32>>>,
@@ -175,7 +176,8 @@ impl<Q: BackendQ> Model<Q> {
         };
         let n_q = depformer.len();
         let audio_delays: Vec<_> =
-            (0..n_q).map(|i| cfg.delays.get(i).cloned().unwrap_or(last_delay)).collect();
+            // The delays config includes the text stream delay so shift it by one.
+            (0..n_q).map(|i| cfg.delays.get(i + 1).cloned().unwrap_or(last_delay)).collect();
         let conditioners =
             cfg.conditioners.iter().map(|c| (c.name.clone(), c.inner.clone())).collect();
         let conditioners = crate::conditioners::load(cfg.transformer.d_model, &conditioners, vb)?;
@@ -372,10 +374,14 @@ impl<Q: BackendQ> State<Q> {
     }
 
     pub fn last_audio_tokens(&self) -> Option<Vec<u32>> {
+        let max_delay = match self.model.audio_delays.iter().max() {
+            Some(d) => *d,
+            None => return None,
+        };
         let mut last_tokens = vec![];
         for (cb_idx, delay) in self.model.audio_delays.iter().enumerate() {
-            if self.index > *delay {
-                let step_idx = self.index - delay - 1;
+            if self.index + *delay > max_delay {
+                let step_idx = self.index + delay - max_delay - 1;
                 last_tokens.push(self.audio_tokens[step_idx][cb_idx][0]);
             } else {
                 return None;
