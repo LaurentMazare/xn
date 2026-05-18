@@ -494,8 +494,8 @@ fn run_s2s<Q: xn::BackendQ>(
     let condition_sum = lm.condition_sum(
         &[
             ("version".to_string(), "3".into()),
-            ("lang".to_string(), "fr".into()),
-            ("languages_in_segment".to_string(), "fr".into()),
+            ("lang".to_string(), "en".into()),
+            ("languages_in_segment".to_string(), "en".into()),
         ]
         .into(),
     )?;

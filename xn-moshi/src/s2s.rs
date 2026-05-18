@@ -268,6 +268,10 @@ impl<Q: BackendQ> Model<Q> {
 }
 
 impl<Q: BackendQ> State<Q> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        self.transformer.reset_batch_idx(batch_idx)
+    }
+
     pub fn frames_processed(&self) -> usize {
         self.index
     }
