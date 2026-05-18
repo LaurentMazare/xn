@@ -47,6 +47,7 @@ pub struct Config {
     pub audio_card: usize,
     pub text_card_out: usize,
     pub conditioners: Vec<ConditionerConfig>,
+    pub max_speakers: usize,
 }
 
 pub struct DepformerSlice<Q: BackendQ> {
@@ -72,6 +73,7 @@ pub struct Model<Q: BackendQ> {
     conditioners: crate::conditioners::Conditioners<Q::T, Q::B>,
     #[allow(dead_code)]
     default_conditions: Option<Tensor<Q::T, Q::B>>,
+    max_speakers: usize,
 }
 
 pub struct State<Q: BackendQ> {
@@ -229,6 +231,7 @@ impl<Q: BackendQ> Model<Q> {
             default_conditions,
             speaker_wavs_output_proj,
             speaker_wavs_learnt_padding,
+            max_speakers: cfg.max_speakers,
         })
     }
 
@@ -240,9 +243,15 @@ impl<Q: BackendQ> Model<Q> {
         let speaker_wavs = speaker_wavs.t()?.contiguous()?;
         let projected = self.speaker_wavs_output_proj.forward(&speaker_wavs)?;
         let (_b, embs, dim) = projected.dims3()?;
-        let learnt_padding =
-            self.speaker_wavs_learnt_padding.expand((1, 2 * embs, dim))?.contiguous()?;
-        let projected = Tensor::cat(&[&projected, &learnt_padding], 1)?;
+        let projected = if self.max_speakers > 1 {
+            let learnt_padding = self
+                .speaker_wavs_learnt_padding
+                .expand((1, (self.max_speakers - 1) * embs, dim))?
+                .contiguous()?;
+            Tensor::cat(&[&projected, &learnt_padding], 1)?
+        } else {
+            projected
+        };
         let projected = add_sin_embeddings(&projected)?;
         Ok(projected)
     }
