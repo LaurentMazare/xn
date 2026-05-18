@@ -54,6 +54,7 @@ pub struct DepformerSlice<Q: BackendQ> {
     emb: LowRankEmbeddings<Q>,
     linear_in: Q::LinearQ,
     linear_out: Q::LinearQ,
+    norm: crate::transformer::Norm<Q::T, Q::B>,
 }
 
 pub struct Model<Q: BackendQ> {
@@ -127,6 +128,9 @@ impl<Q: BackendQ> Model<Q> {
         let transformer =
             crate::transformer_with_ca::Transformer::load(&vb.pp("transformer"), &cfg.transformer)?;
         let n_q = cfg.depformer.weights_per_step_schedule.len();
+        if cfg.depformer.norm != crate::NormType::LayerNorm {
+            xn::bail!("only LayerNorm is currently supported for the depformer slices");
+        }
         let depformer_config = crate::transformer::Config {
             d_model: cfg.depformer.dim,
             num_heads: cfg.depformer.num_heads,
@@ -168,7 +172,12 @@ impl<Q: BackendQ> Model<Q> {
                 Q::linear_load(df_vb.pp("linear_in"), cfg.transformer.d_model, cfg.depformer.dim)?;
             let linear_out =
                 Q::linear_load(df_vb.pp("linear_out"), cfg.depformer.dim, cfg.audio_card)?;
-            let df = DepformerSlice { transformer, emb, linear_in, linear_out };
+            let norm = crate::transformer::Norm::load(
+                df_vb.pp("norm"),
+                cfg.depformer.dim,
+                cfg.depformer.norm,
+            )?;
+            let df = DepformerSlice { transformer, emb, linear_in, linear_out, norm };
             depformer.push(df);
             let audio_emb = xn::nn::Embedding::load(
                 emb_vb.pp(slice_idx),
@@ -356,6 +365,7 @@ impl<Q: BackendQ> State<Q> {
                 }
             };
             let xs = slice.transformer.forward(&xs, &mut state, &mask)?;
+            let xs = slice.norm.forward(&xs)?;
             let logits = slice.linear_out.forward(&xs)?;
             let (b, _t, vocab) = logits.dims3()?;
             let logits_2d = logits.reshape((b, vocab))?;
