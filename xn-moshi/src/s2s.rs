@@ -344,7 +344,7 @@ impl<Q: BackendQ> State<Q> {
         }
         let emb = match condition_sum {
             None => emb,
-            Some(cond) => emb.add(cond)?,
+            Some(cond) => emb.broadcast_add(cond)?,
         };
         let ys = model.transformer.forward(&emb, ca_src, &mut self.transformer, mask)?;
         let ys = model.out_norm.forward(&ys)?;
