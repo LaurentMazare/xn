@@ -74,15 +74,29 @@ pub struct Model<Q: BackendQ> {
     default_conditions: Option<Tensor<Q::T, Q::B>>,
 }
 
+#[derive(Debug, Clone)]
+struct PerBatch {
+    index: usize,
+    // (codebook, time)
+    audio_tokens: Vec<Vec<i64>>,
+}
+
+impl PerBatch {
+    fn new(n_slices: usize) -> Self {
+        Self { index: 0, audio_tokens: vec![vec![]; n_slices] }
+    }
+
+    fn reset(&mut self) {
+        self.index = 0;
+        self.audio_tokens.iter_mut().for_each(|v| v.clear());
+    }
+}
+
 pub struct State<Q: BackendQ> {
     pub model: std::sync::Arc<Model<Q>>,
     pub transformer: crate::transformer::BatchedTransformerState<Q::T, Q::B>,
     pub temperature: Tensor<f32, Q::B>,
-    // TODO(laurent): we should have one index per batch element.
-    pub index: usize,
-    // Time-step, codebook, batch element.
-    pub audio_tokens: Vec<Vec<Vec<u32>>>,
-    pub batch_size: usize,
+    per_batch: Vec<PerBatch>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,31 +275,44 @@ impl<Q: BackendQ> Model<Q> {
     ) -> Result<State<Q>> {
         let temperature: Tensor<f32, Q::B> =
             Tensor::full(temperature, (batch_size, 1), self.device())?;
+        let n_slices = self.depformer.len();
         Ok(State {
             model: self.clone(),
             transformer: self.transformer.init_state(batch_size)?,
             temperature,
-            index: 0,
-            audio_tokens: Vec::new(),
-            batch_size,
+            per_batch: vec![PerBatch::new(n_slices); batch_size],
         })
     }
 
     pub fn device(&self) -> &Q::B {
         self.text_emb.device()
     }
+
+    pub fn n_slices(&self) -> usize {
+        self.depformer.len()
+    }
 }
 
 impl<Q: BackendQ> State<Q> {
+    pub fn batch_size(&self) -> usize {
+        self.per_batch.len()
+    }
+
+    pub fn n_slices(&self) -> usize {
+        self.model.n_slices()
+    }
+
     pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        if batch_idx >= self.batch_size() {
+            xn::bail!("batch_idx out of bounds");
+        }
         self.transformer.reset_batch_idx(batch_idx)?;
-        self.index = 0;
-        self.audio_tokens.clear();
+        self.per_batch[batch_idx].reset();
         Ok(())
     }
 
-    pub fn frames_processed(&self) -> usize {
-        self.index
+    pub fn frames_processed(&self, batch_idx: usize) -> usize {
+        self.per_batch[batch_idx].index
     }
 
     pub fn device(&self) -> &Q::B {
@@ -293,12 +320,12 @@ impl<Q: BackendQ> State<Q> {
     }
 
     /// Single forward step. `text_ids` and per-codebook `audio_tokens` are
-    /// `(batch_size,)`. Returns `(text_logits, transformer_out)` of shape
+    /// `(batch_size, codebooks)`. Returns `(text_logits, transformer_out)` of shape
     /// `(batch, 1, text_card_out)` and `(batch, 1, d_model)` respectively.
     #[allow(clippy::type_complexity)]
     fn forward(
         &mut self,
-        audio_tokens: &[Vec<u32>],
+        audio_tokens: &[Vec<i64>],
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
         condition_sum: Option<&Tensor<Q::T, Q::B>>,
@@ -307,12 +334,11 @@ impl<Q: BackendQ> State<Q> {
         let model = &self.model;
         let device = model.device();
         let d_model = model.text_emb.hidden_size();
-        let mut emb = Tensor::zeros((self.batch_size, 1, d_model), device)?;
+        let mut emb = Tensor::zeros((self.batch_size(), 1, d_model), device)?;
         // There are only audio embeddings and no text embeddings as gen_text is false for
         // this model.
         for (audio_emb, ids) in model.audio_embs.iter().zip(audio_tokens.iter()) {
-            let ids_t =
-                Tensor::from_vec(ids.iter().map(|&x| x as i64).collect(), ids.len(), device)?;
+            let ids_t = Tensor::from_vec(ids.clone(), ids.len(), device)?;
             let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
             emb = emb.add(&e)?;
         }
@@ -336,30 +362,33 @@ impl<Q: BackendQ> State<Q> {
         &self,
         ys: &Tensor<Q::T, Q::B>,
         temperature: &Tensor<f32, Q::B>,
-        semantic_token: i64,
-    ) -> Result<Vec<Vec<u32>>> {
+        semantic_tokens: &[i64],
+    ) -> Result<Vec<Vec<i64>>> {
         use xn::ModuleT;
+
+        let batch_size = self.batch_size();
+        if semantic_tokens.len() != batch_size {
+            xn::bail!(
+                "semantic_tokens length {} does not match batch_size {batch_size}",
+                semantic_tokens.len(),
+            );
+        }
         let model = &self.model;
         let device = model.device();
-        let batch_size = self.transformer.batch_size();
         // The depformer slices share the same architecture, so a single state
         // can be reused: every slice extends the kv-cache by one position,
         // matching the moshi-rs `copy_state` propagation.
         let mut state = model.depformer[0].transformer.init_state(batch_size)?;
         let mask = StreamMask::all_active(batch_size);
 
-        let mut all_tokens: Vec<Vec<u32>> = Vec::with_capacity(model.depformer.len());
+        let mut all_tokens: Vec<Vec<i64>> = Vec::with_capacity(model.depformer.len());
 
         for (slice_idx, slice) in model.depformer.iter().enumerate() {
             let xs = slice.linear_in.forward(ys)?;
             let xs = match all_tokens.last() {
                 None => xs,
                 Some(tokens) => {
-                    let token_id = Tensor::from_vec(
-                        tokens.iter().map(|&x| x as i64).collect(),
-                        batch_size,
-                        device,
-                    )?;
+                    let token_id = Tensor::from_vec(tokens.clone(), batch_size, device)?;
                     let token_emb = slice.emb.forward(&token_id)?.unsqueeze(1)?;
                     xs.add(&token_emb)?
                 }
@@ -372,27 +401,31 @@ impl<Q: BackendQ> State<Q> {
             let sampled = crate::sampling::gumbel_max(&logits_2d, temperature)?;
             let mut sampled_v: Vec<i64> = sampled.to_vec()?;
             if slice_idx == 0 {
-                sampled_v.fill(semantic_token);
+                sampled_v.copy_from_slice(semantic_tokens);
             }
-            let tokens: Vec<u32> = sampled_v.into_iter().map(|x| x as u32).collect();
-            all_tokens.push(tokens);
+            all_tokens.push(sampled_v);
         }
         Ok(all_tokens)
     }
 
-    fn audio_tokens_for_current_step(&self) -> Result<Vec<Vec<u32>>> {
+    fn audio_tokens_for_current_step(&self) -> Result<Vec<Vec<i64>>> {
         use xn::Context;
 
         let mut audio_tokens = vec![];
-        for (i, delay) in self.model.audio_delays.iter().enumerate() {
-            let audio_token = if self.index > *delay {
-                let prev_tokens =
-                    self.audio_tokens.last().context("audio_tokens should not be empty")?;
-                prev_tokens[i][0]
-            } else {
-                self.model.audio_card as u32
-            };
-            audio_tokens.push(vec![audio_token]);
+        for (cb_idx, delay) in self.model.audio_delays.iter().enumerate() {
+            let mut tokens = Vec::with_capacity(self.batch_size());
+            for per_batch in self.per_batch.iter() {
+                let audio_token = if per_batch.index > *delay {
+                    let prev_token = per_batch.audio_tokens[cb_idx]
+                        .last()
+                        .context("audio_tokens should not be empty")?;
+                    *prev_token
+                } else {
+                    self.model.audio_card as i64
+                };
+                tokens.push(audio_token);
+            }
+            audio_tokens.push(tokens)
         }
         Ok(audio_tokens)
     }
@@ -402,29 +435,38 @@ impl<Q: BackendQ> State<Q> {
         ca_src: &CaSrc<Q>,
         mask: &StreamMask,
         condition_sum: Option<&Tensor<Q::T, Q::B>>,
-        semantic_token: i64,
+        semantic_tokens: &[i64],
     ) -> Result<()> {
         let audio_tokens = self.audio_tokens_for_current_step()?;
         let (_text_logits, ys) = self.forward(&audio_tokens, ca_src, mask, condition_sum)?;
-        let audio_tokens = self.depformer_sample(&ys, &self.temperature, semantic_token)?;
-        self.audio_tokens.push(audio_tokens);
-        self.index += 1;
+        let audio_tokens = self.depformer_sample(&ys, &self.temperature, semantic_tokens)?;
+        for (batch_idx, per_batch) in self.per_batch.iter_mut().enumerate() {
+            per_batch.index += 1;
+            for (tokens, new_token) in per_batch.audio_tokens.iter_mut().zip(audio_tokens.iter()) {
+                tokens.push(new_token[batch_idx]);
+            }
+        }
         Ok(())
     }
 
-    pub fn last_audio_tokens(&self) -> Option<Vec<u32>> {
+    pub fn last_audio_tokens(&self) -> Option<Vec<Vec<i64>>> {
         let max_delay = match self.model.audio_delays.iter().max() {
             Some(d) => *d,
             None => return None,
         };
-        let mut last_tokens = vec![];
-        for (cb_idx, delay) in self.model.audio_delays.iter().enumerate() {
-            if self.index + *delay > max_delay {
-                let step_idx = self.index + delay - max_delay - 1;
-                last_tokens.push(self.audio_tokens[step_idx][cb_idx][0]);
-            } else {
-                return None;
+        let mut last_tokens = Vec::with_capacity(self.batch_size());
+        let n_slices = self.model.depformer.len();
+        for per_batch in self.per_batch.iter() {
+            let mut tokens = Vec::with_capacity(n_slices);
+            for (cb_idx, delay) in self.model.audio_delays.iter().enumerate() {
+                if per_batch.index + *delay > max_delay {
+                    let step_idx = per_batch.index + delay - max_delay - 1;
+                    tokens.push(per_batch.audio_tokens[cb_idx][step_idx]);
+                } else {
+                    return None;
+                }
             }
+            last_tokens.push(tokens);
         }
         Some(last_tokens)
     }
