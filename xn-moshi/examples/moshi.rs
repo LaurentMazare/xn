@@ -551,17 +551,15 @@ fn run_s2s<Q: xn::BackendQ>(
     let mut decoded_pcm: Vec<Tensor<f32, Q::B>> = Vec::new();
 
     let num_codes = codes.len();
+    let n_slices = state.n_slices();
     println!("\nStreaming LM step, {num_codes} chunks...");
 
     for (code_idx, &code) in codes.iter().enumerate() {
-        state.step(&ca_src, &mask, condition_sum.as_ref(), code)?;
+        state.step(&ca_src, &mask, condition_sum.as_ref(), &[code])?;
         if let Some(audio_tokens) = state.last_audio_tokens() {
-            let n_cb = audio_tokens.len();
-            let codes_t: Tensor<i64, Q::B> = Tensor::from_vec(
-                audio_tokens.iter().map(|&x| x as i64).collect(),
-                (1, n_cb, 1),
-                &dev,
-            )?;
+            let audio_tokens = audio_tokens.into_iter().flatten().collect();
+            let codes_t: Tensor<i64, Q::B> =
+                Tensor::from_vec(audio_tokens, (1, n_slices, 1), &dev)?;
             let pcm = dec_state.decode_step(&StreamTensor::from_tensor(codes_t), &mask)?;
             if let Some(pcm) = pcm.as_option() {
                 decoded_pcm.push(pcm.copy()?);
@@ -573,7 +571,7 @@ fn run_s2s<Q: xn::BackendQ>(
     }
 
     let elapsed = start_time.elapsed();
-    println!("Done: {} frames in {:.2}s", state.frames_processed(), elapsed.as_secs_f64());
+    println!("Done: {} frames in {:.2}s", state.frames_processed(0), elapsed.as_secs_f64());
 
     if decoded_pcm.is_empty() {
         println!("No audio was decoded; skipping WAV write.");
