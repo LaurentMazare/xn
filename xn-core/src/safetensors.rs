@@ -119,15 +119,23 @@ fn typed_tensor_to_save_view<B: Backend>(tensor: &TypedTensor<B>) -> Result<Save
 }
 
 /// Save tensors to a safetensors file.
-pub fn save<K: AsRef<str> + Ord + std::fmt::Display, B: Backend>(
+pub fn save_with_data_info<K: AsRef<str> + Ord + std::fmt::Display, B: Backend>(
     tensors: &HashMap<K, TypedTensor<B>>,
+    data_info: Option<HashMap<String, String>>,
     path: impl AsRef<std::path::Path>,
 ) -> Result<()> {
     let views: Vec<(&K, SaveView)> = tensors
         .iter()
         .map(|(name, tensor)| Ok((name, typed_tensor_to_save_view(tensor)?)))
         .collect::<Result<_>>()?;
-    Ok(safetensors::tensor::serialize_to_file(views, None, path.as_ref())?)
+    Ok(safetensors::tensor::serialize_to_file(views, data_info, path.as_ref())?)
+}
+
+pub fn save<K: AsRef<str> + Ord + std::fmt::Display, B: Backend>(
+    tensors: &HashMap<K, TypedTensor<B>>,
+    path: impl AsRef<std::path::Path>,
+) -> Result<()> {
+    save_with_data_info(tensors, None, path)
 }
 
 impl<T: WithDType, B: Backend> Tensor<T, B> {
