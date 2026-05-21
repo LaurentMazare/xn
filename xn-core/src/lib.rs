@@ -173,12 +173,52 @@ impl Runner {
                     DTypeQ::F16 => w.run::<Unquantized<half::f16, _>>(dev)?,
                     DTypeQ::BF16 => w.run::<Unquantized<half::bf16, _>>(dev)?,
                     DTypeQ::F32 => w.run::<Unquantized<f32, _>>(dev)?,
+                    DTypeQ::Q4_0
+                    | DTypeQ::Q4_1
+                    | DTypeQ::Q5_0
+                    | DTypeQ::Q5_1
+                    | DTypeQ::Q8_0
+                    | DTypeQ::Q8_1
+                    | DTypeQ::Q2K
+                    | DTypeQ::Q3K
+                    | DTypeQ::Q4K
+                    | DTypeQ::Q5K
+                    | DTypeQ::Q6K
+                    | DTypeQ::Q8K => {
+                        return Err(Error::msg(format!(
+                            "{:?} quantization is only supported on CPU",
+                            self.dtype
+                        )));
+                    }
                 }
             }
         }
         #[cfg(not(feature = "cuda"))]
         {
-            w.run::<Unquantized<f32, _>>(CpuDevice)?;
+            match self.dtype {
+                DTypeQ::Fp8 | DTypeQ::Fp8PerToken => {
+                    return Err(Error::msg("FP8 quantization is not supported on CPU"));
+                }
+                DTypeQ::F32 => w.run::<Unquantized<f32, _>>(CpuDevice)?,
+                DTypeQ::Q4_0 => w.run::<crate::quantized::Q40F32>(CpuDevice)?,
+                DTypeQ::Q4_1 => w.run::<crate::quantized::Q41F32>(CpuDevice)?,
+                DTypeQ::Q5_0 => w.run::<crate::quantized::Q50F32>(CpuDevice)?,
+                DTypeQ::Q5_1 => w.run::<crate::quantized::Q51F32>(CpuDevice)?,
+                DTypeQ::Q8_0 => w.run::<crate::quantized::Q80F32>(CpuDevice)?,
+                DTypeQ::Q8_1 => w.run::<crate::quantized::Q81F32>(CpuDevice)?,
+                DTypeQ::Q2K => w.run::<crate::quantized::Q2kF32>(CpuDevice)?,
+                DTypeQ::Q3K => w.run::<crate::quantized::Q3kF32>(CpuDevice)?,
+                DTypeQ::Q4K => w.run::<crate::quantized::Q4kF32>(CpuDevice)?,
+                DTypeQ::Q5K => w.run::<crate::quantized::Q5kF32>(CpuDevice)?,
+                DTypeQ::Q6K => w.run::<crate::quantized::Q6kF32>(CpuDevice)?,
+                DTypeQ::Q8K => w.run::<crate::quantized::Q8kF32>(CpuDevice)?,
+                DTypeQ::F16 | DTypeQ::BF16 => {
+                    return Err(Error::msg(format!(
+                        "{:?} is not yet supported on CPU",
+                        self.dtype
+                    )));
+                }
+            };
         }
         Ok(())
     }

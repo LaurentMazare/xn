@@ -16,6 +16,18 @@ pub enum DTypeQ {
     F16,
     BF16,
     F32,
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q8_0,
+    Q8_1,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8K,
 }
 
 impl std::str::FromStr for DTypeQ {
@@ -28,6 +40,18 @@ impl std::str::FromStr for DTypeQ {
             "f16" => Ok(DTypeQ::F16),
             "bf16" => Ok(DTypeQ::BF16),
             "f32" => Ok(DTypeQ::F32),
+            "q4_0" => Ok(DTypeQ::Q4_0),
+            "q4_1" => Ok(DTypeQ::Q4_1),
+            "q5_0" => Ok(DTypeQ::Q5_0),
+            "q5_1" => Ok(DTypeQ::Q5_1),
+            "q8_0" => Ok(DTypeQ::Q8_0),
+            "q8_1" => Ok(DTypeQ::Q8_1),
+            "q2k" => Ok(DTypeQ::Q2K),
+            "q3k" => Ok(DTypeQ::Q3K),
+            "q4k" => Ok(DTypeQ::Q4K),
+            "q5k" => Ok(DTypeQ::Q5K),
+            "q6k" => Ok(DTypeQ::Q6K),
+            "q8k" => Ok(DTypeQ::Q8K),
             _ => crate::bail!("Invalid DTypeQ: {s}"),
         }
     }
