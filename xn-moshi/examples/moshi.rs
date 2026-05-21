@@ -56,6 +56,18 @@ enum Command {
         #[arg(long, default_value = "bf16")]
         dtype: String,
 
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+
+        #[arg(long)]
+        lm: Option<std::path::PathBuf>,
+
+        #[arg(long)]
+        mimi: Option<std::path::PathBuf>,
+
+        #[arg(long)]
+        tokenizer: Option<std::path::PathBuf>,
+
         /// Batch size for computation (ASR output uses first element only).
         #[arg(short, long, default_value_t = 1)]
         batch_size: usize,
@@ -125,18 +137,32 @@ struct AsrFiles {
     tokenizer: std::path::PathBuf,
 }
 
-fn download_asr_model() -> Result<AsrFiles> {
+fn download_asr_model(
+    lm: Option<std::path::PathBuf>,
+    mimi: Option<std::path::PathBuf>,
+    tokenizer: Option<std::path::PathBuf>,
+) -> Result<AsrFiles> {
     use hf_hub::{Repo, RepoType, api::sync::Api};
     let repo_id = "kyutai/stt-2.6b-en-candle";
     println!("Downloading ASR model from {repo_id}...");
     let api = Api::new()?;
     let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
-    let lm = repo.get("model.safetensors").context("LM safetensors not found")?;
+    let lm = match lm {
+        Some(path) => path,
+        None => repo.get("model.safetensors").context("LM safetensors not found")?,
+    };
     println!("  LM at {}", lm.display());
-    let mimi =
-        repo.get("mimi-pytorch-e351c8d8@125.safetensors").context("mimi safetensors not found")?;
+    let mimi = match mimi {
+        Some(path) => path,
+        None => repo
+            .get("mimi-pytorch-e351c8d8@125.safetensors")
+            .context("mimi safetensors not found")?,
+    };
     println!("  Mimi at {}", mimi.display());
-    let tokenizer = repo.get("tokenizer_en_audio_4000.model").context("tokenizer not found")?;
+    let tokenizer = match tokenizer {
+        Some(path) => path,
+        None => repo.get("tokenizer_en_audio_4000.model").context("tokenizer not found")?,
+    };
     println!("  Tokenizer at {}", tokenizer.display());
     Ok(AsrFiles { lm, mimi, tokenizer })
 }
@@ -154,11 +180,25 @@ struct AsrQ {
     temperature: f64,
     batch_size: usize,
     verbose: bool,
+    config: Option<std::path::PathBuf>,
+    lm: Option<std::path::PathBuf>,
+    mimi: Option<std::path::PathBuf>,
+    tokenizer: Option<std::path::PathBuf>,
 }
 
 impl xn::WithQ for AsrQ {
     fn run<Q: xn::BackendQ>(self, dev: Q::B) -> xn::Result<()> {
-        match run_asr::<Q>(self.input, self.temperature, self.batch_size, self.verbose, dev) {
+        match run_asr::<Q>(
+            self.input,
+            self.temperature,
+            self.batch_size,
+            self.verbose,
+            self.config,
+            self.lm,
+            self.mimi,
+            self.tokenizer,
+            dev,
+        ) {
             Ok(()) => Ok(()),
             Err(e) => xn::bail!("ASR failed: {e}"),
         }
@@ -222,11 +262,23 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Asr { input, temperature, cpu, dtype, batch_size, chrome_tracing, verbose } => {
+        Command::Asr {
+            input,
+            temperature,
+            cpu,
+            dtype,
+            batch_size,
+            config,
+            tokenizer,
+            lm,
+            mimi,
+            chrome_tracing,
+            verbose,
+        } => {
             use std::str::FromStr;
             let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
             let dtype = xn::DTypeQ::from_str(&dtype)?;
-            let asr = AsrQ { input, temperature, batch_size, verbose };
+            let asr = AsrQ { input, temperature, batch_size, verbose, config, lm, mimi, tokenizer };
             xn::Runner::new().cpu_only(cpu).dtype(dtype).run(asr, 0)?;
         }
         Command::S2s {
@@ -598,6 +650,10 @@ fn run_asr<Q: xn::BackendQ>(
     temperature: f64,
     batch_size: usize,
     verbose: bool,
+    config: Option<std::path::PathBuf>,
+    lm: Option<std::path::PathBuf>,
+    mimi: Option<std::path::PathBuf>,
+    tokenizer: Option<std::path::PathBuf>,
     dev: Q::B,
 ) -> Result<()> {
     use std::io::Write;
@@ -620,7 +676,7 @@ fn run_asr<Q: xn::BackendQ>(
     };
 
     // --- Download models ---
-    let files = download_asr_model()?;
+    let files = download_asr_model(lm, mimi, tokenizer)?;
 
     // --- Load tokenizer ---
     let tokenizer_path = files.tokenizer.to_str().context("invalid tokenizer path")?;
@@ -637,7 +693,14 @@ fn run_asr<Q: xn::BackendQ>(
     // --- Load LM ---
     println!("Loading LM weights...");
     let lm_vb = VB::load(&[files.lm], dev.clone())?;
-    let lm_config = lm::Config::stt_2_6b();
+    let lm_config = match config {
+        Some(config_path) => {
+            let config_str = std::fs::read_to_string(config_path)?;
+            let config: xn_moshi::moshi::Config = serde_json::from_str(&config_str)?;
+            config.to_lm_config()
+        }
+        None => lm::Config::stt_2_6b(),
+    };
     let lm: LmModel<Q> = LmModel::load(&lm_vb.root(), &lm_config)?;
     println!("  LM loaded");
 
