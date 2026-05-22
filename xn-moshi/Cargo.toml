@@ -28,6 +28,7 @@ tracing-subscriber = { workspace = true }
 [features]
 default = []
 cuda = ["xn/cuda"]
+accelerate = ["xn/accelerate"]
 audio = ["dep:kaudio"]
 
 [[example]]
