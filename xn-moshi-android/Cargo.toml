@@ -1,0 +1,23 @@
+[package]
+name = "xn-moshi-android"
+version.workspace = true
+edition = "2024"
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+xn = { workspace = true }
+xn-moshi = { path = "../xn-moshi", version = "0.1.12" }
+anyhow = { workspace = true }
+log = "0.4"
+libc = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.14"

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">xn-moshi ASR</string>
+    <string name="status_loading">Loading model…</string>
+    <string name="status_ready">Ready — tap Start.</string>
+    <string name="status_running">Listening…</string>
+    <string name="status_stopped">Stopped.</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="clear">Clear</string>
+    <string name="dtype">Compute dtype</string>
+    <string name="permission_denied">Microphone permission denied.</string>
+</resources>
