@@ -43,8 +43,9 @@ android {
     }
 
     androidResources {
-        // Don't compress .safetensors / SP .model — they're already either
-        // packed or won't gain anything, and we mmap them from filesDir.
+        // Don't compress the weight files — uncompressed assets can be opened
+        // with mmap-friendly random access and zip-extraction at install time
+        // is fast. config.json stays compressed (tiny).
         noCompress += listOf("safetensors", "model")
     }
 

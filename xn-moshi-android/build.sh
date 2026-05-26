@@ -23,8 +23,8 @@ JNILIBS="xn-moshi-android/android/app/src/main/jniLibs/arm64-v8a"
 mkdir -p "$JNILIBS"
 
 if [[ "$BUILD_TYPE" == "release" ]]; then
-    PROFILE_DIR="release"
-    CARGO_FLAGS=("--release")
+    PROFILE_DIR="android-release"
+    CARGO_FLAGS=("--profile" "android-release")
     GRADLE_TASK="assembleRelease"
 else
     PROFILE_DIR="debug"
@@ -53,13 +53,11 @@ else
 fi
 
 echo "==> Checking for model assets..."
-for f in mimi.safetensors lm.safetensors tokenizer.model; do
+for f in mimi.safetensors model.safetensors tokenizer.model config.json; do
     if [[ ! -s "xn-moshi-android/android/app/src/main/assets/$f" ]]; then
         echo "WARN: xn-moshi-android/android/app/src/main/assets/$f is missing or empty." >&2
-        echo "      Download from huggingface.co/kyutai/stt-2.6b-en-candle:" >&2
-        echo "        mimi.safetensors  <- mimi-pytorch-e351c8d8@125.safetensors" >&2
-        echo "        lm.safetensors    <- model.safetensors" >&2
-        echo "        tokenizer.model   <- tokenizer_en_audio_4000.model" >&2
+        echo "      Place the four files from huggingface.co/..." >&2
+        echo "      under xn-moshi-android/android/app/src/main/assets/." >&2
     fi
 done
 

@@ -16,7 +16,12 @@ class Asr private constructor(private val handle: Long) {
         init { System.loadLibrary("xn_moshi_android") }
 
         @JvmStatic external fun nativeInit(
-            mimiPath: String, lmPath: String, tokenizerPath: String, dtype: String,
+            mimiPath: String,
+            lmPath: String,
+            tokenizerPath: String,
+            configPath: String,
+            dtype: String,
+            language: String,
         ): Long
 
         @JvmStatic external fun nativeStep(handle: Long, pcm: FloatArray): String?
@@ -28,8 +33,15 @@ class Asr private constructor(private val handle: Long) {
         val frameSize: Int get() = nativeFrameSize()
         val sampleRate: Int get() = nativeSampleRate()
 
-        fun init(mimiPath: String, lmPath: String, tokenizerPath: String, dtype: String): Asr {
-            val h = nativeInit(mimiPath, lmPath, tokenizerPath, dtype)
+        fun init(
+            mimiPath: String,
+            lmPath: String,
+            tokenizerPath: String,
+            configPath: String,
+            dtype: String,
+            language: String = "en",
+        ): Asr {
+            val h = nativeInit(mimiPath, lmPath, tokenizerPath, configPath, dtype, language)
             check(h != 0L) { "nativeInit returned 0" }
             return Asr(h)
         }

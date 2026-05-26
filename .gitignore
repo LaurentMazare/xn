@@ -24,3 +24,4 @@ pocket-tts-wasm/pkg/
 tmp/
 *.wav
 .DS_Store
+xn-moshi-android/android

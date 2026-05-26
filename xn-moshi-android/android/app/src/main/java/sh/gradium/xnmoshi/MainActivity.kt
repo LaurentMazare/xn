@@ -95,7 +95,7 @@ class MainActivity : AppCompatActivity() {
         try {
             val paths = withContext(Dispatchers.IO) { ModelAssets.extract(applicationContext) }
             asr = withContext(Dispatchers.Default) {
-                Asr.init(paths.mimi, paths.lm, paths.tokenizer, currentDtype)
+                Asr.init(paths.mimi, paths.lm, paths.tokenizer, paths.config, currentDtype)
             }
             status.text = getString(R.string.status_ready)
             startStop.isEnabled = true
@@ -116,7 +116,7 @@ class MainActivity : AppCompatActivity() {
             asr = null
             val paths = withContext(Dispatchers.IO) { ModelAssets.extract(applicationContext) }
             asr = withContext(Dispatchers.Default) {
-                Asr.init(paths.mimi, paths.lm, paths.tokenizer, dtype)
+                Asr.init(paths.mimi, paths.lm, paths.tokenizer, paths.config, dtype)
             }
             currentDtype = dtype
             status.text = getString(R.string.status_ready)

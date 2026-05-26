@@ -38,22 +38,22 @@ cargo install cargo-ndk      # easiest path; the script also handles raw NDK
 # Android SDK + NDK r26 or newer, ANDROID_HOME and ANDROID_NDK_HOME set
 ```
 
-## Drop in the model files
+## Model files
 
-The app embeds the three weight files as APK assets and copies them to
-`filesDir/models/` on first launch. Download them from
-[`kyutai/stt-2.6b-en-candle`](https://huggingface.co/kyutai/stt-2.6b-en-candle)
-and rename:
+Four files live in `android/app/src/main/assets/` (gitignored — bring
+your own).
 
-| In `assets/`        | Source file                                  |
-| ------------------- | -------------------------------------------- |
-| `mimi.safetensors`  | `mimi-pytorch-e351c8d8@125.safetensors`      |
-| `lm.safetensors`    | `model.safetensors`                          |
-| `tokenizer.model`   | `tokenizer_en_audio_4000.model`              |
+| In `assets/`        | Purpose                                       |
+| ------------------- | --------------------------------------------- |
+| `config.json`       | LM architecture + `asr_delay_in_tokens`       |
+| `model.safetensors` | LM weights                                    |
+| `mimi.safetensors`  | Mimi audio tokenizer weights                  |
+| `tokenizer.model`   | SentencePiece pieces table                    |
 
-Drop them in `android/app/src/main/assets/` before building. Combined
-size is ~2.5 GB so the resulting APK is large — that's the price of
-fully on-device, no-download inference.
+Bundled size for this checkpoint is ~920 MB so the APK is large —
+that's the price of fully on-device, no-download inference. The asset
+extractor (`ModelAssets.kt`) copies them into `filesDir/models/` on
+first launch and the Rust safetensors loader mmaps from there.
 
 ## Build & install
 

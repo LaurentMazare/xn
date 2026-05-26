@@ -52,3 +52,13 @@ debug = true
 [profile.release-no-debug]
 inherits = "release"
 debug = false
+
+# Shipping profile for the Android .so: thin LTO, strip symbols, single
+# codegen unit. Empirically gets `libxn_moshi_android.so` ~50× smaller than
+# the debug build.
+[profile.android-release]
+inherits = "release"
+debug = false
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

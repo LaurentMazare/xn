@@ -5,21 +5,30 @@ import android.util.Log
 import java.io.File
 
 /**
- * Copies the three ASR model files from APK assets to the app's private
- * files dir once, then hands back absolute paths so the Rust side can mmap
- * them via safetensors.
+ * Copies the four ASR model files from APK assets to the app's private
+ * files dir on first launch, then hands back absolute paths so the Rust
+ * side can mmap them.
  *
- * Drop the three files into `app/src/main/assets/`:
- *  - `mimi.safetensors`     (HF `kyutai/stt-2.6b-en-candle` → mimi-pytorch-e351c8d8@125.safetensors)
- *  - `lm.safetensors`       (same repo → model.safetensors)
- *  - `tokenizer.model`      (same repo → tokenizer_en_audio_4000.model)
+ * The four files come from `...` on Hugging Face and
+ * are bundled verbatim under `app/src/main/assets/`:
+ *  - `config.json`        (LM architecture + asr_delay_in_tokens)
+ *  - `model.safetensors`  (LM weights)
+ *  - `mimi.safetensors`   (Mimi audio tokenizer)
+ *  - `tokenizer.model`    (SentencePiece pieces table)
  */
 object ModelAssets {
 
-    data class Paths(val mimi: String, val lm: String, val tokenizer: String)
+    data class Paths(
+        val mimi: String,
+        val lm: String,
+        val tokenizer: String,
+        val config: String,
+    )
 
     private const val TAG = "ModelAssets"
-    private val FILES = listOf("mimi.safetensors", "lm.safetensors", "tokenizer.model")
+    private val FILES = listOf(
+        "mimi.safetensors", "model.safetensors", "tokenizer.model", "config.json",
+    )
 
     fun extract(ctx: Context): Paths {
         val dir = File(ctx.filesDir, "models").apply { mkdirs() }
@@ -33,8 +42,9 @@ object ModelAssets {
         }
         return Paths(
             mimi = File(dir, "mimi.safetensors").absolutePath,
-            lm = File(dir, "lm.safetensors").absolutePath,
+            lm = File(dir, "model.safetensors").absolutePath,
             tokenizer = File(dir, "tokenizer.model").absolutePath,
+            config = File(dir, "config.json").absolutePath,
         )
     }
 }

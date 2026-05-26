@@ -1,0 +1,4 @@
+*.safetensors
+*.model
+*.json
+!.gitignore

@@ -34,10 +34,22 @@ class AudioCapture(
         // 4 frames of headroom on top of the OS minimum, mostly to absorb GC.
         .setBufferSizeInBytes(maxOf(minBuf, frameSize * 4 * 4))
         .build()
+        .also {
+            Log.i(
+                "AudioCapture",
+                "state=${it.state} actualSampleRate=${it.sampleRate} " +
+                        "actualChannels=${it.channelCount} format=${it.audioFormat} " +
+                        "minBuf=$minBuf source=${it.audioSource}",
+            )
+        }
 
     private val frame = FloatArray(frameSize)
+    private var framesRead = 0L
 
-    fun start() = recorder.startRecording()
+    fun start() {
+        recorder.startRecording()
+        Log.i("AudioCapture", "startRecording: recordingState=${recorder.recordingState}")
+    }
 
     /** Fill one full frame; loops on partial reads. Returns null on error. */
     fun readFrame(): FloatArray? {
@@ -45,10 +57,20 @@ class AudioCapture(
         while (off < frameSize) {
             val n = recorder.read(frame, off, frameSize - off, AudioRecord.READ_BLOCKING)
             if (n < 0) {
-                Log.w("AudioCapture", "AudioRecord.read=$n")
+                Log.w("AudioCapture", "AudioRecord.read=$n at off=$off")
                 return null
             }
             off += n
+        }
+        framesRead++
+        if (framesRead == 1L || framesRead % 25 == 0L) {
+            // First frame + every ~2s: confirm we're reading non-silent audio.
+            var peak = 0f
+            for (s in frame) {
+                val a = if (s < 0f) -s else s
+                if (a > peak) peak = a
+            }
+            Log.i("AudioCapture", "frame #$framesRead peak=$peak")
         }
         return frame
     }

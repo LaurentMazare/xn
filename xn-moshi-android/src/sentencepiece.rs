@@ -74,15 +74,10 @@ impl SpDecoder {
             }
         }
         let s = String::from_utf8_lossy(&bytes).into_owned();
-        // U+2581 (▁) marks word boundaries; SP convention strips a leading one
-        // and turns the rest into spaces.
-        let s = s.replace('\u{2581}', " ");
-        // SentencePiece's decode strips one leading space if the output begins
-        // with one (the meta-space at the start of an utterance).
-        match s.strip_prefix(' ') {
-            Some(rest) => rest.to_string(),
-            None => s,
-        }
+        // U+2581 (▁) marks word boundaries. We turn them into spaces; the
+        // caller decides whether to strip the leading one (usually only for
+        // the very first emission of an utterance).
+        s.replace('\u{2581}', " ")
     }
 }
 
