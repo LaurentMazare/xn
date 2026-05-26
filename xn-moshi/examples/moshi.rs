@@ -695,8 +695,10 @@ fn run_asr<Q: xn::BackendQ>(
     let lm_vb = VB::load(&[files.lm], dev.clone())?;
     let lm_config = match config {
         Some(config_path) => {
-            let config_str = std::fs::read_to_string(config_path)?;
-            let config: xn_moshi::moshi::Config = serde_json::from_str(&config_str)?;
+            let config_str = std::fs::read_to_string(&config_path)
+                .with_context(|| format!("failed to read LM config file {config_path:?}"))?;
+            let config: xn_moshi::moshi::Config = serde_json::from_str(&config_str)
+                .with_context(|| format!("failed to parse LM config JSON {config_path:?}"))?;
             config.to_lm_config()
         }
         None => lm::Config::stt_2_6b(),
