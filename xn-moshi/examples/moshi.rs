@@ -186,12 +186,22 @@ impl AsrFiles {
     }
 }
 
-fn init_tracing() -> tracing_chrome::FlushGuard {
-    use tracing_chrome::ChromeLayerBuilder;
+fn init_tracing(chrome: bool) -> Option<tracing_chrome::FlushGuard> {
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::{prelude::*, registry::Registry};
-    let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
-    Registry::default().with(chrome_layer).init();
-    guard
+    if chrome {
+        use tracing_chrome::ChromeLayerBuilder;
+        let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
+        Registry::default().with(chrome_layer).init();
+        Some(guard)
+    } else {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::Layer::new().with_target(false))
+            .with(filter)
+            .init();
+        None
+    }
 }
 
 struct AsrQ {
@@ -251,7 +261,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::AudioToAudio { input, output, codebooks, cpu, chrome_tracing } => {
-            let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
+            let _guard = init_tracing(chrome_tracing);
 
             #[cfg(feature = "cuda")]
             {
@@ -286,7 +296,7 @@ fn main() -> Result<()> {
             verbose,
         } => {
             use std::str::FromStr;
-            let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
+            let _guard = init_tracing(chrome_tracing);
             let dtype = xn::DTypeQ::from_str(&dtype)?;
             let asr = AsrQ { input, temperature, batch_size, verbose, model };
             xn::Runner::new().cpu_only(cpu).dtype(dtype).run(asr, 0)?;
@@ -304,7 +314,7 @@ fn main() -> Result<()> {
             verbose,
         } => {
             use std::str::FromStr;
-            let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
+            let _guard = init_tracing(chrome_tracing);
             let dtype = xn::DTypeQ::from_str(&dtype)?;
             let s2s = S2s { input, voice, temperature, batch_size, verbose, config, output };
             xn::Runner::new().cpu_only(cpu).dtype(dtype).run(s2s, 0)?;
