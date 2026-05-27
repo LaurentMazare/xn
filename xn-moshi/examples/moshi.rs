@@ -57,16 +57,7 @@ enum Command {
         dtype: String,
 
         #[arg(long)]
-        config: Option<std::path::PathBuf>,
-
-        #[arg(long)]
-        lm: Option<std::path::PathBuf>,
-
-        #[arg(long)]
-        mimi: Option<std::path::PathBuf>,
-
-        #[arg(long)]
-        tokenizer: Option<std::path::PathBuf>,
+        model: Option<String>,
 
         /// Batch size for computation (ASR output uses first element only).
         #[arg(short, long, default_value_t = 1)]
@@ -135,36 +126,64 @@ struct AsrFiles {
     lm: std::path::PathBuf,
     mimi: std::path::PathBuf,
     tokenizer: std::path::PathBuf,
+    config: Option<xn_moshi::moshi::Config>,
 }
 
-fn download_asr_model(
-    lm: Option<std::path::PathBuf>,
-    mimi: Option<std::path::PathBuf>,
-    tokenizer: Option<std::path::PathBuf>,
-) -> Result<AsrFiles> {
-    use hf_hub::{Repo, RepoType, api::sync::Api};
-    let repo_id = "kyutai/stt-2.6b-en-candle";
-    println!("Downloading ASR model from {repo_id}...");
-    let api = Api::new()?;
-    let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
-    let lm = match lm {
-        Some(path) => path,
-        None => repo.get("model.safetensors").context("LM safetensors not found")?,
-    };
-    println!("  LM at {}", lm.display());
-    let mimi = match mimi {
-        Some(path) => path,
-        None => repo
+impl AsrFiles {
+    fn download_or_local(path_str: &str) -> Result<Self> {
+        let path = std::path::Path::new(path_str);
+        if path.is_dir() {
+            tracing::info!(?path, "loading ASR model from local directory...");
+            let lm = path.join("model.safetensors");
+            if !lm.exists() {
+                anyhow::bail!("LM safetensors not found at {lm:?}")
+            }
+            let mimi = path.join("mimi.safetensors");
+            if !mimi.exists() {
+                anyhow::bail!("Mimi safetensors not found at {mimi:?}")
+            }
+            let tokenizer = path.join("tokenizer.model");
+            if !tokenizer.exists() {
+                anyhow::bail!("Tokenizer not found at {tokenizer:?}")
+            }
+            let config = path.join("config.json");
+            if !config.exists() {
+                anyhow::bail!("config.json not found at {config:?}")
+            }
+            let config: xn_moshi::moshi::Config =
+                serde_json::from_str(&std::fs::read_to_string(config)?)?;
+            Ok(AsrFiles { lm, mimi, tokenizer, config: Some(config) })
+        } else {
+            use hf_hub::{Repo, RepoType, api::sync::Api};
+            tracing::info!(?path_str, "downloading ASR model from Hugging Face Hub...");
+            let api = Api::new()?;
+            let repo = api.repo(Repo::new(path_str.to_string(), RepoType::Model));
+            let lm = repo.get("model.safetensors").context("LM safetensors not found")?;
+            let mimi = repo.get("mimi.safetensors").context("mimi safetensors not found")?;
+            let tokenizer = repo.get("tokenizer.model").context("tokenizer not found")?;
+            let config = repo.get("config.json").context("config.json not found")?;
+            let config: xn_moshi::moshi::Config =
+                serde_json::from_str(&std::fs::read_to_string(config)?)?;
+            Ok(AsrFiles { lm, mimi, tokenizer, config: Some(config) })
+        }
+    }
+
+    fn download_kyutai_2b() -> Result<AsrFiles> {
+        use hf_hub::{Repo, RepoType, api::sync::Api};
+        let repo_id = "kyutai/stt-2.6b-en-candle";
+        tracing::info!(?repo_id, "Downloading ASR model from Hugging Face Hub...");
+        let api = Api::new()?;
+        let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+        let lm = repo.get("model.safetensors").context("LM safetensors not found")?;
+        tracing::info!(?lm, "LM safetensors found");
+        let mimi = repo
             .get("mimi-pytorch-e351c8d8@125.safetensors")
-            .context("mimi safetensors not found")?,
-    };
-    println!("  Mimi at {}", mimi.display());
-    let tokenizer = match tokenizer {
-        Some(path) => path,
-        None => repo.get("tokenizer_en_audio_4000.model").context("tokenizer not found")?,
-    };
-    println!("  Tokenizer at {}", tokenizer.display());
-    Ok(AsrFiles { lm, mimi, tokenizer })
+            .context("mimi safetensors not found")?;
+        tracing::info!(?mimi, "Mimi safetensors found");
+        let tokenizer = repo.get("tokenizer_en_audio_4000.model").context("tokenizer not found")?;
+        tracing::info!(?tokenizer, "Tokenizer found");
+        Ok(AsrFiles { lm, mimi, tokenizer, config: None })
+    }
 }
 
 fn init_tracing() -> tracing_chrome::FlushGuard {
@@ -180,10 +199,7 @@ struct AsrQ {
     temperature: f64,
     batch_size: usize,
     verbose: bool,
-    config: Option<std::path::PathBuf>,
-    lm: Option<std::path::PathBuf>,
-    mimi: Option<std::path::PathBuf>,
-    tokenizer: Option<std::path::PathBuf>,
+    model: Option<String>,
 }
 
 impl xn::WithQ for AsrQ {
@@ -193,10 +209,7 @@ impl xn::WithQ for AsrQ {
             self.temperature,
             self.batch_size,
             self.verbose,
-            self.config,
-            self.lm,
-            self.mimi,
-            self.tokenizer,
+            self.model.as_deref(),
             dev,
         ) {
             Ok(()) => Ok(()),
@@ -268,17 +281,14 @@ fn main() -> Result<()> {
             cpu,
             dtype,
             batch_size,
-            config,
-            tokenizer,
-            lm,
-            mimi,
+            model,
             chrome_tracing,
             verbose,
         } => {
             use std::str::FromStr;
             let _guard = if chrome_tracing { Some(init_tracing()) } else { None };
             let dtype = xn::DTypeQ::from_str(&dtype)?;
-            let asr = AsrQ { input, temperature, batch_size, verbose, config, lm, mimi, tokenizer };
+            let asr = AsrQ { input, temperature, batch_size, verbose, model };
             xn::Runner::new().cpu_only(cpu).dtype(dtype).run(asr, 0)?;
         }
         Command::S2s {
@@ -650,10 +660,7 @@ fn run_asr<Q: xn::BackendQ>(
     temperature: f64,
     batch_size: usize,
     verbose: bool,
-    config: Option<std::path::PathBuf>,
-    lm: Option<std::path::PathBuf>,
-    mimi: Option<std::path::PathBuf>,
-    tokenizer: Option<std::path::PathBuf>,
+    model: Option<&str>,
     dev: Q::B,
 ) -> Result<()> {
     use std::io::Write;
@@ -676,7 +683,10 @@ fn run_asr<Q: xn::BackendQ>(
     };
 
     // --- Download models ---
-    let files = download_asr_model(lm, mimi, tokenizer)?;
+    let files = match model {
+        Some(model) => AsrFiles::download_or_local(model)?,
+        None => AsrFiles::download_kyutai_2b()?,
+    };
 
     // --- Load tokenizer ---
     let tokenizer_path = files.tokenizer.to_str().context("invalid tokenizer path")?;
@@ -693,14 +703,8 @@ fn run_asr<Q: xn::BackendQ>(
     // --- Load LM ---
     println!("Loading LM weights...");
     let lm_vb = VB::load(&[files.lm], dev.clone())?;
-    let lm_config = match config {
-        Some(config_path) => {
-            let config_str = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("failed to read LM config file {config_path:?}"))?;
-            let config: xn_moshi::moshi::Config = serde_json::from_str(&config_str)
-                .with_context(|| format!("failed to parse LM config JSON {config_path:?}"))?;
-            config.to_lm_config()
-        }
+    let lm_config = match files.config {
+        Some(config) => config.to_lm_config(),
         None => lm::Config::stt_2_6b(),
     };
     let lm: LmModel<Q> = LmModel::load(&lm_vb.root(), &lm_config)?;
