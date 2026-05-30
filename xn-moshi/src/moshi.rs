@@ -20,10 +20,10 @@ pub struct Config {
     pub hidden_scale: f64,
     pub causal: bool,
     pub context: usize,
-    pub max_period: usize,
+    pub max_period: f64,
     pub gating: Gating,
-    pub extra_heads_num_heads: usize,
-    pub extra_heads_dim: usize,
+    pub extra_heads_num_heads: Option<usize>,
+    pub extra_heads_dim: Option<usize>,
     pub conditioners: std::collections::HashMap<String, ConditionerConfig>,
 }
 
@@ -38,10 +38,11 @@ impl Config {
 
     pub fn to_lm_config(&self) -> crate::lm::Config {
         let dim_feedforward = (self.dim as f64 * self.hidden_scale) as usize;
-        let extra_heads = if self.extra_heads_num_heads > 0 {
+        let extra_heads_num_heads = self.extra_heads_num_heads.unwrap_or(0);
+        let extra_heads = if extra_heads_num_heads > 0 {
             Some(crate::lm::ExtraHeadsConfig {
-                num_heads: self.extra_heads_num_heads,
-                dim: self.extra_heads_dim,
+                num_heads: extra_heads_num_heads,
+                dim: self.extra_heads_dim.unwrap_or(0),
             })
         } else {
             None

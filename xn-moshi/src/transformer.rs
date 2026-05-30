@@ -23,7 +23,7 @@ pub struct Config {
     pub gating: Option<crate::seanet::Activation>,
     pub norm: crate::NormType,
     pub context: usize,
-    pub max_period: usize,
+    pub max_period: f64,
     pub kv_repeat: usize,
     pub dim_feedforward: usize,
     pub conv_layout: bool,
