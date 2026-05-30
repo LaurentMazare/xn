@@ -159,7 +159,7 @@ impl<Q: BackendQ> Model<Q> {
             gating: Some(crate::seanet::Activation::Silu),
             kv_repeat: 1,
             layer_scale: None,
-            max_period: 10_000,
+            max_period: 10_000.0,
             norm_first: true,
             positional_embedding: crate::transformer::PositionalEmbedding::None,
             use_conv_block: false,

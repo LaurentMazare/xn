@@ -8,22 +8,34 @@ use xn::{Backend, Result, Tensor, WithDTypeF};
 // Config
 // ============================================================================
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub d_model: usize,
     pub num_heads: usize,
     pub num_layers: usize,
     pub causal: bool,
+    #[serde(default = "default_true")]
     pub norm_first: bool,
+    #[serde(default = "default_false")]
     pub bias_ff: bool,
+    #[serde(default = "default_false")]
     pub bias_attn: bool,
     pub layer_scale: Option<f64>,
     pub positional_embedding: PositionalEmbedding,
+    #[serde(default = "default_false")]
     pub use_conv_block: bool,
     pub gating: Option<crate::seanet::Activation>,
     pub norm: crate::NormType,
     pub context: usize,
-    pub max_period: usize,
+    pub max_period: f64,
     pub kv_repeat: usize,
     pub dim_feedforward: usize,
     pub conv_layout: bool,

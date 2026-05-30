@@ -5,7 +5,7 @@ use xn::nn::var_builder::Path;
 use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
-#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Activation {
     Elu(f32),
@@ -14,6 +14,25 @@ pub enum Activation {
     Silu,
     Tanh,
     Sigmoid,
+}
+
+impl<'de> serde::Deserialize<'de> for Activation {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let activation = match s.as_str() {
+            "ELU" | "elu" => Activation::Elu(1.0),
+            "gelu" => Activation::Gelu,
+            "relu" => Activation::Relu,
+            "silu" => Activation::Silu,
+            "tanh" => Activation::Tanh,
+            "sigmoid" => Activation::Sigmoid,
+            other => return Err(serde::de::Error::custom(format!("unknown activation: {other}"))),
+        };
+        Ok(activation)
+    }
 }
 
 impl Activation {
@@ -29,7 +48,7 @@ impl Activation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub dimension: usize,
     pub channels: usize,
@@ -46,7 +65,7 @@ pub struct Config {
     pub pad_mode: PadMode,
     pub true_skip: bool,
     pub compress: usize,
-    pub lstm: usize,
+    pub lstm: Option<usize>,
     pub disable_norm_outer_blocks: usize,
     pub final_activation: Option<Activation>,
 }
@@ -271,7 +290,7 @@ pub struct SeaNetEncoder<T: WithDTypeF, B: Backend> {
 
 impl<T: WithDTypeF, B: Backend> SeaNetEncoder<T, B> {
     pub fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
-        if cfg.lstm > 0 {
+        if cfg.lstm.unwrap_or(0) > 0 {
             xn::bail!("seanet lstm is not supported")
         }
         let n_blocks = 2 + cfg.ratios.len();
@@ -432,7 +451,7 @@ pub struct SeaNetDecoder<T: WithDTypeF, B: Backend> {
 
 impl<T: WithDTypeF, B: Backend> SeaNetDecoder<T, B> {
     pub fn load(vb: &Path<B>, cfg: &Config) -> Result<Self> {
-        if cfg.lstm > 0 {
+        if cfg.lstm.unwrap_or(0) > 0 {
             xn::bail!("seanet lstm is not supported")
         }
         let n_blocks = 2 + cfg.ratios.len();

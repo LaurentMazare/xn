@@ -193,18 +193,36 @@ impl<Q: BackendQ> Asr<Q> {
         default_temperature: f64,
         dev: Q::B,
     ) -> Result<Self> {
+        Self::load_with_mimi_config(
+            mimi_weight,
+            lm_weight,
+            config,
+            crate::mimi::Config::v0_1(Some(32)),
+            asr_delay_in_tokens,
+            default_temperature,
+            dev,
+        )
+    }
+
+    pub fn load_with_mimi_config(
+        mimi_weight: &str,
+        lm_weight: &str,
+        config: Option<&str>,
+        mimi_config: crate::mimi::Config,
+        asr_delay_in_tokens: usize,
+        default_temperature: f64,
+        dev: Q::B,
+    ) -> Result<Self> {
         use crate::lm;
-        use crate::mimi;
         use xn::nn::VB;
 
         let moshi_config = match config {
             Some(c) => {
                 let c = std::fs::read_to_string(c)
                     .map_err(|e| xn::Error::Msg(format!("reading config {c}: {e}")))?;
-                Some(
-                    serde_json::from_str::<moshi::Config>(&c)
-                        .map_err(|e| xn::Error::Msg(format!("parsing config: {e}")))?,
-                )
+                let config = serde_json::from_str::<moshi::Config>(&c)
+                    .map_err(|e| xn::Error::Msg(format!("parsing config: {e}")))?;
+                Some(config)
             }
             None => None,
         };
@@ -214,7 +232,6 @@ impl<Q: BackendQ> Asr<Q> {
         };
 
         let mimi_vb = VB::load(&[mimi_weight], dev.clone())?.root();
-        let mimi_config = mimi::Config::v0_1(Some(32));
         let mimi_model: Mimi<f32, Q::B> = Mimi::load(&mimi_vb, mimi_config)?;
         mimi_vb.check_all_used_with_ignore(|s| {
             s.ends_with("_codebook._initialized")
