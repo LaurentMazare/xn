@@ -3,13 +3,13 @@ use xn::nn::var_builder::Path;
 use xn::streaming::{StreamMask, StreamTensor};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResampleMethod {
     Conv,
     Interpolate,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub channels: usize,
     pub sample_rate: f64,
@@ -39,7 +39,7 @@ impl Config {
             kernel_size: 7,
             residual_kernel_size: 3,
             last_kernel_size: 3,
-            lstm: 0,
+            lstm: None,
             norm: conv::Norm::WeightNorm,
             pad_mode: conv::PadMode::Constant,
             ratios: vec![8, 6, 5, 4],
@@ -93,7 +93,7 @@ impl Config {
             kernel_size: 7,
             residual_kernel_size: 3,
             last_kernel_size: 3,
-            lstm: 0,
+            lstm: None,
             norm: conv::Norm::WeightNorm,
             pad_mode: conv::PadMode::Constant,
             ratios: vec![8, 8, 6, 5],

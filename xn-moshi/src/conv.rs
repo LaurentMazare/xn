@@ -2,14 +2,17 @@ use xn::nn::var_builder::Path;
 use xn::streaming::{StreamMask, StreamTensor, apply_state_mask};
 use xn::{Backend, Result, Tensor, WithDTypeF};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Norm {
     WeightNorm,
     SpectralNorm,
     TimeGroupNorm,
+    None,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PadMode {
     Constant,
     Reflect,
@@ -96,7 +99,7 @@ impl<T: WithDTypeF, B: Backend> NormConv1d<T, B> {
             Some(Norm::TimeGroupNorm) => {
                 xn::bail!("TimeGroupNorm requires GroupNorm which is not available in xn")
             }
-            None => vb.tensor("weight", (out_c, in_c / groups, k_size))?,
+            Some(Norm::None) | None => vb.tensor("weight", (out_c, in_c / groups, k_size))?,
         };
         let bias = if bias { Some(vb.tensor("bias", (out_c,))?) } else { None };
         Ok(Self { weight, bias, stride, dilation, groups })
@@ -163,7 +166,7 @@ impl<T: WithDTypeF, B: Backend> NormConvTranspose1d<T, B> {
             Some(Norm::TimeGroupNorm) => {
                 xn::bail!("TimeGroupNorm requires GroupNorm which is not available in xn")
             }
-            None => vb.tensor("weight", (in_c, out_c / groups, k_size))?,
+            Some(Norm::None) | None => vb.tensor("weight", (in_c, out_c / groups, k_size))?,
         };
         let bias = if bias { Some(vb.tensor("bias", (out_c,))?) } else { None };
         Ok(Self { weight, bias, k_size, stride, groups })
