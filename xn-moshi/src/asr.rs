@@ -245,7 +245,7 @@ impl<Q: BackendQ> Asr<Q> {
             Some(c) => Some(c.load_conditioners::<Q::T, _>(&lm_vb)?),
             None => None,
         };
-        lm_vb.check_all_used()?;
+        lm_vb.check_all_used_with_ignore(|s| s.starts_with("linears."))?;
 
         let default_condition = match conditioners.as_ref() {
             Some(conds) => {
@@ -295,6 +295,7 @@ impl<Q: BackendQ> AsrState<Q> {
     pub fn condition_sum(
         &self,
         lang: Option<&str>,
+        target_lang: Option<&str>,
         delay: f64,
     ) -> Result<Option<Tensor<Q::T, Q::B>>> {
         let conds = match self.model.conditioners.as_ref() {
@@ -304,6 +305,9 @@ impl<Q: BackendQ> AsrState<Q> {
                 if let Some(lang) = lang {
                     values.insert("lang".to_string(), lang.into());
                     values.insert("languages_in_segment".to_string(), lang.into());
+                }
+                if let Some(target_lang) = target_lang {
+                    values.insert("target_language".to_string(), target_lang.into());
                 }
                 conds.condition_sum(&values)?
             }

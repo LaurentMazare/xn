@@ -477,7 +477,7 @@ fn key_map_s2s(s: &str) -> Option<String> {
 }
 
 fn load_pcm_data(input: &std::path::PathBuf, target_sample_rate: usize) -> Result<Vec<f32>> {
-    let (pcm_data, sample_rate) = kaudio::pcm_decode(&input)?;
+    let (pcm_data, sample_rate) = kaudio::pcm_decode(input)?;
     let len = pcm_data.len();
     println!("  {len} samples at {sample_rate} Hz ({:.2}s)", len as f64 / sample_rate as f64);
 
@@ -490,6 +490,7 @@ fn load_pcm_data(input: &std::path::PathBuf, target_sample_rate: usize) -> Resul
     Ok(pcm_data)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_s2s<Q: xn::BackendQ>(
     input: std::path::PathBuf,
     voice_input: std::path::PathBuf,
