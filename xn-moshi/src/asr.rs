@@ -32,56 +32,99 @@ impl AsrWord {
 pub struct StepResult {
     pub words: Vec<AsrWord>,
     pub prs: Vec<Vec<f32>>,
+    // For the audio tokens, first dimension is batch, second is codebooks.
+    pub audio_tokens: Vec<Vec<u32>>,
+    pub text_tokens: Vec<u32>,
 }
 
-// ============================================================================
-// Per-batch-element state
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct ItemState {
-    batch_idx: usize,
-    step_idx: usize,
-    text_token: u32,
-    word_tokens: Vec<u32>,
-    unended_word: bool,
-    last_stop_time: f64,
-    audio_pad_token: u32,
-}
-
-impl ItemState {
-    fn reset(&mut self) {
-        self.step_idx = 0;
-        self.text_token = 0;
-        self.word_tokens.clear();
-        self.unended_word = false;
-        self.last_stop_time = 0.;
+mod item_state {
+    use super::*;
+    #[derive(Debug, Clone)]
+    pub struct ItemState {
+        batch_idx: usize,
+        step_idx: usize,
+        text_token: u32,
+        word_tokens: Vec<u32>,
+        unended_word: bool,
+        last_stop_time: f64,
     }
 
-    pub fn text_token(&self) -> u32 {
-        self.text_token
-    }
+    impl ItemState {
+        pub fn new(batch_idx: usize, text_token: u32) -> Self {
+            Self {
+                batch_idx,
+                step_idx: 0,
+                text_token,
+                word_tokens: vec![],
+                unended_word: false,
+                last_stop_time: 0.,
+            }
+        }
 
-    pub fn is_first_step(&self) -> bool {
-        self.step_idx == 0
-    }
+        pub fn reset(&mut self) {
+            self.step_idx = 0;
+            self.text_token = 0;
+            self.word_tokens.clear();
+            self.unended_word = false;
+            self.last_stop_time = 0.;
+        }
 
-    pub fn flush_tokens(&mut self) -> Option<AsrWord> {
-        if !self.word_tokens.is_empty() {
-            let mut tokens = vec![];
-            std::mem::swap(&mut self.word_tokens, &mut tokens);
-            let word = AsrWord::Word {
-                tokens,
-                start_time: self.last_stop_time,
-                batch_idx: self.batch_idx,
-            };
-            self.unended_word = true;
-            Some(word)
-        } else {
-            None
+        pub fn text_token(&self) -> u32 {
+            self.text_token
+        }
+
+        pub fn is_first_step(&self) -> bool {
+            self.step_idx == 0
+        }
+
+        pub fn flush_tokens(&mut self) -> Option<AsrWord> {
+            if !self.word_tokens.is_empty() {
+                let mut tokens = vec![];
+                std::mem::swap(&mut self.word_tokens, &mut tokens);
+                let word = AsrWord::Word {
+                    tokens,
+                    start_time: self.last_stop_time,
+                    batch_idx: self.batch_idx,
+                };
+                self.unended_word = true;
+                Some(word)
+            } else {
+                None
+            }
+        }
+
+        pub fn on_text_token(
+            &mut self,
+            text_token: u32,
+            asr_delay_in_tokens: usize,
+            words: &mut Vec<AsrWord>,
+        ) {
+            self.text_token = text_token;
+            self.step_idx += 1;
+            if self.step_idx >= asr_delay_in_tokens {
+                if text_token == TOKEN_PAD
+                    || text_token == TOKEN_EOP
+                    || text_token == TOKEN_SILENCE_PAD
+                {
+                    if let Some(word) = self.flush_tokens() {
+                        words.push(word)
+                    }
+                } else {
+                    self.word_tokens.push(self.text_token);
+                }
+                if self.text_token == TOKEN_EOP {
+                    let stop_time = (self.step_idx - asr_delay_in_tokens) as f64 / 12.5;
+                    if self.unended_word {
+                        self.unended_word = false;
+                        words.push(AsrWord::EndWord { stop_time, batch_idx: self.batch_idx });
+                    }
+                    self.last_stop_time = stop_time;
+                }
+            }
         }
     }
 }
+use item_state::ItemState;
 
 // ============================================================================
 // ASR State
@@ -130,18 +173,8 @@ impl<Q: BackendQ> Asr<Q> {
 
     pub fn init_state(&self, batch_size: usize) -> Result<AsrState<Q>> {
         let text_start_token = self.lm.text_start_token();
-        let audio_pad_token = self.lm.audio_pad_token();
-        let batch = (0..batch_size)
-            .map(|batch_idx| ItemState {
-                batch_idx,
-                text_token: text_start_token,
-                word_tokens: vec![],
-                unended_word: false,
-                step_idx: 0,
-                last_stop_time: 0.,
-                audio_pad_token,
-            })
-            .collect();
+        let batch =
+            (0..batch_size).map(|batch_idx| ItemState::new(batch_idx, text_start_token)).collect();
         let temperature =
             Tensor::full(self.default_temperature as f32, (batch_size, 1), self.device())?;
         let condition = match self.default_condition.as_ref() {
@@ -351,8 +384,7 @@ impl<Q: BackendQ> AsrState<Q> {
     where
         F: Fn(&[ItemState], &[u32], &[Vec<u32>]),
     {
-        let dims = audio_tokens.dims();
-        let (batch_size, codebooks, steps) = (dims[0], dims[1], dims[2]);
+        let (batch_size, codebooks, steps) = audio_tokens.dims3()?;
         if batch_size != self.batch.len() {
             xn::bail!("batch size mismatch: {batch_size} != {}", self.batch.len());
         }
@@ -364,7 +396,7 @@ impl<Q: BackendQ> AsrState<Q> {
         let mut step_results = vec![];
         for step in 0..steps {
             // Extract tokens for this step: audio_tokens[:, :, step]
-            let audio_tokens_step: Vec<Vec<u32>> = (0..batch_size)
+            let audio_tokens: Vec<Vec<u32>> = (0..batch_size)
                 .map(|b| {
                     (0..codebooks)
                         .map(|cb| {
@@ -377,7 +409,7 @@ impl<Q: BackendQ> AsrState<Q> {
             // Build per-codebook token vectors with next_token logic
             let audio_ids: Vec<Vec<u32>> = (0..codebooks)
                 .map(|codebook_idx| {
-                    audio_tokens_step
+                    audio_tokens
                         .iter()
                         .zip(self.batch.iter_mut())
                         .enumerate()
@@ -388,7 +420,7 @@ impl<Q: BackendQ> AsrState<Q> {
                                 // The first slice is dropped and replace with pad tokens. Note
                                 // that we do not shift the audio slices and just discard this
                                 // first slice.
-                                item.audio_pad_token
+                                self.model.lm.audio_pad_token()
                             } else {
                                 tokens[codebook_idx]
                             }
@@ -442,32 +474,9 @@ impl<Q: BackendQ> AsrState<Q> {
                 if !mask.is_active(batch_idx) {
                     continue;
                 }
-                let text_token = text_token as u32;
-                item.text_token = text_token;
-                item.step_idx += 1;
-                if item.step_idx >= self.model.asr_delay_in_tokens {
-                    if text_token == TOKEN_PAD
-                        || text_token == TOKEN_EOP
-                        || text_token == TOKEN_SILENCE_PAD
-                    {
-                        if let Some(word) = item.flush_tokens() {
-                            words.push(word)
-                        }
-                    } else {
-                        item.word_tokens.push(item.text_token);
-                    }
-                    if item.text_token == TOKEN_EOP {
-                        let stop_time =
-                            (item.step_idx - self.model.asr_delay_in_tokens) as f64 / 12.5;
-                        if item.unended_word {
-                            item.unended_word = false;
-                            words.push(AsrWord::EndWord { stop_time, batch_idx });
-                        }
-                        item.last_stop_time = stop_time;
-                    }
-                }
+                item.on_text_token(text_token as u32, self.model.asr_delay_in_tokens, &mut words);
             }
-            let step_result = StepResult { words, prs };
+            let step_result = StepResult { words, prs, audio_tokens, text_tokens };
             step_results.push(step_result);
         }
         Ok(step_results)
