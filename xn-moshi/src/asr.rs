@@ -10,6 +10,11 @@ const TOKEN_EOP: u32 = 0;
 const TOKEN_PAD: u32 = 3;
 const TOKEN_SILENCE_PAD: u32 = 4;
 
+pub trait TokenBooster: 'static + Send + Sync {
+    fn on_text_token(&mut self, text_token: u32);
+    fn text_biases(&self) -> Vec<(u32, f32)>;
+}
+
 // ============================================================================
 // Messages
 // ============================================================================
@@ -39,7 +44,6 @@ pub struct StepResult {
 
 mod item_state {
     use super::*;
-    #[derive(Debug, Clone)]
     pub struct ItemState {
         batch_idx: usize,
         step_idx: usize,
@@ -47,6 +51,7 @@ mod item_state {
         word_tokens: Vec<u32>,
         unended_word: bool,
         last_stop_time: f64,
+        token_booster: Option<Box<dyn TokenBooster>>,
     }
 
     impl ItemState {
@@ -58,15 +63,17 @@ mod item_state {
                 word_tokens: vec![],
                 unended_word: false,
                 last_stop_time: 0.,
+                token_booster: None,
             }
         }
 
-        pub fn reset(&mut self) {
+        pub fn reset(&mut self, token_booster: Option<Box<dyn TokenBooster>>) {
             self.step_idx = 0;
             self.text_token = 0;
             self.word_tokens.clear();
             self.unended_word = false;
             self.last_stop_time = 0.;
+            self.token_booster = token_booster;
         }
 
         pub fn text_token(&self) -> u32 {
@@ -102,6 +109,9 @@ mod item_state {
             self.text_token = text_token;
             self.step_idx += 1;
             if self.step_idx >= asr_delay_in_tokens {
+                if let Some(tb) = self.token_booster.as_mut() {
+                    tb.on_text_token(text_token);
+                }
                 if text_token == TOKEN_PAD
                     || text_token == TOKEN_EOP
                     || text_token == TOKEN_SILENCE_PAD
@@ -122,13 +132,23 @@ mod item_state {
                 }
             }
         }
+
+        pub fn with_text_bias(&self) -> bool {
+            self.token_booster.is_some()
+        }
+
+        pub fn text_biases(&self, asr_delay_in_tokens: usize) -> Vec<(u32, f32)> {
+            if self.step_idx < asr_delay_in_tokens {
+                return vec![];
+            }
+            match &self.token_booster {
+                None => vec![],
+                Some(tb) => tb.text_biases(),
+            }
+        }
     }
 }
 use item_state::ItemState;
-
-// ============================================================================
-// ASR State
-// ============================================================================
 
 pub struct AsrState<Q: BackendQ> {
     model: Asr<Q>,
@@ -313,7 +333,7 @@ impl<Q: BackendQ> AsrState<Q> {
     }
 
     pub fn reset_state(&mut self) -> Result<()> {
-        self.batch.iter_mut().for_each(|s| s.reset());
+        self.batch.iter_mut().for_each(|s| s.reset(None));
         self.model_step_idx = 0;
         let batch_size = self.batch.len();
         self.lm = self.model.lm.init_state(batch_size)?;
@@ -372,6 +392,26 @@ impl<Q: BackendQ> AsrState<Q> {
             .iter()
             .map(|s| if s.is_first_step() { text_start_token } else { s.text_token() })
             .collect()
+    }
+
+    fn text_bias(&self, asr_delay_in_tokens: usize) -> Result<Option<Tensor<Q::T, Q::B>>> {
+        let with_text_bias = self.batch.iter().any(|s| s.with_text_bias());
+        if !with_text_bias {
+            return Ok(None);
+        }
+        let batch_size = self.batch.len();
+        let vocab_size = self.model.lm.text_out_vocab_size();
+        let mut bias = vec![Q::T::from_f32(0.0); batch_size * vocab_size];
+        for (batch_idx, item) in self.batch.iter().enumerate() {
+            for (token_id, token_bias) in item.text_biases(asr_delay_in_tokens) {
+                let token_id = token_id as usize;
+                if token_id < vocab_size {
+                    bias[batch_idx * vocab_size + token_id] = Q::T::from_f32(token_bias);
+                }
+            }
+        }
+        let bias = Tensor::from_vec(bias, (batch_size, vocab_size), self.device())?;
+        Ok(Some(bias))
     }
 
     /// Process audio tokens (shape: batch, codebooks, steps as i64) and return ASR messages.
@@ -443,8 +483,10 @@ impl<Q: BackendQ> AsrState<Q> {
                 mask,
                 self.condition.as_ref(),
             )?;
-
             self.model_step_idx += 1;
+            // We compute self.text_bias as early as possible so that the CPU
+            // computations take place while the cuda async computations are running.
+            let text_bias = self.text_bias(self.model.asr_delay_in_tokens)?;
 
             // Extra heads
             let extra_heads = self.lm.extra_heads(&transformer_out)?;
@@ -466,6 +508,11 @@ impl<Q: BackendQ> AsrState<Q> {
             // text_logits shape: (batch, 1, text_out_vocab_size)
             let (batch_size, _one, vocab_size) = text_logits.dims3()?;
             let logits_2d = text_logits.reshape((batch_size, vocab_size))?;
+            let logits_2d = if let Some(text_bias) = text_bias.as_ref() {
+                logits_2d.add(text_bias)?
+            } else {
+                logits_2d
+            };
             let sampled_tokens = gumbel_max(&logits_2d, &self.temperature)?;
             let mut words = vec![];
             for (batch_idx, (text_token, item)) in
@@ -487,11 +534,12 @@ impl<Q: BackendQ> AsrState<Q> {
         batch_idx: usize,
         temp: Option<f64>,
         cond: Option<&Tensor<Q::T, Q::B>>,
+        token_booster: Option<Box<dyn TokenBooster>>,
     ) -> Result<()> {
         if batch_idx >= self.batch.len() {
             xn::bail!("batch index out of range: {batch_idx} >= {}", self.batch.len());
         }
-        self.batch[batch_idx].reset();
+        self.batch[batch_idx].reset(token_booster);
         self.lm.reset_batch_idx(batch_idx)?;
         self.audio_tokenizer.reset_batch_idx(batch_idx)?;
         let temp = temp.unwrap_or(self.model.default_temperature) as f32;

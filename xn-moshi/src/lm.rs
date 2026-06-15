@@ -137,6 +137,7 @@ pub struct LmModel<Q: BackendQ> {
     extra_heads: Vec<xn::nn::Linear<Q::T, Q::B>>, // each (dim, d_model)
     audio_vocab_size: usize,
     text_in_vocab_size: usize,
+    text_out_vocab_size: usize,
 }
 
 impl<Q: BackendQ> LmModel<Q> {
@@ -175,6 +176,7 @@ impl<Q: BackendQ> LmModel<Q> {
             extra_heads,
             audio_vocab_size: cfg.audio_vocab_size,
             text_in_vocab_size: cfg.text_in_vocab_size,
+            text_out_vocab_size: cfg.text_out_vocab_size,
         })
     }
 
@@ -188,6 +190,10 @@ impl<Q: BackendQ> LmModel<Q> {
 
     pub fn text_start_token(&self) -> u32 {
         self.text_in_vocab_size as u32 - 1
+    }
+
+    pub fn text_out_vocab_size(&self) -> usize {
+        self.text_out_vocab_size
     }
 
     pub fn in_audio_codebooks(&self) -> usize {
