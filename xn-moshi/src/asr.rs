@@ -1,12 +1,11 @@
 use crate::conditioners::Conditioners;
 use crate::lm::{LmModel, LmState};
 use crate::mimi::{Mimi, MimiEncodeState};
-use crate::moshi;
-use crate::sampling::gumbel_max;
 use xn::streaming::{StreamMask, StreamTensor};
 use xn::{BackendQ, Result, Tensor, WithDTypeF};
 
 const TOKEN_EOP: u32 = 0;
+const TOKEN_EOS: u32 = 2;
 const TOKEN_PAD: u32 = 3;
 const TOKEN_SILENCE_PAD: u32 = 4;
 
@@ -23,12 +22,15 @@ pub trait TokenBooster: 'static + Send + Sync {
 pub enum AsrWord {
     Word { tokens: Vec<u32>, start_time: f64, batch_idx: usize },
     EndWord { stop_time: f64, batch_idx: usize },
+    EndOfStream { batch_idx: usize },
 }
 
 impl AsrWord {
     pub fn batch_idx(&self) -> usize {
         match self {
-            AsrWord::Word { batch_idx, .. } | AsrWord::EndWord { batch_idx, .. } => *batch_idx,
+            AsrWord::Word { batch_idx, .. }
+            | AsrWord::EndWord { batch_idx, .. }
+            | AsrWord::EndOfStream { batch_idx, .. } => *batch_idx,
         }
     }
 }
@@ -52,6 +54,7 @@ mod item_state {
         unended_word: bool,
         last_stop_time: f64,
         token_booster: Option<Box<dyn TokenBooster>>,
+        use_audio_pad_on_step_idx: Option<usize>,
     }
 
     impl ItemState {
@@ -64,6 +67,7 @@ mod item_state {
                 unended_word: false,
                 last_stop_time: 0.,
                 token_booster: None,
+                use_audio_pad_on_step_idx: None,
             }
         }
 
@@ -74,6 +78,7 @@ mod item_state {
             self.unended_word = false;
             self.last_stop_time = 0.;
             self.token_booster = token_booster;
+            self.use_audio_pad_on_step_idx = None;
         }
 
         pub fn text_token(&self) -> u32 {
@@ -100,6 +105,15 @@ mod item_state {
             }
         }
 
+        // Some models are trained with an explicit end-of-stream set of audio pad tokens.
+        pub fn on_explicit_audio_eos(&mut self) {
+            self.use_audio_pad_on_step_idx = Some(self.step_idx);
+        }
+
+        pub fn use_audio_pad(&self) -> bool {
+            self.use_audio_pad_on_step_idx.is_some_and(|i| i == self.step_idx)
+        }
+
         pub fn on_text_token(
             &mut self,
             text_token: u32,
@@ -114,6 +128,7 @@ mod item_state {
                 }
                 if text_token == TOKEN_PAD
                     || text_token == TOKEN_EOP
+                    || text_token == TOKEN_EOS
                     || text_token == TOKEN_SILENCE_PAD
                 {
                     if let Some(word) = self.flush_tokens() {
@@ -122,13 +137,16 @@ mod item_state {
                 } else {
                     self.word_tokens.push(self.text_token);
                 }
-                if self.text_token == TOKEN_EOP {
+                if self.text_token == TOKEN_EOP || self.text_token == TOKEN_EOS {
                     let stop_time = (self.step_idx - asr_delay_in_tokens) as f64 / 12.5;
                     if self.unended_word {
                         self.unended_word = false;
                         words.push(AsrWord::EndWord { stop_time, batch_idx: self.batch_idx });
                     }
                     self.last_stop_time = stop_time;
+                }
+                if self.text_token == TOKEN_EOS {
+                    words.push(AsrWord::EndOfStream { batch_idx: self.batch_idx });
                 }
             }
         }
@@ -273,7 +291,7 @@ impl<Q: BackendQ> Asr<Q> {
             Some(c) => {
                 let c = std::fs::read_to_string(c)
                     .map_err(|e| xn::Error::Msg(format!("reading config {c}: {e}")))?;
-                let config = serde_json::from_str::<moshi::Config>(&c)
+                let config = serde_json::from_str::<crate::moshi::Config>(&c)
                     .map_err(|e| xn::Error::Msg(format!("parsing config: {e}")))?;
                 Some(config)
             }
@@ -445,19 +463,18 @@ impl<Q: BackendQ> AsrState<Q> {
                         .collect()
                 })
                 .collect();
-
             // Build per-codebook token vectors with next_token logic
             let audio_ids: Vec<Vec<u32>> = (0..codebooks)
                 .map(|codebook_idx| {
                     audio_tokens
                         .iter()
-                        .zip(self.batch.iter_mut())
+                        .zip(self.batch.iter())
                         .enumerate()
                         .map(|(batch_idx, (tokens, item))| {
                             if !mask.is_active(batch_idx) {
                                 0u32
-                            } else if item.is_first_step() {
-                                // The first slice is dropped and replace with pad tokens. Note
+                            } else if item.is_first_step() || item.use_audio_pad() {
+                                // The first slice is dropped and replaced with pad tokens. Note
                                 // that we do not shift the audio slices and just discard this
                                 // first slice.
                                 self.model.lm.audio_pad_token()
@@ -513,7 +530,7 @@ impl<Q: BackendQ> AsrState<Q> {
             } else {
                 logits_2d
             };
-            let sampled_tokens = gumbel_max(&logits_2d, &self.temperature)?;
+            let sampled_tokens = crate::sampling::gumbel_max(&logits_2d, &self.temperature)?;
             let mut words = vec![];
             for (batch_idx, (text_token, item)) in
                 sampled_tokens.to_vec()?.into_iter().zip(self.batch.iter_mut()).enumerate()
@@ -521,6 +538,7 @@ impl<Q: BackendQ> AsrState<Q> {
                 if !mask.is_active(batch_idx) {
                     continue;
                 }
+                // item.step_idx is incremented in on_text_token.
                 item.on_text_token(text_token as u32, self.model.asr_delay_in_tokens, &mut words);
             }
             let step_result = StepResult { words, prs, audio_tokens, text_tokens };
@@ -554,6 +572,14 @@ impl<Q: BackendQ> AsrState<Q> {
         {
             batch_cond.slice_set(c, 0, batch_idx)?;
         }
+        Ok(())
+    }
+
+    pub fn explicit_audio_eos_for_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+        if batch_idx >= self.batch.len() {
+            xn::bail!("batch index out of range: {batch_idx} >= {}", self.batch.len());
+        }
+        self.batch[batch_idx].on_explicit_audio_eos();
         Ok(())
     }
 }
