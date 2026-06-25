@@ -47,6 +47,7 @@ pub struct Config {
     pub audio_card: usize,
     pub text_card_out: usize,
     pub conditioners: Vec<ConditionerConfig>,
+    pub max_speakers: usize,
 }
 
 pub struct DepformerSlice<Q: BackendQ> {
@@ -68,10 +69,10 @@ pub struct Model<Q: BackendQ> {
     audio_delays: Vec<usize>,
     speaker_wavs_output_proj: Q::LinearQ,
     speaker_wavs_learnt_padding: Tensor<Q::T, Q::B>,
-    #[allow(dead_code)]
     conditioners: crate::conditioners::Conditioners<Q::T, Q::B>,
     #[allow(dead_code)]
     default_conditions: Option<Tensor<Q::T, Q::B>>,
+    max_speakers: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +97,7 @@ pub struct State<Q: BackendQ> {
     pub model: std::sync::Arc<Model<Q>>,
     pub transformer: crate::transformer::BatchedTransformerState<Q::T, Q::B>,
     pub temperature: Tensor<f32, Q::B>,
+    pub default_temperature: f32,
     per_batch: Vec<PerBatch>,
 }
 
@@ -243,6 +245,7 @@ impl<Q: BackendQ> Model<Q> {
             default_conditions,
             speaker_wavs_output_proj,
             speaker_wavs_learnt_padding,
+            max_speakers: cfg.max_speakers,
         })
     }
 
@@ -254,9 +257,15 @@ impl<Q: BackendQ> Model<Q> {
         let speaker_wavs = speaker_wavs.t()?.contiguous()?;
         let projected = self.speaker_wavs_output_proj.forward(&speaker_wavs)?;
         let (_b, embs, dim) = projected.dims3()?;
-        let learnt_padding =
-            self.speaker_wavs_learnt_padding.expand((1, 2 * embs, dim))?.contiguous()?;
-        let projected = Tensor::cat(&[&projected, &learnt_padding], 1)?;
+        let projected = if self.max_speakers > 1 {
+            let learnt_padding = self
+                .speaker_wavs_learnt_padding
+                .expand((1, (self.max_speakers - 1) * embs, dim))?
+                .contiguous()?;
+            Tensor::cat(&[&projected, &learnt_padding], 1)?
+        } else {
+            projected
+        };
         let projected = add_sin_embeddings(&projected)?;
         Ok(projected)
     }
@@ -271,15 +280,16 @@ impl<Q: BackendQ> Model<Q> {
     pub fn init_state(
         self: &std::sync::Arc<Self>,
         batch_size: usize,
-        temperature: f32,
+        default_temperature: f32,
     ) -> Result<State<Q>> {
         let temperature: Tensor<f32, Q::B> =
-            Tensor::full(temperature, (batch_size, 1), self.device())?;
+            Tensor::full(default_temperature, (batch_size, 1), self.device())?;
         let n_slices = self.depformer.len();
         Ok(State {
             model: self.clone(),
             transformer: self.transformer.init_state(batch_size)?,
             temperature,
+            default_temperature,
             per_batch: vec![PerBatch::new(n_slices); batch_size],
         })
     }
@@ -302,10 +312,13 @@ impl<Q: BackendQ> State<Q> {
         self.model.n_slices()
     }
 
-    pub fn reset_batch_idx(&mut self, batch_idx: usize) -> Result<()> {
+    pub fn reset_batch_idx(&mut self, batch_idx: usize, temp: Option<f32>) -> Result<()> {
         if batch_idx >= self.batch_size() {
             xn::bail!("batch_idx out of bounds");
         }
+        let temp = temp.unwrap_or(self.default_temperature);
+        let temp = Tensor::full(temp, (1, 1), self.device())?;
+        self.temperature.slice_set(&temp, 0, batch_idx)?;
         self.transformer.reset_batch_idx(batch_idx)?;
         self.per_batch[batch_idx].reset();
         Ok(())
