@@ -190,6 +190,45 @@ fn test_index_select_narrowed_indices_impl<B: Backend>(dev: &B) -> Result<()> {
 }
 test_both_backends!(test_index_select_narrowed_indices, test_index_select_narrowed_indices_impl);
 
+/// An index of -1 should select a row of zeros rather than reading from the source.
+/// Generic over the float dtype so the same checks run for f32/f16/bf16 on every backend.
+fn test_index_select_minus_one_dtype<T: xn::WithDTypeF, B: Backend>(dev: &B) -> Result<()> {
+    let f = T::from_f32;
+    // 4x3 tensor of rows 1..=12.
+    let data: Vec<T> = (1..=12).map(|x| f(x as f32)).collect();
+    let a: Tensor<T, B> = Tensor::from_vec(data, (4, 3), dev)?;
+
+    // dim 0: select rows [2, -1, 0]; the -1 row must be all zeros.
+    let idx = Tensor::from_vec(vec![2i64, -1, 0], 3, dev)?;
+    let b = a.index_select(&idx, 0)?;
+    assert_eq!(b.dims(), &[3, 3]);
+    let got: Vec<f32> = b.to_vec()?.into_iter().map(<T as xn::WithDTypeF>::to_f32).collect();
+    assert_eq!(got, vec![7., 8., 9., 0., 0., 0., 1., 2., 3.]);
+
+    // dim 1: select columns [-1, 1, -1]; the -1 columns must be zeros.
+    let idx = Tensor::from_vec(vec![-1i64, 1, -1], 3, dev)?;
+    let c = a.index_select(&idx, 1)?;
+    assert_eq!(c.dims(), &[4, 3]);
+    let got: Vec<f32> = c.to_vec()?.into_iter().map(<T as xn::WithDTypeF>::to_f32).collect();
+    assert_eq!(got, vec![0., 2., 0., 0., 5., 0., 0., 8., 0., 0., 11., 0.]);
+
+    // All indices -1 -> all zeros.
+    let idx = Tensor::from_vec(vec![-1i64, -1], 2, dev)?;
+    let d = a.index_select(&idx, 0)?;
+    assert_eq!(d.dims(), &[2, 3]);
+    let got: Vec<f32> = d.to_vec()?.into_iter().map(<T as xn::WithDTypeF>::to_f32).collect();
+    assert_eq!(got, vec![0.; 6]);
+    Ok(())
+}
+
+fn test_index_select_minus_one_impl<B: Backend>(dev: &B) -> Result<()> {
+    test_index_select_minus_one_dtype::<f32, B>(dev)?;
+    test_index_select_minus_one_dtype::<half::f16, B>(dev)?;
+    test_index_select_minus_one_dtype::<half::bf16, B>(dev)?;
+    Ok(())
+}
+test_both_backends!(test_index_select_minus_one, test_index_select_minus_one_impl);
+
 // =============================================================================
 // Reduce tests
 // =============================================================================

@@ -738,10 +738,15 @@ impl crate::Backend for crate::CpuDevice {
 
         for left in 0..left_size {
             for (i, &idx) in ids.iter().enumerate().take(num_ids) {
-                let src_offset = left * src_dim_size * right_size + idx as usize * right_size;
                 let dst_offset = left * num_ids * right_size + i * right_size;
-                dst[dst_offset..dst_offset + right_size]
-                    .copy_from_slice(&src[src_offset..src_offset + right_size]);
+                if idx == -1 {
+                    // An index of -1 selects zeros rather than a row of the source.
+                    dst[dst_offset..dst_offset + right_size].fill(<T as num_traits::Zero>::zero());
+                } else {
+                    let src_offset = left * src_dim_size * right_size + idx as usize * right_size;
+                    dst[dst_offset..dst_offset + right_size]
+                        .copy_from_slice(&src[src_offset..src_offset + right_size]);
+                }
             }
         }
         Ok(())

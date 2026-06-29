@@ -16,8 +16,14 @@ __device__ void index_select(
     if (i >= numel || j >= dim) {
       return;
     }
-    assert(ids[i] >= 0 && ids[i] < src_dim_size);
-    dst[i * dim + j] = src[ids[i] * dim + j];
+    I idx = ids[i];
+    if (idx == -1) {
+      // An index of -1 selects zeros rather than a row of the source.
+      dst[i * dim + j] = static_cast<T>(0.0f);
+      return;
+    }
+    assert(idx >= 0 && idx < src_dim_size);
+    dst[i * dim + j] = src[idx * dim + j];
 }
 
 #define IS_OP(TYPENAME, INDEX_TYPENAME, FN_NAME) \
