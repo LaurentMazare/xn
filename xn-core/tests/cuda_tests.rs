@@ -664,6 +664,56 @@ fn test_index_select_3d() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_index_select_minus_one_f32() -> Result<()> {
+    let device = get_device();
+    // Shape [4, 3], rows 1..=12.
+    let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+    let a: Tensor<f32, Device> = Tensor::from_vec(data, vec![4, 3], &device)?;
+
+    // -1 selects a row of zeros on dim 0.
+    let indices = Tensor::from_vec(vec![2i64, -1, 0], 3, &device)?;
+    let selected = a.index_select(&indices, 0)?;
+    assert_eq!(selected.dims(), &[3, 3]);
+    assert_eq!(selected.to_vec()?, vec![7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+
+    // -1 selects zeros on dim 1 as well.
+    let indices = Tensor::from_vec(vec![-1i64, 1, -1], 3, &device)?;
+    let selected = a.index_select(&indices, 1)?;
+    assert_eq!(selected.dims(), &[4, 3]);
+    assert_eq!(
+        selected.to_vec()?,
+        vec![0.0, 2.0, 0.0, 0.0, 5.0, 0.0, 0.0, 8.0, 0.0, 0.0, 11.0, 0.0]
+    );
+    Ok(())
+}
+
+#[test]
+fn test_index_select_minus_one_f16() -> Result<()> {
+    let device = get_device();
+    let data: Vec<half::f16> = (1..=12).map(|x| half::f16::from_f32(x as f32)).collect();
+    let a: Tensor<half::f16, Device> = Tensor::from_vec(data, vec![4, 3], &device)?;
+
+    let indices = Tensor::from_vec(vec![2i64, -1, 0], 3, &device)?;
+    let selected = a.index_select(&indices, 0)?;
+    let got: Vec<f32> = selected.to_vec()?.into_iter().map(|v| v.to_f32()).collect();
+    assert_eq!(got, vec![7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+    Ok(())
+}
+
+#[test]
+fn test_index_select_minus_one_bf16() -> Result<()> {
+    let device = get_device();
+    let data: Vec<half::bf16> = (1..=12).map(|x| half::bf16::from_f32(x as f32)).collect();
+    let a: Tensor<half::bf16, Device> = Tensor::from_vec(data, vec![4, 3], &device)?;
+
+    let indices = Tensor::from_vec(vec![2i64, -1, 0], 3, &device)?;
+    let selected = a.index_select(&indices, 0)?;
+    let got: Vec<f32> = selected.to_vec()?.into_iter().map(|v| v.to_f32()).collect();
+    assert_eq!(got, vec![7.0, 8.0, 9.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+    Ok(())
+}
+
 // =============================================================================
 // Narrow and Cat operations (use copy2d internally)
 // =============================================================================
