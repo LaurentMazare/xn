@@ -2,6 +2,7 @@
 mod accelerate;
 
 pub mod backend;
+pub mod convert;
 pub mod cpu_backend;
 pub mod display;
 pub mod dtype;
