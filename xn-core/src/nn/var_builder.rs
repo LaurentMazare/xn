@@ -10,8 +10,13 @@ impl MmapedFiles {
         let mut mmaps = Vec::new();
         for path in file_paths {
             let path = path.as_ref();
-            let file = std::fs::File::open(path)?;
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+            let file =
+                std::fs::File::open(path).map_err(|e| crate::Error::from(e).with_path(path))?;
+            let mmap = unsafe {
+                memmap2::MmapOptions::new()
+                    .map(&file)
+                    .map_err(|e| crate::Error::from(e).with_path(path))?
+            };
             mmaps.push((path.to_path_buf(), mmap));
         }
         Ok(Self { mmaps })
@@ -41,8 +46,9 @@ fn load_tensor_data_with_key_map(
     key_map: impl Fn(&str) -> Option<String>,
 ) -> Result<std::collections::HashMap<String, TensorData<'_>>> {
     let mut tensor_data = std::collections::HashMap::new();
-    for (_path, mmap) in mmaps.mmaps.iter() {
-        let tensors = safetensors::SafeTensors::deserialize(mmap)?;
+    for (path, mmap) in mmaps.mmaps.iter() {
+        let tensors = safetensors::SafeTensors::deserialize(mmap)
+            .map_err(|e| crate::Error::from(e).with_path(path))?;
         for (name, tensor) in tensors.iter() {
             let mapped_name = match key_map(name) {
                 Some(n) => n,
