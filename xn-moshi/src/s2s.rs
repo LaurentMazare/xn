@@ -96,6 +96,10 @@ impl PerBatch {
 pub struct State<Q: BackendQ> {
     pub model: std::sync::Arc<Model<Q>>,
     pub transformer: crate::transformer::BatchedTransformerState<Q::T, Q::B>,
+    /// Per-layer cross-attention keys/values (one `CaSrc::KeysValues` per layer),
+    /// computed once from the (constant) cross-attention source on the first
+    /// forward pass and reused afterwards.
+    cross_kv: Option<Vec<CaSrc<Q>>>,
     pub temperature: Tensor<f32, Q::B>,
     pub default_temperature: f32,
     per_batch: Vec<PerBatch>,
@@ -181,7 +185,7 @@ impl<Q: BackendQ> Model<Q> {
             let emb = LowRankEmbeddings::load(
                 &df_vb.pp("emb"),
                 in_vocab_size + 1,
-                cfg.transformer.d_model,
+                cfg.depformer.dim,
                 cfg.depformer.low_rank_embeddings,
             )?;
             let linear_in =
@@ -288,6 +292,7 @@ impl<Q: BackendQ> Model<Q> {
         Ok(State {
             model: self.clone(),
             transformer: self.transformer.init_state(batch_size)?,
+            cross_kv: None,
             temperature,
             default_temperature,
             per_batch: vec![PerBatch::new(n_slices); batch_size],
@@ -300,6 +305,10 @@ impl<Q: BackendQ> Model<Q> {
 
     pub fn n_slices(&self) -> usize {
         self.depformer.len()
+    }
+
+    pub fn max_speakers(&self) -> usize {
+        self.max_speakers
     }
 }
 
@@ -321,6 +330,10 @@ impl<Q: BackendQ> State<Q> {
         self.temperature.slice_set(&temp, 0, batch_idx)?;
         self.transformer.reset_batch_idx(batch_idx)?;
         self.per_batch[batch_idx].reset();
+        // The cross-attention source may change when a batch slot is reused for a
+        // new voice, so drop the cached keys/values; they are recomputed lazily
+        // from the current source on the next forward pass.
+        self.cross_kv = None;
         Ok(())
     }
 
@@ -344,6 +357,10 @@ impl<Q: BackendQ> State<Q> {
         condition_sum: Option<&Tensor<Q::T, Q::B>>,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
         use xn::ModuleT;
+        // Project the (constant) cross-attention source once, then reuse.
+        if self.cross_kv.is_none() {
+            self.cross_kv = Some(self.model.transformer.compute_cross_kv(ca_src)?);
+        }
         let model = &self.model;
         let device = model.device();
         let d_model = model.text_emb.hidden_size();
@@ -359,7 +376,8 @@ impl<Q: BackendQ> State<Q> {
             None => emb,
             Some(cond) => emb.broadcast_add(cond)?,
         };
-        let ys = model.transformer.forward(&emb, ca_src, &mut self.transformer, mask)?;
+        let cross_kv = self.cross_kv.as_ref().expect("cross_kv computed above");
+        let ys = model.transformer.forward(&emb, cross_kv, &mut self.transformer, mask)?;
         let ys = model.out_norm.forward(&ys)?;
         let logits = model.text_linear.forward(&ys)?;
         Ok((logits, ys))

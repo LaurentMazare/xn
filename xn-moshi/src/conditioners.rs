@@ -159,11 +159,18 @@ pub struct SourceLevelConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TensorConfig {
+    pub dim: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConditionerConfig {
     Lut { lut: LutConfig },
     Continuous { continuous: ContinuousConfig },
     SourceLevel { source_level: SourceLevelConfig },
+    Tensor { tensor: TensorConfig },
+    OfficialText,
 }
 
 // This is not a full implementation of source level conditioning.
@@ -180,10 +187,38 @@ impl<T: WithDTypeF, B: Backend> SourceLevelConditioner<T, B> {
     }
 }
 
+pub struct OfficialTextConditioner<T: WithDTypeF, B: Backend> {
+    pub output_proj: Linear<T, B>,
+    pub learnt_padding: Tensor<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> OfficialTextConditioner<T, B> {
+    pub fn load(vb: &Path<B>, output_dim: usize) -> Result<Self> {
+        let output_proj = Linear::load(vb.pp("output_proj"), output_dim, output_dim)?;
+        let learnt_padding = vb.tensor("learnt_padding", (1, 1, output_dim))?;
+        Ok(Self { output_proj, learnt_padding })
+    }
+}
+
+pub struct TensorConditioner<T: WithDTypeF, B: Backend> {
+    pub output_proj: Linear<T, B>,
+    pub learnt_padding: Tensor<T, B>,
+}
+
+impl<T: WithDTypeF, B: Backend> TensorConditioner<T, B> {
+    pub fn load(vb: &Path<B>, output_dim: usize, cfg: &TensorConfig) -> Result<Self> {
+        let output_proj = Linear::load(vb.pp("output_proj"), cfg.dim, output_dim)?;
+        let learnt_padding = vb.tensor("learnt_padding", (1, 1, output_dim))?;
+        Ok(Self { output_proj, learnt_padding })
+    }
+}
+
 pub struct Conditioners<T: xn::WithDTypeF, B: xn::Backend> {
     pub lut: std::collections::HashMap<String, LUTConditioner<T, B>>,
     pub continuous: std::collections::HashMap<String, ContinuousConditioner<T, B>>,
     pub source_level: std::collections::HashMap<String, SourceLevelConditioner<T, B>>,
+    pub tensor: std::collections::HashMap<String, TensorConditioner<T, B>>,
+    pub official_text: std::collections::HashMap<String, OfficialTextConditioner<T, B>>,
 }
 
 pub enum Value {
@@ -267,10 +302,12 @@ pub fn load<T: xn::WithDTypeF, B: xn::Backend>(
     let mut lut = std::collections::HashMap::new();
     let mut continuous = std::collections::HashMap::new();
     let mut source_level = std::collections::HashMap::new();
+    let mut tensor = std::collections::HashMap::new();
+    let mut official_text = std::collections::HashMap::new();
     for (name, cond_config) in conditioner_configs {
         match cond_config {
             ConditionerConfig::Lut { lut: lut_cfg } => {
-                let conditioner = crate::conditioners::LUTConditioner::load(
+                let conditioner = LUTConditioner::load(
                     &vb.pp("condition_provider").pp("conditioners").pp(name),
                     None,
                     output_dim,
@@ -279,7 +316,7 @@ pub fn load<T: xn::WithDTypeF, B: xn::Backend>(
                 lut.insert(name.clone(), conditioner);
             }
             ConditionerConfig::Continuous { continuous: cont_cfg } => {
-                let conditioner = crate::conditioners::ContinuousConditioner::load(
+                let conditioner = ContinuousConditioner::load(
                     &vb.pp("condition_provider").pp("conditioners").pp(name),
                     cont_cfg.dim,
                     output_dim,
@@ -288,14 +325,29 @@ pub fn load<T: xn::WithDTypeF, B: xn::Backend>(
                 continuous.insert(name.clone(), conditioner);
             }
             ConditionerConfig::SourceLevel { source_level: cfg } => {
-                let conditioner = crate::conditioners::SourceLevelConditioner::load(
+                let conditioner = SourceLevelConditioner::load(
                     &vb.pp("condition_provider").pp("conditioners").pp(name),
                     output_dim,
                     cfg,
                 )?;
                 source_level.insert(name.clone(), conditioner);
             }
+            ConditionerConfig::Tensor { tensor: cfg } => {
+                let conditioner = TensorConditioner::load(
+                    &vb.pp("condition_provider").pp("conditioners").pp(name),
+                    output_dim,
+                    cfg,
+                )?;
+                tensor.insert(name.clone(), conditioner);
+            }
+            ConditionerConfig::OfficialText => {
+                let conditioner = OfficialTextConditioner::<T, B>::load(
+                    &vb.pp("condition_provider").pp("conditioners").pp(name),
+                    output_dim,
+                )?;
+                official_text.insert(name.clone(), conditioner);
+            }
         }
     }
-    Ok(Conditioners { lut, continuous, source_level })
+    Ok(Conditioners { lut, continuous, source_level, tensor, official_text })
 }

@@ -132,6 +132,10 @@ impl<Q: BackendQ> BatchedMultiheadCrossAttention<Q> {
             .transpose(1, 2)?
             .contiguous()?; // (b, h, t, d)
 
+        // For `CaSrc::KeysValues` this is a cheap passthrough; the projection is
+        // done once via `Transformer::compute_cross_kv` because the source is
+        // constant across timesteps (otherwise it would redo the same large GEMM
+        // on every layer at every step).
         let (k, v) = self.compute_kv(ca_src)?; // (b, h, k, d)
 
         let scale = Q::T::from_f32(1.0 / (self.head_dim as f32).sqrt());
@@ -292,10 +296,26 @@ impl<Q: BackendQ> Transformer<Q> {
         Ok(BatchedTransformerState { builder, kv_caches })
     }
 
+    /// Project the cross-attention source into one pre-computed
+    /// [`CaSrc::KeysValues`] per layer. The source (the speaker embeddings) is
+    /// constant across the whole generation, so its KV projection only needs to
+    /// run once; recomputing it inside every layer on every timestep was
+    /// previously the dominant cost of the main transformer (one large GEMM per
+    /// layer per step). Call once per generation and pass the result to
+    /// [`Self::forward`].
+    pub fn compute_cross_kv(&self, ca_src: &CaSrc<Q>) -> Result<Vec<CaSrc<Q>>> {
+        let mut per_layer = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (k, v) = layer.cross_attn.compute_kv(ca_src)?;
+            per_layer.push(CaSrc::KeysValues(k, v));
+        }
+        Ok(per_layer)
+    }
+
     pub fn forward(
         &self,
         xs: &Tensor<Q::T, Q::B>,
-        ca_src: &CaSrc<Q>,
+        cross_kv: &[CaSrc<Q>],
         state: &mut BatchedTransformerState<Q::T, Q::B>,
         mask: &StreamMask,
     ) -> Result<Tensor<Q::T, Q::B>> {
@@ -332,8 +352,13 @@ impl<Q: BackendQ> Transformer<Q> {
             PositionalEmbedding::Sin => xn::bail!("sin positional embedding is not supported"),
         };
 
-        for (layer, kv_cache) in self.layers.iter().zip(state.kv_caches.iter_mut()) {
-            xs = layer.forward(&xs, rope.as_ref(), kv_cache, &iam, ca_src)?;
+        if cross_kv.len() != self.layers.len() {
+            xn::bail!("cross_kv has {} entries, expected {}", cross_kv.len(), self.layers.len())
+        }
+        for ((layer, kv_cache), cross) in
+            self.layers.iter().zip(state.kv_caches.iter_mut()).zip(cross_kv.iter())
+        {
+            xs = layer.forward(&xs, rope.as_ref(), kv_cache, &iam, cross)?;
         }
         Ok(xs)
     }
