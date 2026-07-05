@@ -265,16 +265,17 @@ impl Device {
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
-        let pdevice = if let Ok(idx) = std::env::var("XN_VULKAN_DEVICE").unwrap_or_default().parse::<usize>() {
+        let pdevice = if let Ok(idx) =
+            std::env::var("XN_VULKAN_DEVICE").unwrap_or_default().parse::<usize>()
+        {
             pdevices.get(idx).copied().unwrap_or(ranked[0].2)
         } else {
             ranked.get(ordinal).map(|r| r.2).unwrap_or(ranked[0].2)
         };
 
         let props = unsafe { instance.get_physical_device_properties(pdevice) };
-        let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
+        let device_name =
+            unsafe { CStr::from_ptr(props.device_name.as_ptr()) }.to_string_lossy().into_owned();
 
         // Pick a queue family that supports compute.
         let qfams = unsafe { instance.get_physical_device_queue_family_properties(pdevice) };
@@ -329,8 +330,8 @@ impl Device {
         // Optional GPU profiling via timestamp queries (XN_VULKAN_PROFILE=1).
         let profile_requested =
             std::env::var("XN_VULKAN_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
-        let profile_enabled = profile_requested
-            && qfams[queue_family_index as usize].timestamp_valid_bits != 0;
+        let profile_enabled =
+            profile_requested && qfams[queue_family_index as usize].timestamp_valid_bits != 0;
         let timestamp_period = props.limits.timestamp_period as f64;
         let query_pool = if profile_enabled {
             let info = vk::QueryPoolCreateInfo::default()
@@ -365,8 +366,9 @@ impl Device {
                 .size(PUSH_CONSTANT_SIZE);
             let ranges = [pc_range];
             let sls = [set_layout];
-            let info =
-                vk::PipelineLayoutCreateInfo::default().set_layouts(&sls).push_constant_ranges(&ranges);
+            let info = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&sls)
+                .push_constant_ranges(&ranges);
             pipeline_layouts[n] = unsafe { device.create_pipeline_layout(&info, None) }
                 .map_err(vkerr("create_pipeline_layout"))?;
         }
@@ -374,15 +376,15 @@ impl Device {
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let command_pool =
-            unsafe { device.create_command_pool(&pool_info, None) }.map_err(vkerr("create_command_pool"))?;
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
+            .map_err(vkerr("create_command_pool"))?;
 
         let cb_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let command_buffer =
-            unsafe { device.allocate_command_buffers(&cb_info) }.map_err(vkerr("alloc_cmd_buffer"))?[0];
+        let command_buffer = unsafe { device.allocate_command_buffers(&cb_info) }
+            .map_err(vkerr("alloc_cmd_buffer"))?[0];
 
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
             .map_err(vkerr("create_fence"))?;
@@ -393,8 +395,8 @@ impl Device {
         let dp_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(MAX_SETS_PER_BATCH)
             .pool_sizes(&pool_sizes);
-        let descriptor_pool =
-            unsafe { device.create_descriptor_pool(&dp_info, None) }.map_err(vkerr("create_desc_pool"))?;
+        let descriptor_pool = unsafe { device.create_descriptor_pool(&dp_info, None) }
+            .map_err(vkerr("create_desc_pool"))?;
 
         let inner = DeviceInner {
             entry,
@@ -450,7 +452,10 @@ impl Device {
     /// the same size class when one is available. Returns the buffer, its
     /// memory, the persistently-mapped pointer, and the size class (needed to
     /// return the buffer to the pool on free).
-    fn alloc_buffer(&self, size_bytes: usize) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)> {
+    fn alloc_buffer(
+        &self,
+        size_bytes: usize,
+    ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)> {
         let class = size_class(size_bytes);
         {
             let mut pool = self.pool.lock().unwrap();
@@ -470,7 +475,8 @@ impl Device {
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { self.device.create_buffer(&info, None) }.map_err(vkerr("create_buffer"))?;
+        let buffer =
+            unsafe { self.device.create_buffer(&info, None) }.map_err(vkerr("create_buffer"))?;
         let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
 
         // Prefer the unified APU type (device-local + host-visible + coherent),
@@ -490,9 +496,12 @@ impl Device {
             }
         };
 
-        let alloc = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mem_type);
-        let memory = unsafe { self.device.allocate_memory(&alloc, None) }.map_err(vkerr("allocate_memory"))?;
-        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }.map_err(vkerr("bind_buffer_memory"))?;
+        let alloc =
+            vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mem_type);
+        let memory = unsafe { self.device.allocate_memory(&alloc, None) }
+            .map_err(vkerr("allocate_memory"))?;
+        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(vkerr("bind_buffer_memory"))?;
         let ptr = unsafe {
             self.device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
         }
@@ -530,7 +539,13 @@ impl Device {
     }
 
     /// Record a single dispatch of `kernel` (1D workgroup count).
-    fn dispatch(&self, kernel: &str, buffers: &[vk::Buffer], push: &Pc, groups_x: u32) -> Result<()> {
+    fn dispatch(
+        &self,
+        kernel: &str,
+        buffers: &[vk::Buffer],
+        push: &Pc,
+        groups_x: u32,
+    ) -> Result<()> {
         self.dispatch_nd(kernel, buffers, push, (groups_x, 1, 1))
     }
 
@@ -560,12 +575,15 @@ impl Device {
             let alloc_info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(ctx.descriptor_pool)
                 .set_layouts(&set_layouts);
-            let set = dev.allocate_descriptor_sets(&alloc_info).map_err(vkerr("alloc_desc_set"))?[0];
+            let set =
+                dev.allocate_descriptor_sets(&alloc_info).map_err(vkerr("alloc_desc_set"))?[0];
             ctx.n_sets += 1;
 
             let infos: Vec<vk::DescriptorBufferInfo> = buffers
                 .iter()
-                .map(|&b| vk::DescriptorBufferInfo::default().buffer(b).offset(0).range(vk::WHOLE_SIZE))
+                .map(|&b| {
+                    vk::DescriptorBufferInfo::default().buffer(b).offset(0).range(vk::WHOLE_SIZE)
+                })
                 .collect();
             let writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
                 .map(|i| {
@@ -580,7 +598,14 @@ impl Device {
 
             let cb = ctx.command_buffer;
             dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
-            dev.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            dev.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
             dev.cmd_push_constants(cb, layout, vk::ShaderStageFlags::COMPUTE, 0, &push.bytes);
             dev.cmd_dispatch(cb, gx, gy, gz);
             if self.profile_enabled {
@@ -752,7 +777,10 @@ impl DeviceInner {
         let mut rows: Vec<_> = stats.per_kernel.iter().collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
         eprintln!("\n=== xn vulkan profile: {} ===", self.device_name);
-        eprintln!("{:<22} {:>9} {:>11} {:>9} {:>7}", "kernel", "count", "total ms", "avg us", "%gpu");
+        eprintln!(
+            "{:<22} {:>9} {:>11} {:>9} {:>7}",
+            "kernel", "count", "total ms", "avg us", "%gpu"
+        );
         for (name, (cnt, ns)) in rows {
             eprintln!(
                 "{:<22} {:>9} {:>11.2} {:>9.1} {:>6.1}%",

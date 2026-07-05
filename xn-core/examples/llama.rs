@@ -248,8 +248,7 @@ fn run_for_device<T: xn::WithDTypeF, Dev: xn::Backend>(args: Args, dev: Dev) -> 
     println!("Model: {:?}", args.model_size);
     println!("Config: {:?}", config);
 
-    let (model, tokenizer): (Llama<T, Dev>, _) = if let Some(repo_id) = args.model_size.hf_repo()
-    {
+    let (model, tokenizer): (Llama<T, Dev>, _) = if let Some(repo_id) = args.model_size.hf_repo() {
         let model_files = download_model(repo_id)?;
 
         println!("Loading tokenizer...");

@@ -154,11 +154,8 @@ fn matmul_2d_explicit() -> Result<()> {
 fn cmp_matmul(m: usize, k: usize, n: usize, batch: usize) -> Result<()> {
     let a = iota(batch * m * k);
     let b = iota(batch * k * n);
-    let (as_, bs): (Vec<usize>, Vec<usize>) = if batch == 1 {
-        (vec![m, k], vec![k, n])
-    } else {
-        (vec![batch, m, k], vec![batch, k, n])
-    };
+    let (as_, bs): (Vec<usize>, Vec<usize>) =
+        if batch == 1 { (vec![m, k], vec![k, n]) } else { (vec![batch, m, k], vec![batch, k, n]) };
     let av: Tensor<f32, Vk> = Tensor::from_vec(a.clone(), as_.clone(), &dev())?;
     let bv: Tensor<f32, Vk> = Tensor::from_vec(b.clone(), bs.clone(), &dev())?;
     let ac: Tensor<f32, _> = Tensor::from_vec(a, as_, &CPU)?;
@@ -287,7 +284,11 @@ fn reductions_cmp() -> Result<()> {
         for dim in 0..dims.len() {
             assert_close(&cpu.max(dim)?.to_vec()?, &vk.max(dim)?.to_vec()?, 1e-6);
             assert_close(&cpu.min(dim)?.to_vec()?, &vk.min(dim)?.to_vec()?, 1e-6);
-            assert_close(&cpu.sum_keepdim(vec![dim])?.to_vec()?, &vk.sum_keepdim(vec![dim])?.to_vec()?, 1e-5);
+            assert_close(
+                &cpu.sum_keepdim(vec![dim])?.to_vec()?,
+                &vk.sum_keepdim(vec![dim])?.to_vec()?,
+                1e-5,
+            );
             assert_eq!(cpu.argmax(dim)?.to_vec()?, vk.argmax(dim)?.to_vec()?);
             assert_eq!(cpu.argmin(dim)?.to_vec()?, vk.argmin(dim)?.to_vec()?);
         }
@@ -358,7 +359,11 @@ fn rope_cmp() -> Result<()> {
     let sc: Tensor<f32, _> = Tensor::from_vec(sin, vec![max_pos, d / 2], &CPU)?;
     for pos in [0usize, 2, 5] {
         assert_close(&xc.rope(&cc, &sc, pos)?.to_vec()?, &xv.rope(&cv, &sv, pos)?.to_vec()?, 1e-5);
-        assert_close(&xc.rope_i(&cc, &sc, pos)?.to_vec()?, &xv.rope_i(&cv, &sv, pos)?.to_vec()?, 1e-5);
+        assert_close(
+            &xc.rope_i(&cc, &sc, pos)?.to_vec()?,
+            &xv.rope_i(&cv, &sv, pos)?.to_vec()?,
+            1e-5,
+        );
     }
     Ok(())
 }
@@ -380,7 +385,8 @@ fn cmp_conv1d(
     let src = iota(batch * in_c * len);
     let kern = iota(out_c * (in_c / groups) * ks);
     let sv: Tensor<f32, Vk> = Tensor::from_vec(src.clone(), vec![batch, in_c, len], &dev())?;
-    let kv: Tensor<f32, Vk> = Tensor::from_vec(kern.clone(), vec![out_c, in_c / groups, ks], &dev())?;
+    let kv: Tensor<f32, Vk> =
+        Tensor::from_vec(kern.clone(), vec![out_c, in_c / groups, ks], &dev())?;
     let sc: Tensor<f32, _> = Tensor::from_vec(src, vec![batch, in_c, len], &CPU)?;
     let kc: Tensor<f32, _> = Tensor::from_vec(kern, vec![out_c, in_c / groups, ks], &CPU)?;
     let rc = sc.conv1d(&kc, None, stride, padding, 1, groups)?;
@@ -454,7 +460,11 @@ fn f16_elementwise_and_norm() -> Result<()> {
     let wv: Tensor<half::f16, Vk> = Tensor::from_vec(to_f16_vec(&w), vec![16], &dev())?;
     let dc: Tensor<f32, _> = Tensor::from_vec(data.clone(), vec![4, 16], &CPU)?;
     let wc: Tensor<f32, _> = Tensor::from_vec(w, vec![16], &CPU)?;
-    assert_close(&dc.rms_norm(&wc, 1e-5)?.to_vec()?, &f16_to_f32(&dv.rms_norm(&wv, 1e-5)?.to_vec()?), 3e-2);
+    assert_close(
+        &dc.rms_norm(&wc, 1e-5)?.to_vec()?,
+        &f16_to_f32(&dv.rms_norm(&wv, 1e-5)?.to_vec()?),
+        3e-2,
+    );
     assert_close(&dc.softmax()?.to_vec()?, &f16_to_f32(&dv.softmax()?.to_vec()?), 3e-2);
     Ok(())
 }
@@ -488,14 +498,17 @@ fn f16_index_select_and_rope() -> Result<()> {
     let xc: Tensor<f32, _> = Tensor::from_vec(x, vec![b, h, t, d], &CPU)?;
     let cc: Tensor<f32, _> = Tensor::from_vec(cos, vec![mp, d / 2], &CPU)?;
     let sc: Tensor<f32, _> = Tensor::from_vec(sin, vec![mp, d / 2], &CPU)?;
-    assert_close(&xc.rope(&cc, &sc, 2)?.to_vec()?, &f16_to_f32(&xv.rope(&cv, &sv, 2)?.to_vec()?), 3e-2);
+    assert_close(
+        &xc.rope(&cc, &sc, 2)?.to_vec()?,
+        &f16_to_f32(&xv.rope(&cv, &sv, 2)?.to_vec()?),
+        3e-2,
+    );
     Ok(())
 }
 
 #[test]
 fn conv_transpose1d_cmp() -> Result<()> {
-    for (b, ic, oc, len, ks, stride) in
-        [(1, 1, 1, 3, 3, 1), (1, 2, 3, 4, 3, 2), (2, 2, 2, 5, 2, 2)]
+    for (b, ic, oc, len, ks, stride) in [(1, 1, 1, 3, 3, 1), (1, 2, 3, 4, 3, 2), (2, 2, 2, 5, 2, 2)]
     {
         let src = iota(b * ic * len);
         let kern = iota(ic * oc * ks);

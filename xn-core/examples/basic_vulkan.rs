@@ -23,10 +23,16 @@ fn main() -> Result<()> {
 
     // Matmul benchmarks: a decode-shaped GEMV (m=1) and square GEMMs.
     for (m, n, k) in [(1usize, 4096usize, 4096usize), (512, 512, 512), (2048, 2048, 2048)] {
-        let a: Tensor<f32, Device> =
-            Tensor::from_vec((0..m * k).map(|i| (i % 127) as f32 * 0.01).collect(), (m, k), &device)?;
-        let b: Tensor<f32, Device> =
-            Tensor::from_vec((0..k * n).map(|i| (i % 113) as f32 * 0.01).collect(), (k, n), &device)?;
+        let a: Tensor<f32, Device> = Tensor::from_vec(
+            (0..m * k).map(|i| (i % 127) as f32 * 0.01).collect(),
+            (m, k),
+            &device,
+        )?;
+        let b: Tensor<f32, Device> = Tensor::from_vec(
+            (0..k * n).map(|i| (i % 113) as f32 * 0.01).collect(),
+            (k, n),
+            &device,
+        )?;
         let _ = a.matmul(&b)?;
         device.synchronize()?;
         let iters = 50;
