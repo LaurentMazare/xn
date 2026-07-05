@@ -626,12 +626,15 @@ impl crate::Backend for Device {
                 dims.iter().chain(src_strides.iter()).map(|&v| v as u32).collect();
             let scratch = dst.device.scratch_u32(&info)?;
             let push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset);
-            dst.device.dispatch(
+            let res = dst.device.dispatch(
                 &format!("copy_strided_{dt}"),
-                &[src.buffer, dst.buffer, scratch],
+                &[src.buffer, dst.buffer, scratch.buffer],
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
-            )
+            );
+            // Only defer after the dispatch is recorded (see defer_free).
+            dst.device.defer_free(scratch);
+            res
         } else {
             dst.device.flush()?;
             let n = dims.len();
@@ -711,12 +714,15 @@ impl crate::Backend for Device {
                 .collect();
             let scratch = dst.device.scratch_u32(&info)?;
             let push = Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op));
-            dst.device.dispatch(
+            let res = dst.device.dispatch(
                 &format!("broadcast_{dt}"),
-                &[lhs.buffer, rhs.buffer, dst.buffer, scratch],
+                &[lhs.buffer, rhs.buffer, dst.buffer, scratch.buffer],
                 &push,
                 div_ceil(numel, WORKGROUP_SIZE),
-            )
+            );
+            // Only defer after the dispatch is recorded (see defer_free).
+            dst.device.defer_free(scratch);
+            res
         } else {
             dst.device.flush()?;
             let n = dst_shape.len();

@@ -903,20 +903,25 @@ impl<T: WithDType> Drop for Storage<T> {
 
 impl Device {
     /// Allocate a small host-visible buffer holding `data`, for passing `info`
-    /// arrays (dims/strides) to shaders. The buffer is scheduled for recycling
-    /// on the next flush (after the batch that uses it completes), so the
-    /// returned handle is valid for recording into the current batch.
-    fn scratch_u32(&self, data: &[u32]) -> Result<vk::Buffer> {
+    /// arrays (dims/strides) to shaders. The caller must pass the returned
+    /// `PooledBuf` to [`Self::defer_free`] *after* recording the dispatch that
+    /// uses it (see the `defer_free` invariant).
+    fn scratch_u32(&self, data: &[u32]) -> Result<PooledBuf> {
         let (buffer, memory, ptr, class) = self.alloc_buffer(data.len() * 4)?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, ptr, data.len() * 4);
         }
-        self.defer_free(PooledBuf { buffer, memory, ptr: ptr as usize, class });
-        Ok(buffer)
+        Ok(PooledBuf { buffer, memory, ptr: ptr as usize, class })
     }
 
-    /// Schedule a buffer to be recycled into the pool on the next flush, once
-    /// any batch referencing it has completed on the GPU.
+    /// Schedule a buffer to be recycled into the pool on the next flush.
+    ///
+    /// Invariant: this must only be called once *every* use of the buffer has
+    /// been recorded into the command buffer. Recycling happens when a batch is
+    /// flushed, and a flush may be forced in the middle of an op sequence (see
+    /// `dispatch_nd`); a buffer deferred before its use is recorded would be
+    /// recycled by such a flush and overwritten while the subsequently-recorded
+    /// dispatch still references it.
     fn defer_free(&self, buf: PooledBuf) {
         self.ctx.lock().unwrap().free_bufs.push(buf);
     }

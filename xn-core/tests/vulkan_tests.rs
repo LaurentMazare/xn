@@ -320,6 +320,45 @@ fn broadcast_ops() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn forced_midbatch_flush_with_scratch() -> Result<()> {
+    // Regression test for the scratch-buffer recycle race: >4096 dispatches
+    // without a host readback force a mid-batch flush inside dispatch_nd. The
+    // op straddling that flush uses a scratch `info` buffer (broadcast dims and
+    // strides); if the scratch is deferred to the pool before its dispatch is
+    // recorded, the flush recycles it and the *next* op's scratch overwrites it
+    // while the recorded dispatch still references it. Shapes alternate so
+    // consecutive scratch contents differ and the corruption is observable.
+    // The tensors are 1024 elements (4 KiB size class) so the 24-byte scratch
+    // buffers are alone in their 256 B size class: the first same-class alloc
+    // after the forced flush is the next op's scratch_u32, whose host memcpy
+    // lands in the still-referenced buffer.
+    let d = dev();
+    let n = 1024usize;
+    let base: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+    let row32: Vec<f32> = (0..32).map(|i| (i % 5) as f32).collect();
+    let row64: Vec<f32> = (0..64).map(|i| (i % 3) as f32).collect();
+
+    let mut xv: Tensor<f32, Vk> = Tensor::from_vec(base.clone(), vec![32, 32], &d)?;
+    let r32v: Tensor<f32, Vk> = Tensor::from_vec(row32.clone(), vec![1, 32], &d)?;
+    let r64v: Tensor<f32, Vk> = Tensor::from_vec(row64.clone(), vec![1, 64], &d)?;
+    let mut xc: Tensor<f32, _> = Tensor::from_vec(base, vec![32, 32], &CPU)?;
+    let r32c: Tensor<f32, _> = Tensor::from_vec(row32, vec![1, 32], &CPU)?;
+    let r64c: Tensor<f32, _> = Tensor::from_vec(row64, vec![1, 64], &CPU)?;
+
+    for i in 0..4200 {
+        if i % 2 == 0 {
+            xv = xv.broadcast_add(&r32v)?;
+            xc = xc.broadcast_add(&r32c)?;
+        } else {
+            xv = xv.reshape((16, 64))?.broadcast_add(&r64v)?.reshape((32, 32))?;
+            xc = xc.reshape((16, 64))?.broadcast_add(&r64c)?.reshape((32, 32))?;
+        }
+    }
+    assert_close(&xc.to_vec()?, &xv.to_vec()?, 1e-4);
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // index_select / scatter (kv-cache-like)
 // -----------------------------------------------------------------------------
@@ -372,6 +411,7 @@ fn rope_cmp() -> Result<()> {
 // Convolutions
 // -----------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn cmp_conv1d(
     batch: usize,
     in_c: usize,
