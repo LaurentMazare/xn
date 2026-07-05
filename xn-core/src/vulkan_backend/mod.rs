@@ -96,6 +96,8 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
         // conv shaders are f32-only; other dtypes must fail pipeline lookup.
         "conv1d" => (CONV1D_F32, None, None, 3),
         "conv_transpose1d" => (CONV_TRANSPOSE1D_F32, None, None, 3),
+        "im2col1d" => (IM2COL1D_F32, None, None, 2),
+        "col2im1d" => (COL2IM1D_F32, None, None, 2),
         _ => return None,
     };
     let bytes = match dt {
