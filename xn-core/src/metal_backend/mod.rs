@@ -64,6 +64,7 @@ const KERNEL_SRCS: &[&str] = &[
     include_str!("../../metal-kernels/gemv.metal"),
     include_str!("../../metal-kernels/conv1d.metal"),
     include_str!("../../metal-kernels/conv_transpose1d.metal"),
+    include_str!("../../metal-kernels/cast.metal"),
 ];
 
 /// Definition of a compute kernel given a dtype-suffixed name such as
@@ -75,8 +76,12 @@ const KERNEL_SRCS: &[&str] = &[
 /// the wrong variant.
 type KernelDef<'a> = (usize, &'a str, u32, (u64, u64, u64));
 fn kernel_def(name: &str) -> Option<KernelDef<'_>> {
-    let (base, dt) = name.rsplit_once('_')?;
     let wg1d = (WORKGROUP_SIZE as u64, 1, 1);
+    // Dtype casts name both types explicitly and live in the f32 library.
+    if name.starts_with("cast_") {
+        return Some((0, name, 2, wg1d));
+    }
+    let (base, dt) = name.rsplit_once('_')?;
     // (bindings, threads-per-threadgroup, f32-only)
     let (bindings, wg, f32_only) = match base {
         "unary" => (2, wg1d, false),
@@ -113,11 +118,6 @@ fn kernel_def(name: &str) -> Option<KernelDef<'_>> {
 }
 
 const WORKGROUP_SIZE: u32 = 256;
-
-/// Max dispatches per batch before we force a flush. Metal has no hard limit
-/// here; this just bounds how much recorded-but-unsubmitted work (and how many
-/// to-be-recycled buffers) can accumulate.
-const MAX_DISPATCHES_PER_BATCH: u32 = 4096;
 
 fn mtlerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ {
     move |e| crate::Error::msg(format!("metal: {context}: {e:?}"))
@@ -199,12 +199,23 @@ const MLX_BK: usize = 16;
 /// in `kernel_def`.
 const GEMV_NSG: u32 = 8;
 
+/// Commands recorded per command buffer before it is committed (without
+/// waiting): the GPU starts executing early batches while the host keeps
+/// recording later ones, instead of sitting idle until the flush.
+const SUBMIT_CHUNK: u32 = 256;
+
+/// Max committed-but-unretired command buffers before recording applies
+/// backpressure by waiting for the oldest one. Bounds how much memory the
+/// deferred buffer recycling can hold back.
+const MAX_IN_FLIGHT: usize = 16;
+
 /// Command-recording state, guarded by a mutex.
 ///
-/// Dispatches are recorded into a serial compute encoder on `cmd_buffer` and
-/// only submitted when the batch is flushed (on host readback / `synchronize`
-/// / before host access to shared memory). This keeps the GPU busy across many
-/// ops instead of paying a CPU<->GPU round-trip per op.
+/// Dispatches are recorded into a serial compute encoder on `cmd_buffer`.
+/// Every `SUBMIT_CHUNK` commands the buffer is committed *without* waiting
+/// (see [`Device::maybe_submit`]) so GPU execution overlaps host recording; a
+/// flush (host readback / `synchronize` / host access to shared memory)
+/// submits the tail and waits for everything in flight.
 struct OpCtx {
     /// Open command buffer holding recorded, unsubmitted commands.
     cmd_buffer: Option<metal::CommandBuffer>,
@@ -212,28 +223,56 @@ struct OpCtx {
     encoder: Option<metal::ComputeCommandEncoder>,
     /// Number of commands recorded in the current batch.
     n_dispatches: u32,
-    /// Buffers (dropped tensors + scratch) to recycle into the pool on the
-    /// next flush, once any batch referencing them has finished executing.
+    /// Buffers (dropped tensors + scratch) to recycle into the pool once the
+    /// current batch has finished executing on the GPU.
     free_bufs: Vec<PooledBuf>,
     /// Profiling: kernel name per recorded command in the current batch.
     prof_names: Vec<String>,
+    /// Committed batches, oldest first (the queue executes them in commit
+    /// order). Their pooled buffers are recycled when they retire.
+    in_flight: std::collections::VecDeque<InFlight>,
 }
 
-/// Accumulated profiling counters (enabled via `XN_METAL_PROFILE=1`).
-/// In profiling mode every recorded command is flushed in its own command
-/// buffer, so the buffer's GPUStartTime/GPUEndTime delta is an accurate
-/// per-command GPU duration (per-dispatch timestamps inside a batch are not
-/// available on Apple GPUs). Batching is disabled, so wall-clock numbers are
-/// pessimistic; the per-kernel GPU times and shares are the useful output.
+/// A committed, possibly still executing command buffer.
+struct InFlight {
+    cmd: metal::CommandBuffer,
+    /// Buffers to recycle once this batch has completed.
+    free_bufs: Vec<PooledBuf>,
+    /// Profiling: kernel names recorded in this batch (one entry per batch in
+    /// per-kernel mode, unused otherwise).
+    names: Vec<String>,
+}
+
+/// Accumulated profiling counters.
+/// `XN_METAL_PROFILE=1`: per-kernel mode — every command is flushed in its
+/// own command buffer, so the buffer's GPUStartTime/GPUEndTime delta is an
+/// accurate per-command GPU duration (per-dispatch timestamps inside a batch
+/// are not available on Apple GPUs). Batching is disabled, so wall-clock
+/// numbers are pessimistic; the per-kernel GPU times and shares are the
+/// useful output.
+/// `XN_METAL_PROFILE=2`: batch mode — batching/pipelining stays exactly as in
+/// normal runs and only per-command-buffer totals are collected: GPU busy
+/// time, GPU idle gaps between consecutive buffers (host recording, kernel
+/// scheduling latency, host compute), and CPU wait time. This is the mode to
+/// diagnose wall-clock vs GPU-time discrepancies.
 #[derive(Default)]
 struct ProfStats {
     /// kernel name -> (dispatch count, total gpu ns)
     per_kernel: HashMap<String, (u64, u128)>,
     gpu_ns: u128,
     dispatches: u64,
+    /// Committed command buffers.
+    submissions: u64,
+    /// Blocking waits (host readbacks / synchronize / backpressure).
     flushes: u64,
-    /// CPU time spent in submit + wait.
+    /// CPU time spent blocked waiting on the GPU.
     wait_ns: u128,
+    /// Blocking waits broken down by cause -> (count, wait ns).
+    wait_reasons: HashMap<&'static str, (u64, u128)>,
+    /// GPU idle time between consecutive command buffers.
+    gap_ns: u128,
+    /// GPUEndTime of the last retired command buffer.
+    last_gpu_end: f64,
 }
 
 /// A buffer plus its shared-memory pointer, as kept in the recycling pool. The
@@ -283,9 +322,9 @@ pub struct DeviceInner {
     mlx_pipelines: Mutex<HashMap<String, Option<metal::ComputePipelineState>>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
-    /// Set when `XN_METAL_PROFILE=1`: flush after every command and collect
-    /// per-kernel GPU times.
-    profile_enabled: bool,
+    /// 0 = off; 1 = per-kernel profiling (flush after every command); 2 =
+    /// batch-level profiling (normal batching, per-command-buffer stats).
+    profile_mode: u8,
     /// MLX gemv kernels for large m == 1 matmuls (disable with
     /// `XN_METAL_NO_MLX_GEMV=1`).
     use_mlx_gemv: bool,
@@ -347,8 +386,11 @@ impl Device {
             .new_library_with_source(MLX_GEMV_SRC, &metal::CompileOptions::new())
             .map_err(|e| crate::Error::msg(format!("metal: mlx gemv compilation failed: {e}")))?;
 
-        let profile_enabled =
-            std::env::var("XN_METAL_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
+        let profile_mode = match std::env::var("XN_METAL_PROFILE").ok().as_deref() {
+            None | Some("") | Some("0") => 0,
+            Some("2") => 2,
+            Some(_) => 1,
+        };
         let use_mlx_gemv =
             !std::env::var("XN_METAL_NO_MLX_GEMV").is_ok_and(|v| !v.is_empty() && v != "0");
 
@@ -367,8 +409,9 @@ impl Device {
                 n_dispatches: 0,
                 free_bufs: Vec::new(),
                 prof_names: Vec::new(),
+                in_flight: std::collections::VecDeque::new(),
             }),
-            profile_enabled,
+            profile_mode,
             use_mlx_gemv,
             pstats: Mutex::new(ProfStats::default()),
             device_name,
@@ -512,9 +555,6 @@ impl Device {
     ) -> Result<()> {
         use std::ffi::c_void;
         let mut ctx = self.ctx.lock().unwrap();
-        if ctx.n_dispatches >= MAX_DISPATCHES_PER_BATCH {
-            self.flush_locked(&mut ctx)?;
-        }
         let enc = self.compute_encoder(&mut ctx)?;
         enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(mat.0), mat.1);
@@ -531,9 +571,11 @@ impl Device {
             metal::MTLSize::new(group.0, group.1, group.2),
         );
         ctx.n_dispatches += 1;
-        if self.profile_enabled {
+        if self.profile_mode == 1 {
             let name = format!("mlx_{name} (n={out_size}, k={in_size})");
             self.profile_flush(&mut ctx, name)?;
+        } else {
+            self.maybe_submit(&mut ctx)?;
         }
         Ok(())
     }
@@ -554,9 +596,6 @@ impl Device {
     ) -> Result<()> {
         use std::ffi::c_void;
         let mut ctx = self.ctx.lock().unwrap();
-        if ctx.n_dispatches >= MAX_DISPATCHES_PER_BATCH {
-            self.flush_locked(&mut ctx)?;
-        }
         let enc = self.compute_encoder(&mut ctx)?;
         enc.set_compute_pipeline_state(pipeline);
         enc.set_buffer(0, Some(a.0), a.1);
@@ -578,9 +617,11 @@ impl Device {
             metal::MTLSize::new(32, 2, 2),
         );
         ctx.n_dispatches += 1;
-        if self.profile_enabled {
+        if self.profile_mode == 1 {
             let name = format!("mlx_gemm (m={}, n={}, k={})", params.m, params.n, params.k);
             self.profile_flush(&mut ctx, name)?;
+        } else {
+            self.maybe_submit(&mut ctx)?;
         }
         Ok(())
     }
@@ -612,9 +653,6 @@ impl Device {
         let (pipeline, bindings, wg) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let mut ctx = self.ctx.lock().unwrap();
-        if ctx.n_dispatches >= MAX_DISPATCHES_PER_BATCH {
-            self.flush_locked(&mut ctx)?;
-        }
         let enc = self.compute_encoder(&mut ctx)?;
         enc.set_compute_pipeline_state(&pipeline);
         for (i, b) in buffers.iter().enumerate() {
@@ -630,7 +668,7 @@ impl Device {
             metal::MTLSize::new(wg.0, wg.1, wg.2),
         );
         ctx.n_dispatches += 1;
-        if self.profile_enabled {
+        if self.profile_mode == 1 {
             // The matmul kernels' push constants start with (m, n, k); decode
             // them so the profile splits matmuls by shape.
             let is_matmul = kernel.starts_with("gemv") || kernel.starts_with("gemm_tiled");
@@ -642,6 +680,8 @@ impl Device {
                 kernel.to_string()
             };
             self.profile_flush(&mut ctx, name)?;
+        } else {
+            self.maybe_submit(&mut ctx)?;
         }
         Ok(())
     }
@@ -659,9 +699,6 @@ impl Device {
             return Ok(());
         }
         let mut ctx = self.ctx.lock().unwrap();
-        if ctx.n_dispatches >= MAX_DISPATCHES_PER_BATCH {
-            self.flush_locked(&mut ctx)?;
-        }
         // Blits need their own encoder type: close the compute encoder first.
         if let Some(enc) = ctx.encoder.take() {
             enc.end_encoding();
@@ -673,8 +710,10 @@ impl Device {
             blit.end_encoding();
         });
         ctx.n_dispatches += 1;
-        if self.profile_enabled {
+        if self.profile_mode == 1 {
             self.profile_flush(&mut ctx, "buffer_copy".to_string())?;
+        } else {
+            self.maybe_submit(&mut ctx)?;
         }
         Ok(())
     }
@@ -684,7 +723,33 @@ impl Device {
     /// exactly that command.
     fn profile_flush(&self, ctx: &mut OpCtx, name: String) -> Result<()> {
         ctx.prof_names.push(name);
-        self.flush_locked(ctx)
+        self.flush_locked(ctx, "per-kernel profiling")
+    }
+
+    /// Record a buffer fill with a repeated byte into the current batch (used
+    /// for zero fills of any dtype, keeping the pipeline intact).
+    fn record_fill(&self, dst: &metal::BufferRef, value: u8, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut ctx = self.ctx.lock().unwrap();
+        // Blits need their own encoder type: close the compute encoder first.
+        if let Some(enc) = ctx.encoder.take() {
+            enc.end_encoding();
+        }
+        let cmd = self.command_buffer(&mut ctx)?.to_owned();
+        autoreleasepool(|| {
+            let blit = cmd.new_blit_command_encoder();
+            blit.fill_buffer(dst, metal::NSRange::new(0, bytes as u64), value);
+            blit.end_encoding();
+        });
+        ctx.n_dispatches += 1;
+        if self.profile_mode == 1 {
+            self.profile_flush(&mut ctx, "buffer_fill".to_string())?;
+        } else {
+            self.maybe_submit(&mut ctx)?;
+        }
+        Ok(())
     }
 
     /// The current batch's command buffer, creating it if needed.
@@ -712,49 +777,124 @@ impl Device {
     }
 
     /// Submit any pending recorded commands and wait for completion. Safe to
-    /// call when nothing is pending.
-    fn flush(&self) -> Result<()> {
+    /// call when nothing is pending. `reason` labels the wait in the
+    /// profiling stats (`XN_METAL_PROFILE=2` prints a per-cause breakdown).
+    fn flush(&self, reason: &'static str) -> Result<()> {
         let mut ctx = self.ctx.lock().unwrap();
-        self.flush_locked(&mut ctx)
+        self.flush_locked(&mut ctx, reason)
     }
 
-    fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
+    fn flush_locked(&self, ctx: &mut OpCtx, reason: &'static str) -> Result<()> {
+        self.submit_locked(ctx);
+        if ctx.in_flight.is_empty() {
+            return Ok(());
+        }
+        let t0 = (self.profile_mode > 0).then(std::time::Instant::now);
+        // The queue executes command buffers in commit order, so waiting on
+        // the newest one means every older one has completed too.
+        if let Some(last) = ctx.in_flight.back() {
+            last.cmd.wait_until_completed();
+        }
+        if let Some(t0) = t0 {
+            let wait_ns = t0.elapsed().as_nanos();
+            let mut stats = self.pstats.lock().unwrap();
+            stats.flushes += 1;
+            stats.wait_ns += wait_ns;
+            let e = stats.wait_reasons.entry(reason).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += wait_ns;
+        }
+        while !ctx.in_flight.is_empty() {
+            self.retire_one(ctx);
+        }
+        Ok(())
+    }
+
+    /// Commit the currently-recorded batch without waiting, so the GPU starts
+    /// executing it while the host keeps recording. No-op when nothing is
+    /// recorded.
+    fn submit_locked(&self, ctx: &mut OpCtx) {
         if let Some(enc) = ctx.encoder.take() {
             enc.end_encoding();
         }
         if let Some(cmd) = ctx.cmd_buffer.take() {
-            let t0 = if self.profile_enabled { Some(std::time::Instant::now()) } else { None };
             cmd.commit();
-            cmd.wait_until_completed();
+            ctx.in_flight.push_back(InFlight {
+                cmd,
+                free_bufs: std::mem::take(&mut ctx.free_bufs),
+                names: std::mem::take(&mut ctx.prof_names),
+            });
+        }
+        ctx.n_dispatches = 0;
+    }
+
+    /// Pipelined submission: once `SUBMIT_CHUNK` commands are recorded,
+    /// commit the batch without waiting. Completed batches retire eagerly so
+    /// their buffers recycle; if too many batches are outstanding, block on
+    /// the oldest for backpressure.
+    fn maybe_submit(&self, ctx: &mut OpCtx) -> Result<()> {
+        if ctx.n_dispatches < SUBMIT_CHUNK {
+            return Ok(());
+        }
+        self.submit_locked(ctx);
+        while ctx
+            .in_flight
+            .front()
+            .is_some_and(|f| f.cmd.status() == metal::MTLCommandBufferStatus::Completed)
+        {
+            self.retire_one(ctx);
+        }
+        if ctx.in_flight.len() > MAX_IN_FLIGHT {
+            let t0 = (self.profile_mode > 0).then(std::time::Instant::now);
+            ctx.in_flight.front().unwrap().cmd.wait_until_completed();
             if let Some(t0) = t0 {
-                // GPUStartTime/GPUEndTime are not exposed by metal-rs; call
-                // the Objective-C selectors directly (CFTimeInterval seconds).
-                let (gpu_t0, gpu_t1) = command_buffer_gpu_times(&cmd);
-                let dt_ns = ((gpu_t1 - gpu_t0).max(0.0) * 1e9) as u128;
+                let wait_ns = t0.elapsed().as_nanos();
                 let mut stats = self.pstats.lock().unwrap();
                 stats.flushes += 1;
-                stats.wait_ns += t0.elapsed().as_nanos();
-                // In profiling mode each command is flushed on its own, so
-                // the batch holds at most one name.
-                for name in ctx.prof_names.drain(..) {
-                    let e = stats.per_kernel.entry(name).or_insert((0, 0));
-                    e.0 += 1;
-                    e.1 += dt_ns;
-                    stats.dispatches += 1;
-                }
-                stats.gpu_ns += dt_ns;
+                stats.wait_ns += wait_ns;
+                let e = stats.wait_reasons.entry("backpressure").or_insert((0, 0));
+                e.0 += 1;
+                e.1 += wait_ns;
+            }
+            self.retire_one(ctx);
+        }
+        Ok(())
+    }
+
+    /// Retire the oldest submitted batch, which must have completed: collect
+    /// profiling stats and recycle the buffers it referenced.
+    fn retire_one(&self, ctx: &mut OpCtx) {
+        let Some(fl) = ctx.in_flight.pop_front() else {
+            return;
+        };
+        if self.profile_mode > 0 {
+            // GPUStartTime/GPUEndTime are not exposed by metal-rs; call the
+            // Objective-C selectors directly (CFTimeInterval seconds).
+            let (gpu_t0, gpu_t1) = command_buffer_gpu_times(&fl.cmd);
+            let dt_ns = ((gpu_t1 - gpu_t0).max(0.0) * 1e9) as u128;
+            let mut stats = self.pstats.lock().unwrap();
+            stats.submissions += 1;
+            if stats.last_gpu_end > 0.0 && gpu_t0 > stats.last_gpu_end {
+                stats.gap_ns += ((gpu_t0 - stats.last_gpu_end) * 1e9) as u128;
+            }
+            stats.last_gpu_end = gpu_t1;
+            stats.gpu_ns += dt_ns;
+            // In per-kernel mode each batch holds exactly one command/name.
+            for name in fl.names {
+                let e = stats.per_kernel.entry(name).or_insert((0, 0));
+                e.0 += 1;
+                e.1 += dt_ns;
+                stats.dispatches += 1;
             }
         }
-        // The GPU is now idle for this batch: buffers freed during it can be
+        // This batch has completed on the GPU: buffers freed during it can be
         // recycled for future allocations.
-        if !ctx.free_bufs.is_empty() {
+        if !fl.free_bufs.is_empty() {
             let mut pool = self.pool.lock().unwrap();
-            for b in ctx.free_bufs.drain(..) {
+            for b in fl.free_bufs {
                 pool.free.entry(b.class).or_default().push(b);
             }
         }
-        ctx.n_dispatches = 0;
-        Ok(())
     }
 }
 
@@ -762,33 +902,44 @@ impl DeviceInner {
     /// Print accumulated per-kernel GPU times (profiling mode only).
     fn print_profile(&self) {
         let stats = self.pstats.lock().unwrap();
-        if stats.dispatches == 0 {
+        if stats.submissions == 0 {
             return;
         }
-        let mut rows: Vec<_> = stats.per_kernel.iter().collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
         eprintln!("\n=== xn metal profile: {} ===", self.device_name);
-        eprintln!(
-            "{:<38} {:>9} {:>11} {:>9} {:>7}",
-            "kernel", "count", "total ms", "avg us", "%gpu"
-        );
-        for (name, (cnt, ns)) in rows {
+        if !stats.per_kernel.is_empty() {
+            let mut rows: Vec<_> = stats.per_kernel.iter().collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
             eprintln!(
-                "{:<38} {:>9} {:>11.2} {:>9.1} {:>6.1}%",
-                name,
-                cnt,
-                *ns as f64 / 1e6,
-                *ns as f64 / 1e3 / *cnt as f64,
-                100.0 * *ns as f64 / stats.gpu_ns as f64,
+                "{:<38} {:>9} {:>11} {:>9} {:>7}",
+                "kernel", "count", "total ms", "avg us", "%gpu"
             );
+            for (name, (cnt, ns)) in rows {
+                eprintln!(
+                    "{:<38} {:>9} {:>11.2} {:>9.1} {:>6.1}%",
+                    name,
+                    cnt,
+                    *ns as f64 / 1e6,
+                    *ns as f64 / 1e3 / *cnt as f64,
+                    100.0 * *ns as f64 / stats.gpu_ns as f64,
+                );
+            }
         }
         eprintln!(
-            "gpu total: {:.2} ms over {} commands in {} flushes; cpu submit+wait: {:.2} ms",
+            "gpu busy: {:.2} ms across {} command buffers; gpu idle between buffers: {:.2} ms",
             stats.gpu_ns as f64 / 1e6,
-            stats.dispatches,
+            stats.submissions,
+            stats.gap_ns as f64 / 1e6,
+        );
+        eprintln!(
+            "cpu blocking waits: {} totalling {:.2} ms",
             stats.flushes,
             stats.wait_ns as f64 / 1e6,
         );
+        let mut reasons: Vec<_> = stats.wait_reasons.iter().collect();
+        reasons.sort_by_key(|r| std::cmp::Reverse(r.1.0));
+        for (reason, (cnt, ns)) in reasons {
+            eprintln!("  {:<28} {:>9} waits {:>11.2} ms", reason, cnt, *ns as f64 / 1e6);
+        }
         let pool = self.pool.lock().unwrap();
         let total = pool.hits + pool.misses;
         if total > 0 {
@@ -804,14 +955,15 @@ impl DeviceInner {
 
 impl Drop for DeviceInner {
     fn drop(&mut self) {
-        if self.profile_enabled {
+        if self.profile_mode > 0 {
             self.print_profile();
         }
         // The last batch may still be open: recorded but never submitted
         // because nothing read its results back. Metal asserts if a live
         // command encoder is released without endEncoding, so close it here.
-        // The uncommitted command buffer itself (and its now-unreachable
-        // results) can simply be dropped.
+        // The uncommitted command buffer (and its now-unreachable results)
+        // can simply be dropped; in-flight buffers are kept alive by the
+        // queue until they finish executing.
         if let Ok(ctx) = self.ctx.get_mut() {
             if let Some(enc) = ctx.encoder.take() {
                 enc.end_encoding();

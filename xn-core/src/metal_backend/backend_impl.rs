@@ -44,7 +44,7 @@ impl crate::Backend for Device {
 
     fn synchronize(&self) -> Result<()> {
         // Submit any pending batch and wait for it.
-        self.flush()
+        self.flush("synchronize")
     }
 
     fn storage_len<T: WithDType>(storage: &Self::Storage<T>) -> usize {
@@ -66,13 +66,21 @@ impl crate::Backend for Device {
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, elem: T, len: usize) -> Result<()> {
-        dst.device.flush()?;
+        // Values whose bytes are all identical (zeros for every dtype) fill
+        // on the GPU as a blit, keeping the batch pipeline intact. Anything
+        // else drains the pipeline and fills from the host.
+        let elem_bytes =
+            unsafe { std::slice::from_raw_parts(&elem as *const T as *const u8, T::BYTE_SIZE) };
+        if elem_bytes.iter().all(|&b| b == elem_bytes[0]) {
+            return dst.device.record_fill(&dst.buffer, elem_bytes[0], len * T::BYTE_SIZE);
+        }
+        dst.device.flush("host fill")?;
         dst.as_mut_slice()[..len].fill(elem);
         Ok(())
     }
 
     fn rand_uniform(dst: &mut Self::Storage<f32>, len: usize, lo: f32, up: f32) -> Result<()> {
-        dst.device.flush()?;
+        dst.device.flush("rand_uniform")?;
         let range = up - lo;
         for v in dst.as_mut_slice()[..len].iter_mut() {
             *v = rand::random::<f32>() * range + lo;
@@ -86,7 +94,7 @@ impl crate::Backend for Device {
             Ok(d) => d,
             Err(e) => crate::bail!("failed to create normal distribution for randn: {e}"),
         };
-        dst.device.flush()?;
+        dst.device.flush("randn")?;
         let mut rng = rand::rng();
         for v in dst.as_mut_slice()[..len].iter_mut() {
             *v = distr.sample(&mut rng);
@@ -105,7 +113,28 @@ impl crate::Backend for Device {
         len: usize,
     ) -> Result<()> {
         use half::{bf16, f16};
-        src.device.flush()?;
+        // Same-dtype conversion is a plain buffer copy; conversions between
+        // the float dtypes run as GPU cast kernels. Both stay in the batch
+        // pipeline. Only integer<->float conversions drain and run on host.
+        if T::DTYPE == U::DTYPE {
+            return src.device.record_copy(&dst.buffer, &src.buffer, len * T::BYTE_SIZE);
+        }
+        let sfx = |d: DType| match d {
+            DType::F32 => Some("f32"),
+            DType::F16 => Some("f16"),
+            DType::BF16 => Some("bf16"),
+            _ => None,
+        };
+        if let (Some(s), Some(d)) = (sfx(T::DTYPE), sfx(U::DTYPE)) {
+            let push = Pc::new().usize(len);
+            return src.device.dispatch(
+                &format!("cast_{s}_{d}"),
+                &[&src.buffer, &dst.buffer],
+                &push,
+                div_ceil(len, WORKGROUP_SIZE),
+            );
+        }
+        src.device.flush("host to_dtype")?;
         macro_rules! cast {
             ($s:ty, $d:ty, |$v:ident| $e:expr) => {{
                 let s = unsafe { std::slice::from_raw_parts(src.ptr as *const $s, len) };
@@ -148,7 +177,7 @@ impl crate::Backend for Device {
     }
 
     fn data<T: WithDType>(src: &Self::Storage<T>, len: usize) -> Result<std::borrow::Cow<'_, [T]>> {
-        src.device.flush()?;
+        src.device.flush("readback")?;
         Ok(std::borrow::Cow::Owned(src.as_slice()[..len].to_vec()))
     }
 
@@ -196,7 +225,7 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let src = s.as_slice()[..len].to_vec();
             for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(src) {
                 *d = bin_apply(op, *d, sv);
@@ -221,7 +250,7 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let l = lhs.as_slice();
             let r = rhs.as_slice();
             let d = dst.as_mut_slice();
@@ -251,7 +280,7 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let s = src.as_slice()[..len].to_vec();
             for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(s) {
                 *d = sv * scale + add;
@@ -286,7 +315,7 @@ impl crate::Backend for Device {
                 div_ceil(numel, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let s = src.as_slice();
             let d = dst.as_mut_slice();
             for dst_idx in 0..numel {
@@ -334,7 +363,7 @@ impl crate::Backend for Device {
                 div_ceil(d1 * d2, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let s = src.as_slice();
             let d = dst.as_mut_slice();
             for i1 in 0..d1 {
@@ -587,7 +616,7 @@ impl crate::Backend for Device {
                 div_ceil(total, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let ids_h = ids.as_slice();
             let s = src.as_slice();
             let d = dst.as_mut_slice();
@@ -752,7 +781,7 @@ impl crate::Backend for Device {
             dst.device.defer_free(scratch);
             res
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let n = dims.len();
             let s = src.as_slice();
             let d = dst.as_mut_slice();
@@ -793,7 +822,7 @@ impl crate::Backend for Device {
                 div_ceil(numel, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let ids_h = ids.as_slice();
             let s = src.as_slice();
             let d = dst.as_mut_slice();
@@ -840,7 +869,7 @@ impl crate::Backend for Device {
             dst.device.defer_free(scratch);
             res
         } else {
-            dst.device.flush()?;
+            dst.device.flush("host op fallback")?;
             let n = dst_shape.len();
             let l = lhs.as_slice();
             let r = rhs.as_slice();

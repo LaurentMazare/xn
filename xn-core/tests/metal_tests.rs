@@ -101,6 +101,28 @@ fn dtype_roundtrip_conversions() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn gpu_cast_and_fill_paths() -> Result<()> {
+    // Casts between the float dtypes run as GPU kernels and must be
+    // bit-identical to the CPU conversions (both round to nearest even).
+    // Odd length exercises the tail bounds check.
+    let data = iota(33);
+    let cpu: Tensor<f32, _> = Tensor::from_vec(data.clone(), vec![33], &CPU)?;
+    let mt: Tensor<f32, Mt> = Tensor::from_vec(data, vec![33], &dev())?;
+    let c = cpu.to::<half::f16>()?.to::<half::bf16>()?.to::<f32>()?;
+    let m = mt.to::<half::f16>()?.to::<half::bf16>()?.to::<f32>()?;
+    assert_eq!(c.to_vec()?, m.to_vec()?);
+    let c = cpu.to::<half::bf16>()?.to::<half::f16>()?.to::<f32>()?;
+    let m = mt.to::<half::bf16>()?.to::<half::f16>()?.to::<f32>()?;
+    assert_eq!(c.to_vec()?, m.to_vec()?);
+    // Zero fill takes the GPU blit path for every dtype.
+    let z: Tensor<i64, Mt> = Tensor::zeros(vec![7], &dev())?;
+    assert_eq!(z.to_vec()?, vec![0i64; 7]);
+    let z: Tensor<half::bf16, Mt> = Tensor::zeros(vec![9], &dev())?;
+    assert!(z.to_vec()?.iter().all(|v| *v == half::bf16::from_f32(0.0)));
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Elementwise binary / unary, compared against CPU
 // -----------------------------------------------------------------------------
