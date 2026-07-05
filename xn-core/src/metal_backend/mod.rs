@@ -30,6 +30,12 @@ use std::sync::{Arc, Mutex};
 /// Shared dtype prelude, prepended to the concatenated kernel sources.
 const DTYPE_SRC: &str = include_str!("../../metal-kernels/dtype.metal");
 
+/// MLX steel GEMM kernels (simdgroup-matrix based), taken from
+/// candle-metal-kernels which extracted them from MLX. Compiled as its own
+/// library: the file is self-contained and instantiates `gemm_{nn,nt,tn,tt}_*`
+/// specializations selected via function constants.
+const MLX_GEMM_SRC: &str = include_str!("../../metal-kernels/mlx_gemm.metal");
+
 /// All kernel bodies; concatenated (after the prelude) into one MSL library
 /// per dtype variant.
 const KERNEL_SRCS: &[&str] = &[
@@ -144,6 +150,33 @@ struct CachedPipeline {
     wg: (u64, u64, u64),
 }
 
+/// Parameter block for the MLX steel GEMM kernels; layout must match the
+/// `GEMMParams` struct in `mlx_gemm.metal`.
+#[repr(C)]
+struct MlxGemmParams {
+    m: i32,
+    n: i32,
+    k: i32,
+    lda: i32,
+    ldb: i32,
+    ldd: i32,
+    tiles_n: i32,
+    tiles_m: i32,
+    batch_stride_a: isize,
+    batch_stride_b: isize,
+    batch_stride_d: isize,
+    swizzle_log: i32,
+    gemm_k_iterations_aligned: i32,
+    batch_ndim: i32,
+}
+
+/// MLX GEMM tile configuration: block size (bm, bn, bk) = (32, 32, 16) and
+/// (wm, wn) = (2, 2) simdgroups per threadgroup, matching the instantiations
+/// in `mlx_gemm.metal`.
+const MLX_BM: usize = 32;
+const MLX_BN: usize = 32;
+const MLX_BK: usize = 16;
+
 /// Command-recording state, guarded by a mutex.
 ///
 /// Dispatches are recorded into a serial compute encoder on `cmd_buffer` and
@@ -197,7 +230,13 @@ pub struct DeviceInner {
     queue: metal::CommandQueue,
     /// Per-dtype-variant libraries: [f32, f16, bf16].
     libraries: [metal::Library; 3],
+    /// MLX steel GEMM library (simdgroup-matrix kernels, own source file).
+    mlx_gemm_library: metal::Library,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
+    /// MLX GEMM pipelines, keyed by (kernel name, function constants). `None`
+    /// caches a failed specialization (e.g. bf16 on an OS without `bfloat`) so
+    /// the caller falls back to the plain tiled kernel without retrying.
+    mlx_pipelines: Mutex<HashMap<String, Option<metal::ComputePipelineState>>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
     device_name: String,
@@ -250,12 +289,17 @@ impl Device {
         };
         let libraries =
             [compile("")?, compile("#define USE_F16 1\n")?, compile("#define USE_BF16 1\n")?];
+        let mlx_gemm_library = device
+            .new_library_with_source(MLX_GEMM_SRC, &metal::CompileOptions::new())
+            .map_err(|e| crate::Error::msg(format!("metal: mlx gemm compilation failed: {e}")))?;
 
         let inner = DeviceInner {
             device,
             queue,
             libraries,
+            mlx_gemm_library,
             pipelines: Mutex::new(HashMap::new()),
+            mlx_pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx {
                 cmd_buffer: None,
@@ -325,6 +369,94 @@ impl Device {
         pipelines
             .insert(name.to_string(), CachedPipeline { pipeline: pipeline.clone(), bindings, wg });
         Ok((pipeline, bindings, wg))
+    }
+
+    /// Look up (or build) an MLX GEMM pipeline specialization. Returns `None`
+    /// when the specialization is unavailable (e.g. bf16 on an OS without
+    /// `bfloat` support); the failure is cached so the caller falls back to
+    /// the plain tiled kernel without retrying the compilation.
+    fn get_mlx_gemm_pipeline(
+        &self,
+        trans: &str,
+        dt: &str,
+        aligned: (bool, bool, bool),
+        has_batch: bool,
+    ) -> Option<metal::ComputePipelineState> {
+        let (align_m, align_n, align_k) = aligned;
+        let name = format!("gemm_{trans}_{dt}_{dt}_32_32_16_2_2");
+        let key = format!(
+            "{name}_{}{}{}{}",
+            align_m as u8, align_n as u8, align_k as u8, has_batch as u8
+        );
+        let mut cache = self.mlx_pipelines.lock().unwrap();
+        if let Some(p) = cache.get(&key) {
+            return p.clone();
+        }
+        let fcv = metal::FunctionConstantValues::new();
+        let set_bool = |v: &bool, idx: u64| {
+            fcv.set_constant_value_at_index(
+                v as *const bool as *const std::ffi::c_void,
+                metal::MTLDataType::Bool,
+                idx,
+            );
+        };
+        set_bool(&has_batch, 10);
+        set_bool(&false, 100); // use_out_source
+        set_bool(&false, 110); // do_axpby
+        set_bool(&align_m, 200);
+        set_bool(&align_n, 201);
+        set_bool(&align_k, 202);
+        set_bool(&false, 300); // do_gather
+        let pipeline = self
+            .mlx_gemm_library
+            .get_function(&name, Some(fcv))
+            .ok()
+            .and_then(|f| self.device.new_compute_pipeline_state_with_function(&f).ok());
+        cache.insert(key, pipeline.clone());
+        pipeline
+    }
+
+    /// Record an MLX GEMM dispatch into the current batch. `a`/`b` carry byte
+    /// offsets; grid is (tiles_n, tiles_m, batch) with a (32, 2, 2)
+    /// threadgroup (one simdgroup per (wn, wm) tile quadrant).
+    fn dispatch_mlx_gemm(
+        &self,
+        pipeline: &metal::ComputePipelineState,
+        a: (&metal::BufferRef, u64),
+        b: (&metal::BufferRef, u64),
+        d: &metal::BufferRef,
+        params: &MlxGemmParams,
+        batch: i32,
+        batch_strides: &[isize; 2],
+        groups: (u64, u64, u64),
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        let mut ctx = self.ctx.lock().unwrap();
+        if ctx.n_dispatches >= MAX_DISPATCHES_PER_BATCH {
+            self.flush_locked(&mut ctx)?;
+        }
+        let enc = self.compute_encoder(&mut ctx)?;
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(a.0), a.1);
+        enc.set_buffer(1, Some(b.0), b.1);
+        enc.set_buffer(3, Some(d), 0);
+        enc.set_bytes(
+            4,
+            std::mem::size_of::<MlxGemmParams>() as u64,
+            params as *const MlxGemmParams as *const c_void,
+        );
+        enc.set_bytes(6, std::mem::size_of::<i32>() as u64, &batch as *const i32 as *const c_void);
+        enc.set_bytes(
+            7,
+            std::mem::size_of::<[isize; 2]>() as u64,
+            batch_strides.as_ptr() as *const c_void,
+        );
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(groups.0, groups.1, groups.2),
+            metal::MTLSize::new(32, 2, 2),
+        );
+        ctx.n_dispatches += 1;
+        Ok(())
     }
 
     /// Record a single dispatch of `kernel` (1D threadgroup count).

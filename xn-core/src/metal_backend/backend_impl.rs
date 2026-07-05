@@ -423,6 +423,73 @@ impl crate::Backend for Device {
         let (dst_cs, dst_rs) = dst_strides;
         let (lhs_cs, lhs_rs) = lhs_strides;
         let (rhs_cs, rhs_rs) = rhs_strides;
+        // MLX steel GEMM path (simdgroup-matrix kernels), much faster than the
+        // plain tiled kernel. It needs a contiguous row-major dst and a unit
+        // minor stride on each input (the nn/nt/tn/tt layouts, with a free
+        // leading dimension). Buffer byte offsets are kept 16-byte aligned for
+        // the vectorized block loaders. The `m == 1, rhs_rs == 1` decode case
+        // (matmul_t against a row-major weight) stays on the gemv kernel
+        // below, whose per-column threadgroup reduction reads each contiguous
+        // weight row once and measures faster than a 32-row GEMM tile there.
+        // Anything else falls through to the generic kernels.
+        if (m > 1 || rhs_rs != 1) && dst_rs == n && dst_cs == 1 {
+            // (leading dimension, transposed) when the layout is compatible.
+            let a_layout = if lhs_cs == 1 {
+                Some((lhs_rs, "n"))
+            } else if lhs_rs == 1 {
+                Some((lhs_cs, "t"))
+            } else {
+                None
+            };
+            let b_layout = if rhs_cs == 1 {
+                Some((rhs_rs, "n"))
+            } else if rhs_rs == 1 {
+                Some((rhs_cs, "t"))
+            } else {
+                None
+            };
+            let a_byte_off = lhs.1 * T::BYTE_SIZE;
+            let b_byte_off = rhs.1 * T::BYTE_SIZE;
+            if let (Some((lda, ta)), Some((ldb, tb))) = (a_layout, b_layout)
+                && a_byte_off % 16 == 0
+                && b_byte_off % 16 == 0
+            {
+                let aligned =
+                    (m.is_multiple_of(MLX_BM), n.is_multiple_of(MLX_BN), k.is_multiple_of(MLX_BK));
+                let trans = format!("{ta}{tb}");
+                if let Some(pipeline) =
+                    dst.device.get_mlx_gemm_pipeline(&trans, dt, aligned, lhs_b > 1)
+                {
+                    let (tiles_n, tiles_m) = (n.div_ceil(MLX_BN), m.div_ceil(MLX_BM));
+                    let params = MlxGemmParams {
+                        m: m as i32,
+                        n: n as i32,
+                        k: k as i32,
+                        lda: lda as i32,
+                        ldb: ldb as i32,
+                        ldd: n as i32,
+                        tiles_n: tiles_n as i32,
+                        tiles_m: tiles_m as i32,
+                        batch_stride_a: lhs_b_stride as isize,
+                        batch_stride_b: rhs_b_stride as isize,
+                        batch_stride_d: (m * n) as isize,
+                        swizzle_log: 0,
+                        gemm_k_iterations_aligned: (k / MLX_BK) as i32,
+                        batch_ndim: 1,
+                    };
+                    return dst.device.dispatch_mlx_gemm(
+                        &pipeline,
+                        (&lhs.0.buffer, a_byte_off as u64),
+                        (&rhs.0.buffer, b_byte_off as u64),
+                        &dst.buffer,
+                        &params,
+                        lhs_b as i32,
+                        &[lhs_b_stride as isize, rhs_b_stride as isize],
+                        (tiles_n as u64, tiles_m as u64, lhs_b as u64),
+                    );
+                }
+            }
+        }
         let push = Pc::new()
             .usize(m)
             .usize(n)
