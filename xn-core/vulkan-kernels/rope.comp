@@ -33,10 +33,10 @@ void main() {
     uint i_cs = i_t * half_d + i_d;
     if (pc.cs_stride_b > 0u) i_cs += (i_bh / pc.h) * pc.cs_stride_b;
 
-    float c = float(cosb[pc.cos_off + i_cs]);
-    float s = float(sinb[pc.sin_off + i_cs]);
-    float a = float(src[i1]);
-    float b = float(src[i2]);
-    dst[i1] = SCALAR(a * c - b * s);
-    dst[i2] = SCALAR(a * s + b * c);
+    float c = LOAD(cosb[pc.cos_off + i_cs]);
+    float s = LOAD(sinb[pc.sin_off + i_cs]);
+    float a = LOAD(src[i1]);
+    float b = LOAD(src[i2]);
+    dst[i1] = STORE(a * c - b * s);
+    dst[i2] = STORE(a * s + b * c);
 }

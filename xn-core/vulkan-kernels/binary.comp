@@ -16,8 +16,8 @@ layout(push_constant) uniform PC {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) return;
-    float a = float(lhs[i]);
-    float b = float(rhs[i]);
+    float a = LOAD(lhs[i]);
+    float b = LOAD(rhs[i]);
     float r;
     switch (pc.op) {
         case 0u: r = a + b; break;
@@ -28,5 +28,5 @@ void main() {
         case 5u: r = min(a, b); break;
         default: r = a;
     }
-    dst[i] = SCALAR(r);
+    dst[i] = STORE(r);
 }

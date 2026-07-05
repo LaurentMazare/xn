@@ -210,8 +210,8 @@ impl Runner {
         }
         #[cfg(all(feature = "vulkan", not(feature = "cuda")))]
         {
-            // The Vulkan backend computes in f32 or f16 (device permitting).
-            // Quantized formats stay on CPU.
+            // The Vulkan backend computes in f32, f16 or bf16 (device
+            // permitting). Quantized formats stay on CPU.
             if !self.cpu_only {
                 match self.dtype {
                     DTypeQ::F32 => {
@@ -225,6 +225,14 @@ impl Runner {
                             return Err(Error::msg("vulkan device does not support f16"));
                         }
                         w.run::<Unquantized<half::f16, _>>(dev)?;
+                        return Ok(());
+                    }
+                    DTypeQ::BF16 => {
+                        let dev = vulkan_backend::Device::new(_device_id)?;
+                        if !dev.supports_bf16() {
+                            return Err(Error::msg("vulkan device does not support bf16"));
+                        }
+                        w.run::<Unquantized<half::bf16, _>>(dev)?;
                         return Ok(());
                     }
                     _ => {}

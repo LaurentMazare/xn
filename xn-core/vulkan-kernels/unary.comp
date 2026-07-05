@@ -27,7 +27,7 @@ float erf_approx(float x) {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) return;
-    float x = float(src[i]);
+    float x = LOAD(src[i]);
     float r;
     switch (pc.op) {
         case 0u:  r = cos(x); break;
@@ -47,5 +47,5 @@ void main() {
         case 14u: r = 1.0 / (1.0 + exp(-x)); break;
         default:  r = x;
     }
-    dst[i] = SCALAR(r);
+    dst[i] = STORE(r);
 }

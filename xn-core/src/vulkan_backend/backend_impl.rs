@@ -1,12 +1,14 @@
 // Included from `mod.rs`. Implements the `Backend` trait for the Vulkan
 // `Device`, plus host fallbacks for non-f32 data-movement ops.
 
-/// Convert a float-typed scalar value to `f32` (valid for `T` in {f32, f16}).
+/// Convert a float-typed scalar value to `f32`. Only called on the GPU path,
+/// where `float_suffix` has already restricted `T` to {f32, f16, bf16}.
 fn scalar_to_f32<T: WithDType>(v: T) -> f32 {
     match T::DTYPE {
         DType::F32 => unsafe { *(&v as *const T as *const f32) },
         DType::F16 => unsafe { (*(&v as *const T as *const half::f16)).to_f32() },
-        _ => 0.0,
+        DType::BF16 => unsafe { (*(&v as *const T as *const half::bf16)).to_f32() },
+        d => unreachable!("scalar_to_f32 on non-float dtype {d:?}"),
     }
 }
 

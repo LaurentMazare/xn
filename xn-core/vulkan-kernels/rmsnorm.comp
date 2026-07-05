@@ -22,7 +22,7 @@ void main() {
 
     float acc = 0.0;
     for (uint c = tid; c < pc.ncols; c += 256u) {
-        float x = float(src[base + c]);
+        float x = LOAD(src[base + c]);
         acc += x * x;
     }
     sh[tid] = acc;
@@ -36,6 +36,6 @@ void main() {
     barrier();
 
     for (uint c = tid; c < pc.ncols; c += 256u) {
-        dst[base + c] = SCALAR(scale * float(src[base + c]) * float(alpha[c]));
+        dst[base + c] = STORE(scale * LOAD(src[base + c]) * LOAD(alpha[c]));
     }
 }

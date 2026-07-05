@@ -19,7 +19,7 @@ void main() {
     uint base = row * pc.ncols;
 
     float m = -3.402823466e+38;
-    for (uint c = tid; c < pc.ncols; c += 256u) m = max(m, float(src[base + c]));
+    for (uint c = tid; c < pc.ncols; c += 256u) m = max(m, LOAD(src[base + c]));
     sh[tid] = m;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {
@@ -31,8 +31,8 @@ void main() {
 
     float sum = 0.0;
     for (uint c = tid; c < pc.ncols; c += 256u) {
-        float e = exp(float(src[base + c]) - maxv);
-        dst[base + c] = SCALAR(e);
+        float e = exp(LOAD(src[base + c]) - maxv);
+        dst[base + c] = STORE(e);
         sum += e;
     }
     sh[tid] = sum;
@@ -44,5 +44,5 @@ void main() {
     float inv = 1.0 / sh[0];
     barrier();
 
-    for (uint c = tid; c < pc.ncols; c += 256u) dst[base + c] = SCALAR(float(dst[base + c]) * inv);
+    for (uint c = tid; c < pc.ncols; c += 256u) dst[base + c] = STORE(LOAD(dst[base + c]) * inv);
 }

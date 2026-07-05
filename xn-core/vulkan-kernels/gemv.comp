@@ -48,7 +48,7 @@ void main() {
 
     float acc = 0.0;
     for (uint l = tid; l < pc.k; l += 256u) {
-        acc += float(lhs[lbase + l * pc.lhs_cs]) * float(rhs[rbase + l * pc.rhs_rs]);
+        acc += LOAD(lhs[lbase + l * pc.lhs_cs]) * LOAD(rhs[rbase + l * pc.rhs_rs]);
     }
     sh[tid] = acc;
     barrier();
@@ -57,6 +57,6 @@ void main() {
         barrier();
     }
     if (tid == 0u) {
-        dst[b * pc.n + j * pc.dst_cs] = SCALAR(sh[0]);
+        dst[b * pc.n + j * pc.dst_cs] = STORE(sh[0]);
     }
 }

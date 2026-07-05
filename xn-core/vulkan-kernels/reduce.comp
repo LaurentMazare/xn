@@ -26,7 +26,7 @@ void main() {
 
     float acc = pc.op == 0u ? 0.0 : (pc.op == 1u ? -3.402823466e+38 : 3.402823466e+38);
     for (uint k = tid; k < pc.dim_size; k += 256u) {
-        float v = float(src[outer_base + k * pc.inner_size]);
+        float v = LOAD(src[outer_base + k * pc.inner_size]);
         if (pc.op == 0u) acc += v;
         else if (pc.op == 1u) acc = max(acc, v);
         else acc = min(acc, v);
@@ -41,5 +41,5 @@ void main() {
         }
         barrier();
     }
-    if (tid == 0u) dst[o] = SCALAR(sh[0]);
+    if (tid == 0u) dst[o] = STORE(sh[0]);
 }

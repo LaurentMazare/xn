@@ -50,10 +50,10 @@ void main() {
         uint l_lhs = t * uint(TILE) + lx; // k-index for the lhs tile column
         uint l_rhs = t * uint(TILE) + ly; // k-index for the rhs tile row
         lt[ly][lx] = (row < pc.m && l_lhs < pc.k)
-            ? float(lhs[lhs_base + row * pc.lhs_rs + l_lhs * pc.lhs_cs])
+            ? LOAD(lhs[lhs_base + row * pc.lhs_rs + l_lhs * pc.lhs_cs])
             : 0.0;
         rt[ly][lx] = (col < pc.n && l_rhs < pc.k)
-            ? float(rhs[rhs_base + l_rhs * pc.rhs_rs + col * pc.rhs_cs])
+            ? LOAD(rhs[rhs_base + l_rhs * pc.rhs_rs + col * pc.rhs_cs])
             : 0.0;
         barrier();
         for (uint kk = 0u; kk < uint(TILE); kk++) {
@@ -63,6 +63,6 @@ void main() {
     }
 
     if (row < pc.m && col < pc.n) {
-        dst[b * pc.m * pc.n + row * pc.dst_rs + col * pc.dst_cs] = SCALAR(acc);
+        dst[b * pc.m * pc.n + row * pc.dst_rs + col * pc.dst_cs] = STORE(acc);
     }
 }

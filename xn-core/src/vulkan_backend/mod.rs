@@ -40,36 +40,45 @@ fn vkerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ {
 /// Definition of a compute kernel given a dtype-suffixed name such as
 /// `"unary_f16"`: returns its SPIR-V (for the requested dtype) and its number
 /// of storage-buffer bindings (all bound at set 0, bindings `0..bindings`).
+/// Unsupported (kernel, dtype) combinations return `None` so that a wrong
+/// dispatch fails loudly instead of silently running the wrong variant.
 fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
     use shaders::*;
     let (base, dt) = name.rsplit_once('_')?;
-    // (f32 spirv, f16 spirv, binding count)
-    let (f32b, f16b, bindings): (&'static [u8], &'static [u8], u32) = match base {
-        "unary" => (UNARY_F32, UNARY_F16, 2),
-        "binary" => (BINARY_F32, BINARY_F16, 3),
-        "scale_add" => (SCALE_ADD_F32, SCALE_ADD_F16, 2),
-        "broadcast" => (BROADCAST_F32, BROADCAST_F16, 4),
-        "softmax" => (SOFTMAX_F32, SOFTMAX_F16, 2),
-        "rmsnorm" => (RMSNORM_F32, RMSNORM_F16, 3),
-        "layernorm" => (LAYERNORM_F32, LAYERNORM_F16, 4),
-        "rope" => (ROPE_F32, ROPE_F16, 4),
-        "rope_i" => (ROPE_I_F32, ROPE_I_F16, 4),
-        "reduce" => (REDUCE_F32, REDUCE_F16, 2),
-        "reduce_arg" => (REDUCE_ARG_F32, REDUCE_ARG_F16, 2),
-        "transpose" => (TRANSPOSE_F32, TRANSPOSE_F16, 2),
-        "copy2d" => (COPY2D_F32, COPY2D_F16, 2),
-        "copy_strided" => (COPY_STRIDED_F32, COPY_STRIDED_F16, 3),
-        "index_select" => (INDEX_SELECT_F32, INDEX_SELECT_F16, 3),
-        "causality_mask" => (CAUSALITY_MASK_F32, CAUSALITY_MASK_F16, 1),
-        "scatter_set" => (SCATTER_SET_F32, SCATTER_SET_F16, 3),
-        "gemm_tiled" => (GEMM_TILED_F32, GEMM_TILED_F16, 3),
-        "gemv" => (GEMV_F32, GEMV_F16, 3),
-        // conv shaders are f32-only (llama does not use conv).
-        "conv1d" => (CONV1D_F32, CONV1D_F32, 3),
-        "conv_transpose1d" => (CONV_TRANSPOSE1D_F32, CONV_TRANSPOSE1D_F32, 3),
+    type Def = (&'static [u8], Option<&'static [u8]>, Option<&'static [u8]>, u32);
+    // (f32 spirv, f16 spirv, bf16 spirv, binding count)
+    let (f32b, f16b, bf16b, bindings): Def = match base {
+        "unary" => (UNARY_F32, Some(UNARY_F16), Some(UNARY_BF16), 2),
+        "binary" => (BINARY_F32, Some(BINARY_F16), Some(BINARY_BF16), 3),
+        "scale_add" => (SCALE_ADD_F32, Some(SCALE_ADD_F16), Some(SCALE_ADD_BF16), 2),
+        "broadcast" => (BROADCAST_F32, Some(BROADCAST_F16), Some(BROADCAST_BF16), 4),
+        "softmax" => (SOFTMAX_F32, Some(SOFTMAX_F16), Some(SOFTMAX_BF16), 2),
+        "rmsnorm" => (RMSNORM_F32, Some(RMSNORM_F16), Some(RMSNORM_BF16), 3),
+        "layernorm" => (LAYERNORM_F32, Some(LAYERNORM_F16), Some(LAYERNORM_BF16), 4),
+        "rope" => (ROPE_F32, Some(ROPE_F16), Some(ROPE_BF16), 4),
+        "rope_i" => (ROPE_I_F32, Some(ROPE_I_F16), Some(ROPE_I_BF16), 4),
+        "reduce" => (REDUCE_F32, Some(REDUCE_F16), Some(REDUCE_BF16), 2),
+        "reduce_arg" => (REDUCE_ARG_F32, Some(REDUCE_ARG_F16), Some(REDUCE_ARG_BF16), 2),
+        "transpose" => (TRANSPOSE_F32, Some(TRANSPOSE_F16), Some(TRANSPOSE_BF16), 2),
+        "copy2d" => (COPY2D_F32, Some(COPY2D_F16), Some(COPY2D_BF16), 2),
+        "copy_strided" => (COPY_STRIDED_F32, Some(COPY_STRIDED_F16), Some(COPY_STRIDED_BF16), 3),
+        "index_select" => (INDEX_SELECT_F32, Some(INDEX_SELECT_F16), Some(INDEX_SELECT_BF16), 3),
+        "causality_mask" => {
+            (CAUSALITY_MASK_F32, Some(CAUSALITY_MASK_F16), Some(CAUSALITY_MASK_BF16), 1)
+        }
+        "scatter_set" => (SCATTER_SET_F32, Some(SCATTER_SET_F16), Some(SCATTER_SET_BF16), 3),
+        "gemm_tiled" => (GEMM_TILED_F32, Some(GEMM_TILED_F16), Some(GEMM_TILED_BF16), 3),
+        "gemv" => (GEMV_F32, Some(GEMV_F16), Some(GEMV_BF16), 3),
+        // conv shaders are f32-only; other dtypes must fail pipeline lookup.
+        "conv1d" => (CONV1D_F32, None, None, 3),
+        "conv_transpose1d" => (CONV_TRANSPOSE1D_F32, None, None, 3),
         _ => return None,
     };
-    let bytes = if dt == "f16" { f16b } else { f32b };
+    let bytes = match dt {
+        "f16" => f16b?,
+        "bf16" => bf16b?,
+        _ => f32b,
+    };
     Some((bytes, bindings))
 }
 
@@ -195,6 +204,7 @@ pub struct DeviceInner {
     pipeline_layouts: [vk::PipelineLayout; MAX_BINDINGS + 1],
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
     supports_f16: bool,
+    supports_bf16: bool,
     pool: Mutex<BufferPool>,
     /// Set when `XN_VULKAN_PROFILE=1` and the queue supports timestamps.
     profile_enabled: bool,
@@ -285,22 +295,27 @@ impl Device {
             .ok_or_else(|| crate::Error::msg("vulkan: no compute queue family"))?
             as u32;
 
-        // Detect f16 support: shaderFloat16 arithmetic + 16-bit SSBO storage.
+        // Detect 16-bit support:
+        //   f16 needs shaderFloat16 arithmetic + 16-bit SSBO storage;
+        //   bf16 is emulated over uint16_t storage, needing shaderInt16 +
+        //   16-bit SSBO storage (no extension: bf16 <-> f32 is bit shifting).
         let mut f16_int8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
         let mut features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f16_int8)
             .push_next(&mut storage16);
         unsafe { instance.get_physical_device_features2(pdevice, &mut features2) };
+        // NB: read features2 before f16_int8/storage16 — it mutably borrows them.
+        let shader_int16 = features2.features.shader_int16 != 0;
         let dev_exts =
             unsafe { instance.enumerate_device_extension_properties(pdevice) }.unwrap_or_default();
         let has_ext = |name: &CStr| {
             dev_exts.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name)
         };
         let f16_ext_name = ash::khr::shader_float16_int8::NAME;
-        let supports_f16 = f16_int8.shader_float16 != 0
-            && storage16.storage_buffer16_bit_access != 0
-            && has_ext(f16_ext_name);
+        let storage16_ok = storage16.storage_buffer16_bit_access != 0;
+        let supports_f16 = f16_int8.shader_float16 != 0 && storage16_ok && has_ext(f16_ext_name);
+        let supports_bf16 = shader_int16 && storage16_ok;
 
         let priorities = [1.0f32];
         let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -312,15 +327,21 @@ impl Device {
         // struct); `shaderFloat16` still needs its extension string in 1.1.
         let ext_ptrs: Vec<*const std::ffi::c_char> =
             if supports_f16 { vec![f16_ext_name.as_ptr()] } else { vec![] };
+        let core_features = vk::PhysicalDeviceFeatures::default().shader_int16(supports_bf16);
         let mut f16_enable =
             vk::PhysicalDeviceShaderFloat16Int8Features::default().shader_float16(true);
         let mut s16_enable =
             vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
         let mut device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
+            .enabled_features(&core_features)
             .enabled_extension_names(&ext_ptrs);
+        if supports_f16 || supports_bf16 {
+            // Both 16-bit dtypes need the 16-bit SSBO storage feature.
+            device_create = device_create.push_next(&mut s16_enable);
+        }
         if supports_f16 {
-            device_create = device_create.push_next(&mut f16_enable).push_next(&mut s16_enable);
+            device_create = device_create.push_next(&mut f16_enable);
         }
         let device = unsafe { instance.create_device(pdevice, &device_create, None) }
             .map_err(vkerr("create_device"))?;
@@ -411,6 +432,7 @@ impl Device {
             pipeline_layouts,
             pipelines: Mutex::new(HashMap::new()),
             supports_f16,
+            supports_bf16,
             pool: Mutex::new(BufferPool::default()),
             profile_enabled,
             query_pool,
@@ -438,6 +460,12 @@ impl Device {
     /// can be stored as `half::f16`).
     pub fn supports_f16(&self) -> bool {
         self.supports_f16
+    }
+
+    /// Whether this device supports bf16 storage (emulated over uint16_t
+    /// buffers with f32 compute; needs shaderInt16 + 16-bit SSBO storage).
+    pub fn supports_bf16(&self) -> bool {
+        self.supports_bf16
     }
 
     /// Find a memory type index within `type_bits` that has all of `flags`.
@@ -934,23 +962,26 @@ fn check_f32<T: WithDType>(op: &str) -> Result<()> {
     Ok(())
 }
 
-/// Shader dtype suffix ("f32"/"f16") for a float storage type; errors on other
-/// dtypes or when f16 is requested on a device that lacks f16 support.
+/// Shader dtype suffix ("f32"/"f16"/"bf16") for a float storage type; errors
+/// on other dtypes or when the device lacks the required 16-bit support.
 fn dtype_suffix<T: WithDType>(dev: &Device, op: &str) -> Result<&'static str> {
     match T::DTYPE {
         DType::F32 => Ok("f32"),
         DType::F16 if dev.supports_f16 => Ok("f16"),
         DType::F16 => crate::bail!("vulkan: {op}: device does not support f16"),
-        d => crate::bail!("vulkan: {op} supports f32/f16, got {d:?}"),
+        DType::BF16 if dev.supports_bf16 => Ok("bf16"),
+        DType::BF16 => crate::bail!("vulkan: {op}: device does not support bf16"),
+        d => crate::bail!("vulkan: {op} supports f32/f16/bf16, got {d:?}"),
     }
 }
 
 /// Suffix for the GPU path of dtype-generic ops, or `None` to take the host
-/// fallback (non-float dtypes, or f16 without device support).
+/// fallback (non-float dtypes, or 16-bit floats without device support).
 fn float_suffix<T: WithDType>(dev: &Device) -> Option<&'static str> {
     match T::DTYPE {
         DType::F32 => Some("f32"),
         DType::F16 if dev.supports_f16 => Some("f16"),
+        DType::BF16 if dev.supports_bf16 => Some("bf16"),
         _ => None,
     }
 }

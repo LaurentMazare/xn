@@ -546,6 +546,120 @@ fn f16_index_select_and_rope() -> Result<()> {
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// bf16 compute path (uint16_t storage, f32 compute; validated against the f32
+// CPU reference with a loose tolerance — bf16 has 8 mantissa bits).
+// -----------------------------------------------------------------------------
+
+fn to_bf16_vec(v: &[f32]) -> Vec<half::bf16> {
+    v.iter().map(|&x| half::bf16::from_f32(x)).collect()
+}
+
+fn bf16_to_f32(v: &[half::bf16]) -> Vec<f32> {
+    v.iter().map(|x| x.to_f32()).collect()
+}
+
+#[test]
+fn bf16_gpu_roundtrip_exact() -> Result<()> {
+    if !dev().supports_bf16() {
+        eprintln!("skipping: device lacks bf16 support");
+        return Ok(());
+    }
+    // a + 0 forces a GPU LOAD/STORE round trip through the bf16 shader path;
+    // bf16 -> f32 is exact and f32 -> bf16 RNE round-trips exactly, so the
+    // output must be bit-identical to the input (incl. negatives and zeros).
+    let data: Vec<half::bf16> =
+        to_bf16_vec(&[0.0, -0.0, 1.0, -1.5, std::f32::consts::PI, -65504.0, 1e-8, 3.0e38]);
+    let n = data.len();
+    let a: Tensor<half::bf16, Vk> = Tensor::from_vec(data.clone(), vec![n], &dev())?;
+    let z: Tensor<half::bf16, Vk> = Tensor::zeros(vec![n], &dev())?;
+    assert_eq!(a.add(&z)?.to_vec()?, data);
+    Ok(())
+}
+
+#[test]
+fn bf16_matmul_gemm_and_gemv() -> Result<()> {
+    if !dev().supports_bf16() {
+        return Ok(());
+    }
+    for (m, k, n) in [(1usize, 512usize, 384usize), (16, 128, 64)] {
+        let a = iota(m * k);
+        let b = iota(k * n);
+        let av: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&a), vec![m, k], &dev())?;
+        let bv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&b), vec![k, n], &dev())?;
+        let ac: Tensor<f32, _> = Tensor::from_vec(a, vec![m, k], &CPU)?;
+        let bc: Tensor<f32, _> = Tensor::from_vec(b, vec![k, n], &CPU)?;
+        let got = bf16_to_f32(&av.matmul(&bv)?.to_vec()?);
+        assert_close(&ac.matmul(&bc)?.to_vec()?, &got, 5e-2);
+    }
+    Ok(())
+}
+
+#[test]
+fn bf16_elementwise_and_norm() -> Result<()> {
+    if !dev().supports_bf16() {
+        return Ok(());
+    }
+    let a: Vec<f32> = (0..64).map(|i| (i as f32) * 0.05 + 0.1).collect();
+    let av: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&a), vec![64], &dev())?;
+    let ac: Tensor<f32, _> = Tensor::from_vec(a.clone(), vec![64], &CPU)?;
+    assert_close(&ac.silu()?.to_vec()?, &bf16_to_f32(&av.silu()?.to_vec()?), 5e-2);
+
+    let b: Vec<f32> = a.iter().map(|x| x + 0.5).collect();
+    let bv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&b), vec![64], &dev())?;
+    let bc: Tensor<f32, _> = Tensor::from_vec(b, vec![64], &CPU)?;
+    assert_close(&ac.add(&bc)?.to_vec()?, &bf16_to_f32(&av.add(&bv)?.to_vec()?), 5e-2);
+
+    let data = iota(4 * 16);
+    let w: Vec<f32> = (0..16).map(|i| 0.5 + i as f32 * 0.03).collect();
+    let dv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&data), vec![4, 16], &dev())?;
+    let wv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&w), vec![16], &dev())?;
+    let dc: Tensor<f32, _> = Tensor::from_vec(data.clone(), vec![4, 16], &CPU)?;
+    let wc: Tensor<f32, _> = Tensor::from_vec(w, vec![16], &CPU)?;
+    assert_close(
+        &dc.rms_norm(&wc, 1e-5)?.to_vec()?,
+        &bf16_to_f32(&dv.rms_norm(&wv, 1e-5)?.to_vec()?),
+        5e-2,
+    );
+    assert_close(&dc.softmax()?.to_vec()?, &bf16_to_f32(&dv.softmax()?.to_vec()?), 5e-2);
+    Ok(())
+}
+
+#[test]
+fn bf16_index_select_and_rope() -> Result<()> {
+    if !dev().supports_bf16() {
+        return Ok(());
+    }
+    let data = iota(5 * 3);
+    let ids = vec![0i64, 2, 4, 1, -1];
+    let dv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&data), vec![5, 3], &dev())?;
+    let iv: Tensor<i64, Vk> = Tensor::from_vec(ids.clone(), vec![5], &dev())?;
+    let dc: Tensor<f32, _> = Tensor::from_vec(data, vec![5, 3], &CPU)?;
+    let ic: Tensor<i64, _> = Tensor::from_vec(ids, vec![5], &CPU)?;
+    assert_close(
+        &dc.index_select(&ic, 0)?.to_vec()?,
+        &bf16_to_f32(&dv.index_select(&iv, 0)?.to_vec()?),
+        5e-3,
+    );
+
+    let (b, h, t, d, mp) = (1, 2, 3, 4, 10);
+    let x = iota(b * h * t * d);
+    let cos: Vec<f32> = (0..mp * d / 2).map(|i| (i as f32 * 0.3).cos()).collect();
+    let sin: Vec<f32> = (0..mp * d / 2).map(|i| (i as f32 * 0.3).sin()).collect();
+    let xv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&x), vec![b, h, t, d], &dev())?;
+    let cv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&cos), vec![mp, d / 2], &dev())?;
+    let sv: Tensor<half::bf16, Vk> = Tensor::from_vec(to_bf16_vec(&sin), vec![mp, d / 2], &dev())?;
+    let xc: Tensor<f32, _> = Tensor::from_vec(x, vec![b, h, t, d], &CPU)?;
+    let cc: Tensor<f32, _> = Tensor::from_vec(cos, vec![mp, d / 2], &CPU)?;
+    let sc: Tensor<f32, _> = Tensor::from_vec(sin, vec![mp, d / 2], &CPU)?;
+    assert_close(
+        &xc.rope(&cc, &sc, 2)?.to_vec()?,
+        &bf16_to_f32(&xv.rope(&cv, &sv, 2)?.to_vec()?),
+        5e-2,
+    );
+    Ok(())
+}
+
 #[test]
 fn conv_transpose1d_cmp() -> Result<()> {
     for (b, ic, oc, len, ks, stride) in [(1, 1, 1, 3, 3, 1), (1, 2, 3, 4, 3, 2), (2, 2, 2, 5, 2, 2)]

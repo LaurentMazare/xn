@@ -44,7 +44,14 @@ fn build_vulkan_shaders() {
     // Each shader is compiled twice: an f32 variant and an `-DUSE_F16` variant
     // (float16_t storage). The f16 variant needs a newer target-env for the
     // 16-bit-storage / float16 extensions.
-    let variants = [("F32", "vulkan1.0", None), ("F16", "vulkan1.2", Some("USE_F16"))];
+    // 16-bit variants need vulkan1.1 (SPIR-V 1.3) for the 16-bit storage and
+    // arithmetic-type capabilities; this matches the apiVersion the backend
+    // declares at instance creation.
+    let variants = [
+        ("F32", "vulkan1.0", None),
+        ("F16", "vulkan1.1", Some("USE_F16")),
+        ("BF16", "vulkan1.1", Some("USE_BF16")),
+    ];
     for path in &entries {
         println!("cargo:rerun-if-changed={}", path.display());
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();

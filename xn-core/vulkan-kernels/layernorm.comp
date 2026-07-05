@@ -27,7 +27,7 @@ void main() {
     float s1 = 0.0;
     float s2 = 0.0;
     for (uint c = tid; c < pc.ncols; c += 256u) {
-        float x = float(src[base + c]);
+        float x = LOAD(src[base + c]);
         s1 += x;
         s2 += x * x;
     }
@@ -48,7 +48,7 @@ void main() {
     barrier();
 
     for (uint c = tid; c < pc.ncols; c += 256u) {
-        float lhs = (float(src[base + c]) - mean_off) * inv_std;
-        dst[base + c] = SCALAR(lhs * float(weight[c]) + float(bias[c]));
+        float lhs = (LOAD(src[base + c]) - mean_off) * inv_std;
+        dst[base + c] = STORE(lhs * LOAD(weight[c]) + LOAD(bias[c]));
     }
 }

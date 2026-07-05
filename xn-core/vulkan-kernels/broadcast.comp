@@ -31,8 +31,8 @@ void main() {
         li += coord * info[nd + di];
         ri += coord * info[2u * nd + di];
     }
-    float a = float(lhs[li]);
-    float b = float(rhs[ri]);
+    float a = LOAD(lhs[li]);
+    float b = LOAD(rhs[ri]);
     float r;
     switch (pc.op) {
         case 0u: r = a + b; break;
@@ -43,5 +43,5 @@ void main() {
         case 5u: r = min(a, b); break;
         default: r = a;
     }
-    dst[idx] = SCALAR(r);
+    dst[idx] = STORE(r);
 }

@@ -21,6 +21,6 @@ void main() {
     uint tmp = idx / pc.t2;
     uint idx1 = tmp % pc.t1;
     if (idx2 > pc.offset + idx1) {
-        dst[idx] = SCALAR(uintBitsToFloat(0xff800000u)); // -inf
+        dst[idx] = STORE(uintBitsToFloat(0xff800000u)); // -inf
     }
 }
