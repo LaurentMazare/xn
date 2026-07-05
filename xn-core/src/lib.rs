@@ -40,6 +40,11 @@ pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub use cuda_backend::Device as CudaDevice;
 
+#[cfg(feature = "metal")]
+pub mod metal_backend;
+#[cfg(feature = "metal")]
+pub use metal_backend::Device as MetalDevice;
+
 #[cfg(feature = "vulkan")]
 pub mod vulkan_backend;
 #[cfg(feature = "vulkan")]
@@ -146,7 +151,16 @@ pub fn run_with_device<W: WithQ>(w: W, _cpu_only: bool, _device_id: usize) -> Re
             w.run::<Unquantized<f32, _>>(dev)?;
         }
     }
-    #[cfg(all(not(feature = "cuda"), not(feature = "vulkan")))]
+    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "vulkan"))))]
+    {
+        if _cpu_only {
+            w.run::<Unquantized<f32, _>>(CpuDevice)?;
+        } else {
+            let dev = metal_backend::Device::new(_device_id)?;
+            w.run::<Unquantized<f32, _>>(dev)?;
+        }
+    }
+    #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "metal")))]
     {
         w.run::<Unquantized<f32, _>>(CpuDevice)?;
     }
@@ -232,6 +246,31 @@ impl Runner {
                         if !dev.supports_bf16() {
                             return Err(Error::msg("vulkan device does not support bf16"));
                         }
+                        w.run::<Unquantized<half::bf16, _>>(dev)?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "vulkan"))))]
+        {
+            // The Metal backend computes in f32 with f16 or bf16 storage also
+            // supported. Quantized formats stay on CPU.
+            if !self.cpu_only {
+                match self.dtype {
+                    DTypeQ::F32 => {
+                        let dev = metal_backend::Device::new(_device_id)?;
+                        w.run::<Unquantized<f32, _>>(dev)?;
+                        return Ok(());
+                    }
+                    DTypeQ::F16 => {
+                        let dev = metal_backend::Device::new(_device_id)?;
+                        w.run::<Unquantized<half::f16, _>>(dev)?;
+                        return Ok(());
+                    }
+                    DTypeQ::BF16 => {
+                        let dev = metal_backend::Device::new(_device_id)?;
                         w.run::<Unquantized<half::bf16, _>>(dev)?;
                         return Ok(());
                     }

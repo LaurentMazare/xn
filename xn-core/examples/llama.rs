@@ -233,7 +233,25 @@ fn main() -> Result<()> {
             }
         }
     }
-    #[cfg(all(not(feature = "cuda"), not(feature = "vulkan")))]
+    #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "vulkan"))))]
+    {
+        if args.cpu {
+            println!("Using CPU backend (f32)");
+            run_for_device::<f32, _>(args, xn::CPU)?;
+        } else {
+            let dev = xn::metal_backend::Device::new(0)?;
+            // The Metal backend runs f16 by default (halves memory traffic;
+            // decode is bandwidth-bound). `--f32` forces f32.
+            if !args.f32 {
+                println!("Using Metal backend (f16): {}", dev.name());
+                run_for_device::<half::f16, _>(args, dev)?;
+            } else {
+                println!("Using Metal backend (f32): {}", dev.name());
+                run_for_device::<f32, _>(args, dev)?;
+            }
+        }
+    }
+    #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "metal")))]
     {
         println!("Using CPU backend");
         run_for_device::<f32, _>(args, xn::CPU)?;
