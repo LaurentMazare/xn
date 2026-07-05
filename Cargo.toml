@@ -17,6 +17,7 @@ license = "MIT/Apache-2.0"
 [workspace.dependencies]
 xn = { path = "xn-core", version = "0.1.13" }
 anyhow = "1"
+ash = "0.38"
 bindgen_cuda = "0.1.6"
 byteorder = "1"
 clap = { version = "4", features = ["derive"] }

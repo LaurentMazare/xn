@@ -1,8 +1,8 @@
 use xn::{Backend, Result, Tensor, TensorView};
 
-/// Macro to generate tests for both CPU and CUDA backends.
+/// Macro to generate tests for the CPU backend and any enabled GPU backends.
 /// Each test function takes a device reference and runs the test logic.
-macro_rules! test_both_backends {
+macro_rules! test_all_backends {
     ($test_name:ident, $test_fn:ident) => {
         paste::paste! {
             #[test]
@@ -14,6 +14,13 @@ macro_rules! test_both_backends {
             #[test]
             fn [<$test_name _cuda>]() -> Result<()> {
                 let device = xn::cuda_backend::Device::new(0)?;
+                $test_fn(&device)
+            }
+
+            #[cfg(feature = "vulkan")]
+            #[test]
+            fn [<$test_name _vulkan>]() -> Result<()> {
+                let device = xn::vulkan_backend::Device::new(0)?;
                 $test_fn(&device)
             }
         }
@@ -34,7 +41,7 @@ fn test_cat_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.to_vec()?, vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.]);
     Ok(())
 }
-test_both_backends!(test_cat_dim0, test_cat_dim0_impl);
+test_all_backends!(test_cat_dim0, test_cat_dim0_impl);
 
 fn test_cat_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // Two 2x3 tensors concatenated along dim 1 -> 2x6
@@ -48,7 +55,7 @@ fn test_cat_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.to_vec()?, vec![1., 2., 3., 7., 8., 9., 4., 5., 6., 10., 11., 12.]);
     Ok(())
 }
-test_both_backends!(test_cat_dim1, test_cat_dim1_impl);
+test_all_backends!(test_cat_dim1, test_cat_dim1_impl);
 
 fn test_cat_3d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // Two 2x2x3 tensors concatenated along dim 1 -> 2x4x3
@@ -69,7 +76,7 @@ fn test_cat_3d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     );
     Ok(())
 }
-test_both_backends!(test_cat_3d_dim1, test_cat_3d_dim1_impl);
+test_all_backends!(test_cat_3d_dim1, test_cat_3d_dim1_impl);
 
 // =============================================================================
 // Reshape tests
@@ -96,7 +103,7 @@ fn test_reshape_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(e.dims(), &[1, 2, 3]);
     Ok(())
 }
-test_both_backends!(test_reshape, test_reshape_impl);
+test_all_backends!(test_reshape, test_reshape_impl);
 
 fn test_reshape_with_hole_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<f32, B> = Tensor::from_vec(vec![1., 2., 3., 4., 5., 6.], (2, 3), dev)?;
@@ -112,7 +119,7 @@ fn test_reshape_with_hole_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(d.dims(), &[1, 2, 3]);
     Ok(())
 }
-test_both_backends!(test_reshape_with_hole, test_reshape_with_hole_impl);
+test_all_backends!(test_reshape_with_hole, test_reshape_with_hole_impl);
 
 // =============================================================================
 // Index select tests
@@ -136,7 +143,7 @@ fn test_index_select_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.to_vec()?, vec![4., 5., 6., 4., 5., 6., 1., 2., 3.]);
     Ok(())
 }
-test_both_backends!(test_index_select_dim0, test_index_select_dim0_impl);
+test_all_backends!(test_index_select_dim0, test_index_select_dim0_impl);
 
 fn test_index_select_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // Select columns from a 2x4 tensor
@@ -150,7 +157,7 @@ fn test_index_select_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 3., 5., 7.]);
     Ok(())
 }
-test_both_backends!(test_index_select_dim1, test_index_select_dim1_impl);
+test_all_backends!(test_index_select_dim1, test_index_select_dim1_impl);
 
 fn test_index_select_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // 2x3x2 tensor
@@ -168,7 +175,7 @@ fn test_index_select_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 2., 5., 6., 7., 8., 11., 12.]);
     Ok(())
 }
-test_both_backends!(test_index_select_3d, test_index_select_3d_impl);
+test_all_backends!(test_index_select_3d, test_index_select_3d_impl);
 
 fn test_index_select_narrowed_indices_impl<B: Backend>(dev: &B) -> Result<()> {
     // Regression test: narrowing indices from index 0 produces a TensorView with
@@ -188,7 +195,7 @@ fn test_index_select_narrowed_indices_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![10., 20.]);
     Ok(())
 }
-test_both_backends!(test_index_select_narrowed_indices, test_index_select_narrowed_indices_impl);
+test_all_backends!(test_index_select_narrowed_indices, test_index_select_narrowed_indices_impl);
 
 /// An index of -1 should select a row of zeros rather than reading from the source.
 /// Generic over the float dtype so the same checks run for f32/f16/bf16 on every backend.
@@ -227,7 +234,7 @@ fn test_index_select_minus_one_impl<B: Backend>(dev: &B) -> Result<()> {
     test_index_select_minus_one_dtype::<half::bf16, B>(dev)?;
     Ok(())
 }
-test_both_backends!(test_index_select_minus_one, test_index_select_minus_one_impl);
+test_all_backends!(test_index_select_minus_one, test_index_select_minus_one_impl);
 
 // =============================================================================
 // Reduce tests
@@ -247,7 +254,7 @@ fn test_max_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![9., 5., 7., 6.]);
     Ok(())
 }
-test_both_backends!(test_max_dim0, test_max_dim0_impl);
+test_all_backends!(test_max_dim0, test_max_dim0_impl);
 
 fn test_max_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3x4 tensor, max along dim 1 -> 3
@@ -262,7 +269,7 @@ fn test_max_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![5., 8., 9.]);
     Ok(())
 }
-test_both_backends!(test_max_dim1, test_max_dim1_impl);
+test_all_backends!(test_max_dim1, test_max_dim1_impl);
 
 fn test_min_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3x4 tensor, min along dim 0 -> 4
@@ -278,7 +285,7 @@ fn test_min_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 0., 1., 2.]);
     Ok(())
 }
-test_both_backends!(test_min_dim0, test_min_dim0_impl);
+test_all_backends!(test_min_dim0, test_min_dim0_impl);
 
 fn test_min_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3x4 tensor, min along dim 1 -> 3
@@ -293,7 +300,7 @@ fn test_min_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 2., 0.]);
     Ok(())
 }
-test_both_backends!(test_min_dim1, test_min_dim1_impl);
+test_all_backends!(test_min_dim1, test_min_dim1_impl);
 
 fn test_argmin_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3x4 tensor, argmin along dim 0 -> 4
@@ -309,7 +316,7 @@ fn test_argmin_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0i64, 2, 2, 2]);
     Ok(())
 }
-test_both_backends!(test_argmin_dim0, test_argmin_dim0_impl);
+test_all_backends!(test_argmin_dim0, test_argmin_dim0_impl);
 
 fn test_argmin_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3x4 tensor, argmin along dim 1 -> 3
@@ -324,7 +331,7 @@ fn test_argmin_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0i64, 1, 1]);
     Ok(())
 }
-test_both_backends!(test_argmin_dim1, test_argmin_dim1_impl);
+test_all_backends!(test_argmin_dim1, test_argmin_dim1_impl);
 
 fn test_argmax_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3x4 tensor, argmax along dim 0 -> 4
@@ -340,7 +347,7 @@ fn test_argmax_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![2i64, 0, 1, 1]);
     Ok(())
 }
-test_both_backends!(test_argmax_dim0, test_argmax_dim0_impl);
+test_all_backends!(test_argmax_dim0, test_argmax_dim0_impl);
 
 fn test_argmax_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3x4 tensor, argmax along dim 1 -> 3
@@ -355,7 +362,7 @@ fn test_argmax_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1i64, 0, 0]);
     Ok(())
 }
-test_both_backends!(test_argmax_dim1, test_argmax_dim1_impl);
+test_all_backends!(test_argmax_dim1, test_argmax_dim1_impl);
 
 fn test_max_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // 2x3x2 tensor, max along dim 1 -> 2x2
@@ -367,7 +374,7 @@ fn test_max_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![5., 6., 11., 12.]);
     Ok(())
 }
-test_both_backends!(test_max_3d, test_max_3d_impl);
+test_all_backends!(test_max_3d, test_max_3d_impl);
 
 // =============================================================================
 // Broadcast tests
@@ -381,7 +388,7 @@ fn test_broadcast_add_same_shape_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.to_vec()?, vec![11., 22., 33., 44.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_add_same_shape, test_broadcast_add_same_shape_impl);
+test_all_backends!(test_broadcast_add_same_shape, test_broadcast_add_same_shape_impl);
 
 fn test_broadcast_add_1d_to_2d_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] + [3] -> [2, 3]
@@ -394,7 +401,7 @@ fn test_broadcast_add_1d_to_2d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.to_vec()?, vec![11., 22., 33., 14., 25., 36.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_add_1d_to_2d, test_broadcast_add_1d_to_2d_impl);
+test_all_backends!(test_broadcast_add_1d_to_2d, test_broadcast_add_1d_to_2d_impl);
 
 fn test_broadcast_mul_column_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] * [2, 1] -> [2, 3]
@@ -407,7 +414,7 @@ fn test_broadcast_mul_column_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.to_vec()?, vec![2., 4., 6., 12., 15., 18.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_mul_column, test_broadcast_mul_column_impl);
+test_all_backends!(test_broadcast_mul_column, test_broadcast_mul_column_impl);
 
 fn test_broadcast_sub_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] - [3] -> [2, 3]
@@ -418,7 +425,7 @@ fn test_broadcast_sub_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.to_vec()?, vec![9., 18., 27., 39., 48., 57.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_sub, test_broadcast_sub_impl);
+test_all_backends!(test_broadcast_sub, test_broadcast_sub_impl);
 
 fn test_broadcast_div_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] / [2, 1] -> [2, 3]
@@ -428,10 +435,16 @@ fn test_broadcast_div_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.dims(), &[2, 3]);
     // Row 0: [2/2, 4/2, 6/2] = [1, 2, 3]
     // Row 1: [9/3, 12/3, 15/3] = [3, 4, 5]
-    assert_eq!(c.to_vec()?, vec![1., 2., 3., 3., 4., 5.]);
+    // Division is compared approximately: unlike add/sub/mul, GPU float
+    // division is not required to be correctly rounded (Vulkan permits
+    // 2.5 ULP; RADV lowers it to rcp + multiply).
+    let expected = [1., 2., 3., 3., 4., 5.];
+    for (i, (got, want)) in c.to_vec()?.iter().zip(expected.iter()).enumerate() {
+        assert!((got - want).abs() <= want.abs() * 1e-6, "index {i}: got {got}, want {want}");
+    }
     Ok(())
 }
-test_both_backends!(test_broadcast_div, test_broadcast_div_impl);
+test_all_backends!(test_broadcast_div, test_broadcast_div_impl);
 
 fn test_broadcast_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3, 4] + [4] -> [2, 3, 4]
@@ -448,7 +461,7 @@ fn test_broadcast_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c_vec[4], 105.);
     Ok(())
 }
-test_both_backends!(test_broadcast_3d, test_broadcast_3d_impl);
+test_all_backends!(test_broadcast_3d, test_broadcast_3d_impl);
 
 // =============================================================================
 // Unsqueeze tests
@@ -462,7 +475,7 @@ fn test_unsqueeze_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, a.to_vec()?);
     Ok(())
 }
-test_both_backends!(test_unsqueeze_dim0, test_unsqueeze_dim0_impl);
+test_all_backends!(test_unsqueeze_dim0, test_unsqueeze_dim0_impl);
 
 fn test_unsqueeze_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // [3, 4] -> unsqueeze(1) -> [3, 1, 4]
@@ -472,7 +485,7 @@ fn test_unsqueeze_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, a.to_vec()?);
     Ok(())
 }
-test_both_backends!(test_unsqueeze_dim1, test_unsqueeze_dim1_impl);
+test_all_backends!(test_unsqueeze_dim1, test_unsqueeze_dim1_impl);
 
 fn test_unsqueeze_dim_last_impl<B: Backend>(dev: &B) -> Result<()> {
     // [3, 4] -> unsqueeze(2) -> [3, 4, 1]
@@ -482,7 +495,7 @@ fn test_unsqueeze_dim_last_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, a.to_vec()?);
     Ok(())
 }
-test_both_backends!(test_unsqueeze_dim_last, test_unsqueeze_dim_last_impl);
+test_all_backends!(test_unsqueeze_dim_last, test_unsqueeze_dim_last_impl);
 
 fn test_unsqueeze_1d_impl<B: Backend>(dev: &B) -> Result<()> {
     // [4] -> unsqueeze(0) -> [1, 4]
@@ -495,7 +508,7 @@ fn test_unsqueeze_1d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(c.dims(), &[4, 1]);
     Ok(())
 }
-test_both_backends!(test_unsqueeze_1d, test_unsqueeze_1d_impl);
+test_all_backends!(test_unsqueeze_1d, test_unsqueeze_1d_impl);
 
 // =============================================================================
 // Pad with zeros tests
@@ -509,7 +522,7 @@ fn test_pad_with_zeros_1d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0., 0., 1., 2., 3., 4., 0., 0., 0.]);
     Ok(())
 }
-test_both_backends!(test_pad_with_zeros_1d, test_pad_with_zeros_1d_impl);
+test_all_backends!(test_pad_with_zeros_1d, test_pad_with_zeros_1d_impl);
 
 fn test_pad_with_zeros_2d_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] -> pad_with_zeros(0, 1, 1) -> [4, 3]
@@ -520,7 +533,7 @@ fn test_pad_with_zeros_2d_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0., 0., 0., 1., 2., 3., 4., 5., 6., 0., 0., 0.]);
     Ok(())
 }
-test_both_backends!(test_pad_with_zeros_2d_dim0, test_pad_with_zeros_2d_dim0_impl);
+test_all_backends!(test_pad_with_zeros_2d_dim0, test_pad_with_zeros_2d_dim0_impl);
 
 fn test_pad_with_zeros_2d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] -> pad_with_zeros(1, 1, 2) -> [2, 6]
@@ -532,7 +545,7 @@ fn test_pad_with_zeros_2d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0., 1., 2., 3., 0., 0., 0., 4., 5., 6., 0., 0.]);
     Ok(())
 }
-test_both_backends!(test_pad_with_zeros_2d_dim1, test_pad_with_zeros_2d_dim1_impl);
+test_all_backends!(test_pad_with_zeros_2d_dim1, test_pad_with_zeros_2d_dim1_impl);
 
 fn test_pad_with_zeros_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 2, 3] -> pad_with_zeros(1, 1, 0) -> [2, 3, 3]
@@ -548,7 +561,7 @@ fn test_pad_with_zeros_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     );
     Ok(())
 }
-test_both_backends!(test_pad_with_zeros_3d, test_pad_with_zeros_3d_impl);
+test_all_backends!(test_pad_with_zeros_3d, test_pad_with_zeros_3d_impl);
 
 // =============================================================================
 // Conv1d tests
@@ -570,7 +583,7 @@ fn test_conv1d_simple_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![-2., -2., -2.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_simple, test_conv1d_simple_impl);
+test_all_backends!(test_conv1d_simple, test_conv1d_simple_impl);
 
 fn test_conv1d_with_padding_impl<B: Backend>(dev: &B) -> Result<()> {
     // Input: (batch=1, in_channels=1, length=4)
@@ -589,7 +602,7 @@ fn test_conv1d_with_padding_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![3., 6., 9., 7.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_with_padding, test_conv1d_with_padding_impl);
+test_all_backends!(test_conv1d_with_padding, test_conv1d_with_padding_impl);
 
 fn test_conv1d_with_stride_impl<B: Backend>(dev: &B) -> Result<()> {
     // Input: (batch=1, in_channels=1, length=6)
@@ -607,7 +620,7 @@ fn test_conv1d_with_stride_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![3., 7., 11.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_with_stride, test_conv1d_with_stride_impl);
+test_all_backends!(test_conv1d_with_stride, test_conv1d_with_stride_impl);
 
 fn test_conv1d_with_bias_impl<B: Backend>(dev: &B) -> Result<()> {
     let input: Tensor<f32, B> = Tensor::from_vec(vec![1., 2., 3., 4., 5.], (1, 1, 5), dev)?;
@@ -620,7 +633,7 @@ fn test_conv1d_with_bias_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![16., 19., 22.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_with_bias, test_conv1d_with_bias_impl);
+test_all_backends!(test_conv1d_with_bias, test_conv1d_with_bias_impl);
 
 fn test_conv1d_multi_channel_impl<B: Backend>(dev: &B) -> Result<()> {
     // Input: (batch=1, in_channels=2, length=3)
@@ -638,7 +651,7 @@ fn test_conv1d_multi_channel_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![3., 5., 9., 11.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_multi_channel, test_conv1d_multi_channel_impl);
+test_all_backends!(test_conv1d_multi_channel, test_conv1d_multi_channel_impl);
 
 fn test_conv1d_batch_simple_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=2, in_channels=1, length=4, kernel_size=2
@@ -654,7 +667,7 @@ fn test_conv1d_batch_simple_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![3., 5., 7., 11., 13., 15.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_batch_simple, test_conv1d_batch_simple_impl);
+test_all_backends!(test_conv1d_batch_simple, test_conv1d_batch_simple_impl);
 
 fn test_conv1d_batch_multi_channel_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=2, in_channels=2, out_channels=2, length=3, kernel_size=2
@@ -692,7 +705,7 @@ fn test_conv1d_batch_multi_channel_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![6., 8., 6., 8., 18., 20., 18., 20.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_batch_multi_channel, test_conv1d_batch_multi_channel_impl);
+test_all_backends!(test_conv1d_batch_multi_channel, test_conv1d_batch_multi_channel_impl);
 
 fn test_conv1d_batch_with_padding_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=3, in_channels=1, length=3, kernel_size=3, padding=1
@@ -713,7 +726,7 @@ fn test_conv1d_batch_with_padding_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![3., 6., 5., 9., 15., 11., 15., 24., 17.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_batch_with_padding, test_conv1d_batch_with_padding_impl);
+test_all_backends!(test_conv1d_batch_with_padding, test_conv1d_batch_with_padding_impl);
 
 fn test_conv1d_batch_with_stride_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=2, in_channels=1, length=6, kernel_size=2, stride=2
@@ -732,7 +745,7 @@ fn test_conv1d_batch_with_stride_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![-1., -1., -1., -1., -1., -1.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_batch_with_stride, test_conv1d_batch_with_stride_impl);
+test_all_backends!(test_conv1d_batch_with_stride, test_conv1d_batch_with_stride_impl);
 
 fn test_conv1d_batch_with_bias_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=2, in_channels=1, out_channels=2, length=3, kernel_size=2
@@ -754,7 +767,7 @@ fn test_conv1d_batch_with_bias_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![13., 15., 99., 99., 19., 21., 99., 99.]);
     Ok(())
 }
-test_both_backends!(test_conv1d_batch_with_bias, test_conv1d_batch_with_bias_impl);
+test_all_backends!(test_conv1d_batch_with_bias, test_conv1d_batch_with_bias_impl);
 
 fn test_conv1d_batch_large_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=4, in_channels=3, out_channels=2, length=8, kernel_size=3
@@ -811,7 +824,7 @@ fn test_conv1d_batch_large_impl<B: Backend>(dev: &B) -> Result<()> {
     }
     Ok(())
 }
-test_both_backends!(test_conv1d_batch_large, test_conv1d_batch_large_impl);
+test_all_backends!(test_conv1d_batch_large, test_conv1d_batch_large_impl);
 
 // =============================================================================
 // Conv transpose 1d tests
@@ -836,7 +849,7 @@ fn test_conv_transpose1d_simple_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![1., 3., 6., 5., 3.]);
     Ok(())
 }
-test_both_backends!(test_conv_transpose1d_simple, test_conv_transpose1d_simple_impl);
+test_all_backends!(test_conv_transpose1d_simple, test_conv_transpose1d_simple_impl);
 
 fn test_conv_transpose1d_with_stride_impl<B: Backend>(dev: &B) -> Result<()> {
     // Input: (batch=1, in_channels=1, length=3)
@@ -855,7 +868,7 @@ fn test_conv_transpose1d_with_stride_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![1., 1., 2., 2., 3., 3.]);
     Ok(())
 }
-test_both_backends!(test_conv_transpose1d_with_stride, test_conv_transpose1d_with_stride_impl);
+test_all_backends!(test_conv_transpose1d_with_stride, test_conv_transpose1d_with_stride_impl);
 
 fn test_conv_transpose1d_with_bias_impl<B: Backend>(dev: &B) -> Result<()> {
     let input: Tensor<f32, B> = Tensor::from_vec(vec![1., 2.], (1, 1, 2), dev)?;
@@ -869,7 +882,7 @@ fn test_conv_transpose1d_with_bias_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![6., 8., 7.]);
     Ok(())
 }
-test_both_backends!(test_conv_transpose1d_with_bias, test_conv_transpose1d_with_bias_impl);
+test_all_backends!(test_conv_transpose1d_with_bias, test_conv_transpose1d_with_bias_impl);
 
 fn test_conv_transpose1d_batch_simple_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=2, in_channels=1, out_channels=1, length=3, kernel_size=3
@@ -888,7 +901,7 @@ fn test_conv_transpose1d_batch_simple_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(output.to_vec()?, vec![1., 3., 6., 5., 3., 4., 9., 15., 11., 6.]);
     Ok(())
 }
-test_both_backends!(test_conv_transpose1d_batch_simple, test_conv_transpose1d_batch_simple_impl);
+test_all_backends!(test_conv_transpose1d_batch_simple, test_conv_transpose1d_batch_simple_impl);
 
 fn test_conv_transpose1d_batch_multi_channel_impl<B: Backend>(dev: &B) -> Result<()> {
     // batch=2, in_channels=2, out_channels=1, length=2, kernel_size=2
@@ -912,7 +925,7 @@ fn test_conv_transpose1d_batch_multi_channel_impl<B: Backend>(dev: &B) -> Result
     assert_eq!(output.to_vec()?, vec![4., 10., 6., 12., 26., 14.]);
     Ok(())
 }
-test_both_backends!(
+test_all_backends!(
     test_conv_transpose1d_batch_multi_channel,
     test_conv_transpose1d_batch_multi_channel_impl
 );
@@ -937,7 +950,7 @@ fn test_conv_transpose1d_batch_with_stride_impl<B: Backend>(dev: &B) -> Result<(
     assert_eq!(output.to_vec()?, vec![1., 1., 2., 2., 3., 3., 4., 4., 5., 5., 6., 6.]);
     Ok(())
 }
-test_both_backends!(
+test_all_backends!(
     test_conv_transpose1d_batch_with_stride,
     test_conv_transpose1d_batch_with_stride_impl
 );
@@ -966,7 +979,7 @@ fn test_conv_transpose1d_batch_with_bias_impl<B: Backend>(dev: &B) -> Result<()>
     );
     Ok(())
 }
-test_both_backends!(
+test_all_backends!(
     test_conv_transpose1d_batch_with_bias,
     test_conv_transpose1d_batch_with_bias_impl
 );
@@ -983,7 +996,7 @@ fn test_pad_with_same_1d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 1., 1., 2., 3., 4., 4., 4., 4.]);
     Ok(())
 }
-test_both_backends!(test_pad_with_same_1d, test_pad_with_same_1d_impl);
+test_all_backends!(test_pad_with_same_1d, test_pad_with_same_1d_impl);
 
 fn test_pad_with_same_2d_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] -> pad_with_same(0, 1, 1) -> [4, 3]
@@ -998,7 +1011,7 @@ fn test_pad_with_same_2d_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 2., 3., 1., 2., 3., 4., 5., 6., 4., 5., 6.]);
     Ok(())
 }
-test_both_backends!(test_pad_with_same_2d_dim0, test_pad_with_same_2d_dim0_impl);
+test_all_backends!(test_pad_with_same_2d_dim0, test_pad_with_same_2d_dim0_impl);
 
 fn test_pad_with_same_2d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3] -> pad_with_same(1, 1, 2) -> [2, 6]
@@ -1011,7 +1024,7 @@ fn test_pad_with_same_2d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 1., 2., 3., 3., 3., 4., 4., 5., 6., 6., 6.]);
     Ok(())
 }
-test_both_backends!(test_pad_with_same_2d_dim1, test_pad_with_same_2d_dim1_impl);
+test_all_backends!(test_pad_with_same_2d_dim1, test_pad_with_same_2d_dim1_impl);
 
 fn test_pad_with_same_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 2, 2] -> pad_with_same(1, 1, 1) -> [2, 4, 2]
@@ -1024,7 +1037,7 @@ fn test_pad_with_same_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1., 2., 1., 2., 3., 4., 3., 4., 5., 6., 5., 6., 7., 8., 7., 8.]);
     Ok(())
 }
-test_both_backends!(test_pad_with_same_3d, test_pad_with_same_3d_impl);
+test_all_backends!(test_pad_with_same_3d, test_pad_with_same_3d_impl);
 
 // =============================================================================
 // Sum keepdim tests
@@ -1038,7 +1051,7 @@ fn test_sum_keepdim_1d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![15.]);
     Ok(())
 }
-test_both_backends!(test_sum_keepdim_1d, test_sum_keepdim_1d_impl);
+test_all_backends!(test_sum_keepdim_1d, test_sum_keepdim_1d_impl);
 
 fn test_sum_keepdim_2d_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     // [3, 4] -> sum_keepdim(0) -> [1, 4]
@@ -1050,7 +1063,7 @@ fn test_sum_keepdim_2d_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![15., 18., 21., 24.]);
     Ok(())
 }
-test_both_backends!(test_sum_keepdim_2d_dim0, test_sum_keepdim_2d_dim0_impl);
+test_all_backends!(test_sum_keepdim_2d_dim0, test_sum_keepdim_2d_dim0_impl);
 
 fn test_sum_keepdim_2d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // [3, 4] -> sum_keepdim(1) -> [3, 1]
@@ -1062,7 +1075,7 @@ fn test_sum_keepdim_2d_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![10., 26., 42.]);
     Ok(())
 }
-test_both_backends!(test_sum_keepdim_2d_dim1, test_sum_keepdim_2d_dim1_impl);
+test_all_backends!(test_sum_keepdim_2d_dim1, test_sum_keepdim_2d_dim1_impl);
 
 fn test_sum_keepdim_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3, 2] -> sum_keepdim(1) -> [2, 1, 2]
@@ -1074,7 +1087,7 @@ fn test_sum_keepdim_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![9., 12., 27., 30.]);
     Ok(())
 }
-test_both_backends!(test_sum_keepdim_3d, test_sum_keepdim_3d_impl);
+test_all_backends!(test_sum_keepdim_3d, test_sum_keepdim_3d_impl);
 
 fn test_sum_keepdim_multiple_dims_impl<B: Backend>(dev: &B) -> Result<()> {
     // [2, 3, 4] -> sum_keepdim([1, 2]) -> [2, 1, 1]
@@ -1086,7 +1099,7 @@ fn test_sum_keepdim_multiple_dims_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![78., 222.]);
     Ok(())
 }
-test_both_backends!(test_sum_keepdim_multiple_dims, test_sum_keepdim_multiple_dims_impl);
+test_all_backends!(test_sum_keepdim_multiple_dims, test_sum_keepdim_multiple_dims_impl);
 
 // =============================================================================
 // Slice set tests
@@ -1105,7 +1118,7 @@ fn test_slice_set_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(dst.to_vec()?, vec![0., 0., 0., 1., 2., 3., 4., 5., 6., 0., 0., 0.]);
     Ok(())
 }
-test_both_backends!(test_slice_set_dim0, test_slice_set_dim0_impl);
+test_all_backends!(test_slice_set_dim0, test_slice_set_dim0_impl);
 
 fn test_slice_set_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // dst: [2, 6], src: [2, 3], set at offset 2 along dim 1
@@ -1118,7 +1131,7 @@ fn test_slice_set_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(dst.to_vec()?, vec![0., 0., 1., 2., 3., 0., 0., 0., 4., 5., 6., 0.]);
     Ok(())
 }
-test_both_backends!(test_slice_set_dim1, test_slice_set_dim1_impl);
+test_all_backends!(test_slice_set_dim1, test_slice_set_dim1_impl);
 
 fn test_slice_set_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // dst: [2, 4, 3], src: [2, 2, 3], set at offset 1 along dim 1
@@ -1138,7 +1151,7 @@ fn test_slice_set_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     );
     Ok(())
 }
-test_both_backends!(test_slice_set_3d, test_slice_set_3d_impl);
+test_all_backends!(test_slice_set_3d, test_slice_set_3d_impl);
 
 fn test_slice_set_at_start_impl<B: Backend>(dev: &B) -> Result<()> {
     // dst: [4, 2], src: [2, 2], set at offset 0
@@ -1149,7 +1162,7 @@ fn test_slice_set_at_start_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(dst.to_vec()?, vec![1., 2., 3., 4., 9., 9., 9., 9.]);
     Ok(())
 }
-test_both_backends!(test_slice_set_at_start, test_slice_set_at_start_impl);
+test_all_backends!(test_slice_set_at_start, test_slice_set_at_start_impl);
 
 fn test_slice_set_at_end_impl<B: Backend>(dev: &B) -> Result<()> {
     // dst: [4, 2], src: [2, 2], set at offset 2 (at the end)
@@ -1160,7 +1173,7 @@ fn test_slice_set_at_end_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(dst.to_vec()?, vec![9., 9., 9., 9., 1., 2., 3., 4.]);
     Ok(())
 }
-test_both_backends!(test_slice_set_at_end, test_slice_set_at_end_impl);
+test_all_backends!(test_slice_set_at_end, test_slice_set_at_end_impl);
 
 fn test_slice_set_1d_impl<B: Backend>(dev: &B) -> Result<()> {
     // dst: [8], src: [3], set at offset 2
@@ -1171,7 +1184,7 @@ fn test_slice_set_1d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(dst.to_vec()?, vec![0., 0., 1., 2., 3., 0., 0., 0.]);
     Ok(())
 }
-test_both_backends!(test_slice_set_1d, test_slice_set_1d_impl);
+test_all_backends!(test_slice_set_1d, test_slice_set_1d_impl);
 
 // =============================================================================
 // Scatter tests
@@ -1192,7 +1205,7 @@ fn test_scatter_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, vec![1., 5., 6., 0., 0., 3., 4., 2., 0.]);
     Ok(())
 }
-test_both_backends!(test_scatter_dim0, test_scatter_dim0_impl);
+test_all_backends!(test_scatter_dim0, test_scatter_dim0_impl);
 
 fn test_scatter_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     // dst: 2x4 zeros, scatter src into dst along dim 1
@@ -1207,7 +1220,7 @@ fn test_scatter_dim1_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, vec![2., 3., 0., 1., 6., 0., 4., 5.]);
     Ok(())
 }
-test_both_backends!(test_scatter_dim1, test_scatter_dim1_impl);
+test_all_backends!(test_scatter_dim1, test_scatter_dim1_impl);
 
 fn test_scatter_set_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     // In-place scatter_set
@@ -1221,7 +1234,7 @@ fn test_scatter_set_dim0_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(dst.to_vec()?, vec![10., 2., 30., 40., 50., 3., 1., 80., 90.]);
     Ok(())
 }
-test_both_backends!(test_scatter_set_dim0, test_scatter_set_dim0_impl);
+test_all_backends!(test_scatter_set_dim0, test_scatter_set_dim0_impl);
 
 fn test_scatter_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // 3D scatter along dim 1
@@ -1239,7 +1252,7 @@ fn test_scatter_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, vec![0., 2., 0., 0., 1., 0., 0., 0., 3., 0., 0., 4.]);
     Ok(())
 }
-test_both_backends!(test_scatter_3d, test_scatter_3d_impl);
+test_all_backends!(test_scatter_3d, test_scatter_3d_impl);
 
 // =============================================================================
 // Broadcast tests
@@ -1254,7 +1267,7 @@ fn test_broadcast_as_add_dim_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, vec![1., 2., 3., 1., 2., 3.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_as_add_dim, test_broadcast_as_add_dim_impl);
+test_all_backends!(test_broadcast_as_add_dim, test_broadcast_as_add_dim_impl);
 
 fn test_broadcast_as_expand_dim_impl<B: Backend>(dev: &B) -> Result<()> {
     // (2, 1) -> (2, 3): expand dim of size 1
@@ -1265,7 +1278,7 @@ fn test_broadcast_as_expand_dim_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, vec![10., 10., 10., 20., 20., 20.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_as_expand_dim, test_broadcast_as_expand_dim_impl);
+test_all_backends!(test_broadcast_as_expand_dim, test_broadcast_as_expand_dim_impl);
 
 fn test_broadcast_as_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     // (1, 3) -> (2, 4, 3): prepend dim and expand dim 0
@@ -1277,7 +1290,7 @@ fn test_broadcast_as_3d_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, expected);
     Ok(())
 }
-test_both_backends!(test_broadcast_as_3d, test_broadcast_as_3d_impl);
+test_all_backends!(test_broadcast_as_3d, test_broadcast_as_3d_impl);
 
 fn test_broadcast_as_noop_impl<B: Backend>(dev: &B) -> Result<()> {
     // (2, 3) -> (2, 3): no-op broadcast
@@ -1288,7 +1301,7 @@ fn test_broadcast_as_noop_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, vec![1., 2., 3., 4., 5., 6.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_as_noop, test_broadcast_as_noop_impl);
+test_all_backends!(test_broadcast_as_noop, test_broadcast_as_noop_impl);
 
 fn test_broadcast_as_from_view_impl<B: Backend>(dev: &B) -> Result<()> {
     // TensorView::broadcast_as: narrow then broadcast
@@ -1300,7 +1313,7 @@ fn test_broadcast_as_from_view_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result.to_vec()?, vec![1., 2., 3., 1., 2., 3., 1., 2., 3.]);
     Ok(())
 }
-test_both_backends!(test_broadcast_as_from_view, test_broadcast_as_from_view_impl);
+test_all_backends!(test_broadcast_as_from_view, test_broadcast_as_from_view_impl);
 
 fn test_broadcast_as_error_impl<B: Backend>(dev: &B) -> Result<()> {
     // Incompatible shapes should error
@@ -1308,7 +1321,7 @@ fn test_broadcast_as_error_impl<B: Backend>(dev: &B) -> Result<()> {
     assert!(t.broadcast_as((2, 4)).is_err());
     Ok(())
 }
-test_both_backends!(test_broadcast_as_error, test_broadcast_as_error_impl);
+test_all_backends!(test_broadcast_as_error, test_broadcast_as_error_impl);
 
 // =============================================================================
 // Matmul with transposed view tests
@@ -1340,7 +1353,7 @@ fn test_matmul_transposed_view_impl<B: Backend>(dev: &B) -> Result<()> {
     }
     Ok(())
 }
-test_both_backends!(test_matmul_transposed_view, test_matmul_transposed_view_impl);
+test_all_backends!(test_matmul_transposed_view, test_matmul_transposed_view_impl);
 
 // =============================================================================
 // to (dtype cast) tests
@@ -1354,7 +1367,7 @@ fn test_to_f32_to_f16_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result, vec![1.0, 2.5, -3.0, 0.0]);
     Ok(())
 }
-test_both_backends!(test_to_f32_to_f16, test_to_f32_to_f16_impl);
+test_all_backends!(test_to_f32_to_f16, test_to_f32_to_f16_impl);
 
 fn test_to_f16_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     let data: Vec<half::f16> =
@@ -1365,7 +1378,7 @@ fn test_to_f16_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1.0, 2.5, -3.0, 0.0]);
     Ok(())
 }
-test_both_backends!(test_to_f16_to_f32, test_to_f16_to_f32_impl);
+test_all_backends!(test_to_f16_to_f32, test_to_f16_to_f32_impl);
 
 fn test_to_f32_to_bf16_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<f32, B> = Tensor::from_vec(vec![1.0, -0.5, 100.0], (3,), dev)?;
@@ -1374,7 +1387,7 @@ fn test_to_f32_to_bf16_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result, vec![1.0, -0.5, 100.0]);
     Ok(())
 }
-test_both_backends!(test_to_f32_to_bf16, test_to_f32_to_bf16_impl);
+test_all_backends!(test_to_f32_to_bf16, test_to_f32_to_bf16_impl);
 
 fn test_to_bf16_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     let data: Vec<half::bf16> =
@@ -1384,7 +1397,7 @@ fn test_to_bf16_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1.0, -0.5, 100.0]);
     Ok(())
 }
-test_both_backends!(test_to_bf16_to_f32, test_to_bf16_to_f32_impl);
+test_all_backends!(test_to_bf16_to_f32, test_to_bf16_to_f32_impl);
 
 fn test_to_f16_to_bf16_impl<B: Backend>(dev: &B) -> Result<()> {
     let data: Vec<half::f16> = vec![1.0, 2.0, -3.0].into_iter().map(half::f16::from_f32).collect();
@@ -1394,7 +1407,7 @@ fn test_to_f16_to_bf16_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result, vec![1.0, 2.0, -3.0]);
     Ok(())
 }
-test_both_backends!(test_to_f16_to_bf16, test_to_f16_to_bf16_impl);
+test_all_backends!(test_to_f16_to_bf16, test_to_f16_to_bf16_impl);
 
 fn test_to_f32_to_i64_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<f32, B> = Tensor::from_vec(vec![1.9, -2.1, 0.0, 42.0], (4,), dev)?;
@@ -1402,7 +1415,7 @@ fn test_to_f32_to_i64_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1i64, -2, 0, 42]);
     Ok(())
 }
-test_both_backends!(test_to_f32_to_i64, test_to_f32_to_i64_impl);
+test_all_backends!(test_to_f32_to_i64, test_to_f32_to_i64_impl);
 
 fn test_to_i64_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<i64, B> = Tensor::from_vec(vec![1, -2, 0, 42], (4,), dev)?;
@@ -1410,7 +1423,7 @@ fn test_to_i64_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1.0, -2.0, 0.0, 42.0]);
     Ok(())
 }
-test_both_backends!(test_to_i64_to_f32, test_to_i64_to_f32_impl);
+test_all_backends!(test_to_i64_to_f32, test_to_i64_to_f32_impl);
 
 fn test_to_f32_to_u8_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<f32, B> = Tensor::from_vec(vec![0.0, 1.0, 127.0, 255.0], (4,), dev)?;
@@ -1418,7 +1431,7 @@ fn test_to_f32_to_u8_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0u8, 1, 127, 255]);
     Ok(())
 }
-test_both_backends!(test_to_f32_to_u8, test_to_f32_to_u8_impl);
+test_all_backends!(test_to_f32_to_u8, test_to_f32_to_u8_impl);
 
 fn test_to_u8_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<u8, B> = Tensor::from_vec(vec![0, 1, 127, 255], (4,), dev)?;
@@ -1426,7 +1439,7 @@ fn test_to_u8_to_f32_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0.0, 1.0, 127.0, 255.0]);
     Ok(())
 }
-test_both_backends!(test_to_u8_to_f32, test_to_u8_to_f32_impl);
+test_all_backends!(test_to_u8_to_f32, test_to_u8_to_f32_impl);
 
 fn test_to_i64_to_u8_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<i64, B> = Tensor::from_vec(vec![0, 1, 127, 255], (4,), dev)?;
@@ -1434,7 +1447,7 @@ fn test_to_i64_to_u8_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![0u8, 1, 127, 255]);
     Ok(())
 }
-test_both_backends!(test_to_i64_to_u8, test_to_i64_to_u8_impl);
+test_all_backends!(test_to_i64_to_u8, test_to_i64_to_u8_impl);
 
 fn test_to_same_dtype_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<f32, B> = Tensor::from_vec(vec![1.0, 2.0, 3.0], (3,), dev)?;
@@ -1442,7 +1455,7 @@ fn test_to_same_dtype_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(b.to_vec()?, vec![1.0, 2.0, 3.0]);
     Ok(())
 }
-test_both_backends!(test_to_same_dtype, test_to_same_dtype_impl);
+test_all_backends!(test_to_same_dtype, test_to_same_dtype_impl);
 
 fn test_to_preserves_shape_impl<B: Backend>(dev: &B) -> Result<()> {
     let a: Tensor<f32, B> = Tensor::from_vec((1..=24).map(|v| v as f32).collect(), (2, 3, 4), dev)?;
@@ -1455,7 +1468,7 @@ fn test_to_preserves_shape_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_eq!(result[23], 24.0);
     Ok(())
 }
-test_both_backends!(test_to_preserves_shape, test_to_preserves_shape_impl);
+test_all_backends!(test_to_preserves_shape, test_to_preserves_shape_impl);
 
 // =============================================================================
 // Random generation tests
@@ -1473,7 +1486,7 @@ fn test_rand_uniform_impl<B: Backend>(dev: &B) -> Result<()> {
     assert!(vals.windows(2).any(|w| w[0] != w[1]));
     Ok(())
 }
-test_both_backends!(test_rand_uniform, test_rand_uniform_impl);
+test_all_backends!(test_rand_uniform, test_rand_uniform_impl);
 
 fn test_rand_uniform_shape_impl<B: Backend>(dev: &B) -> Result<()> {
     let t: Tensor<f32, B> = Tensor::from_vec(vec![0.0], 1, dev)?;
@@ -1486,7 +1499,7 @@ fn test_rand_uniform_shape_impl<B: Backend>(dev: &B) -> Result<()> {
     }
     Ok(())
 }
-test_both_backends!(test_rand_uniform_shape, test_rand_uniform_shape_impl);
+test_all_backends!(test_rand_uniform_shape, test_rand_uniform_shape_impl);
 
 fn test_rand_uniform_bounds_impl<B: Backend>(dev: &B) -> Result<()> {
     let t: Tensor<f32, B> = Tensor::from_vec(vec![0.0; 1000], 1000, dev)?;
@@ -1498,7 +1511,7 @@ fn test_rand_uniform_bounds_impl<B: Backend>(dev: &B) -> Result<()> {
     assert!(vals.windows(2).any(|w| w[0] != w[1]));
     Ok(())
 }
-test_both_backends!(test_rand_uniform_bounds, test_rand_uniform_bounds_impl);
+test_all_backends!(test_rand_uniform_bounds, test_rand_uniform_bounds_impl);
 
 fn test_rand_uniform_invalid_bounds_impl<B: Backend>(dev: &B) -> Result<()> {
     let t: Tensor<f32, B> = Tensor::from_vec(vec![0.0; 10], 10, dev)?;
@@ -1508,7 +1521,7 @@ fn test_rand_uniform_invalid_bounds_impl<B: Backend>(dev: &B) -> Result<()> {
     assert!(err_msg.contains("upper bound"), "error should mention upper bound: {err_msg}");
     Ok(())
 }
-test_both_backends!(test_rand_uniform_invalid_bounds, test_rand_uniform_invalid_bounds_impl);
+test_all_backends!(test_rand_uniform_invalid_bounds, test_rand_uniform_invalid_bounds_impl);
 
 fn test_randn_impl<B: Backend>(dev: &B) -> Result<()> {
     let t: Tensor<f32, B> = Tensor::from_vec(vec![0.0; 1000], 1000, dev)?;
@@ -1522,7 +1535,7 @@ fn test_randn_impl<B: Backend>(dev: &B) -> Result<()> {
     assert!(vals.windows(2).any(|w| w[0] != w[1]));
     Ok(())
 }
-test_both_backends!(test_randn, test_randn_impl);
+test_all_backends!(test_randn, test_randn_impl);
 
 fn test_randn_shape_impl<B: Backend>(dev: &B) -> Result<()> {
     let t: Tensor<f32, B> = Tensor::from_vec(vec![0.0], 1, dev)?;
@@ -1535,7 +1548,7 @@ fn test_randn_shape_impl<B: Backend>(dev: &B) -> Result<()> {
     }
     Ok(())
 }
-test_both_backends!(test_randn_shape, test_randn_shape_impl);
+test_all_backends!(test_randn_shape, test_randn_shape_impl);
 
 // =============================================================================
 // Unary op tests
@@ -1584,7 +1597,7 @@ fn test_rope_i_batched_cos_sin_impl<B: Backend>(dev: &B) -> Result<()> {
 
     Ok(())
 }
-test_both_backends!(test_rope_i_batched_cos_sin, test_rope_i_batched_cos_sin_impl);
+test_all_backends!(test_rope_i_batched_cos_sin, test_rope_i_batched_cos_sin_impl);
 
 /// Same test but for the non-interleaved rope variant.
 ///
@@ -1621,7 +1634,7 @@ fn test_rope_batched_cos_sin_impl<B: Backend>(dev: &B) -> Result<()> {
 
     Ok(())
 }
-test_both_backends!(test_rope_batched_cos_sin, test_rope_batched_cos_sin_impl);
+test_all_backends!(test_rope_batched_cos_sin, test_rope_batched_cos_sin_impl);
 
 fn assert_approx_eq(a: &[f32], b: &[f32], tol: f32) {
     assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
@@ -1639,7 +1652,7 @@ fn test_exp_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_approx_eq(&dst.to_vec()?, &expected, 1e-6);
     Ok(())
 }
-test_both_backends!(test_exp, test_exp_impl);
+test_all_backends!(test_exp, test_exp_impl);
 
 fn test_log_impl<B: Backend>(dev: &B) -> Result<()> {
     let data = vec![1.0f32, 2.0, 0.5, 10.0];
@@ -1650,7 +1663,7 @@ fn test_log_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_approx_eq(&dst.to_vec()?, &expected, 1e-6);
     Ok(())
 }
-test_both_backends!(test_log, test_log_impl);
+test_all_backends!(test_log, test_log_impl);
 
 fn test_neg_impl<B: Backend>(dev: &B) -> Result<()> {
     let data = vec![1.0f32, -2.0, 0.0, 3.5];
@@ -1661,7 +1674,7 @@ fn test_neg_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_approx_eq(&dst.to_vec()?, &expected, 1e-6);
     Ok(())
 }
-test_both_backends!(test_neg, test_neg_impl);
+test_all_backends!(test_neg, test_neg_impl);
 
 fn test_exp_log_compose_impl<B: Backend>(dev: &B) -> Result<()> {
     let data = vec![0.5f32, 1.0, 2.0, 3.0];
@@ -1674,7 +1687,7 @@ fn test_exp_log_compose_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_approx_eq(&dst.to_vec()?, &expected, 1e-5);
     Ok(())
 }
-test_both_backends!(test_exp_log_compose, test_exp_log_compose_impl);
+test_all_backends!(test_exp_log_compose, test_exp_log_compose_impl);
 
 fn test_log_neg_roundtrip_impl<B: Backend>(dev: &B) -> Result<()> {
     let data = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -1691,4 +1704,4 @@ fn test_log_neg_roundtrip_impl<B: Backend>(dev: &B) -> Result<()> {
     assert_approx_eq(&dst.to_vec()?, &data, 1e-6);
     Ok(())
 }
-test_both_backends!(test_log_neg_roundtrip, test_log_neg_roundtrip_impl);
+test_all_backends!(test_log_neg_roundtrip, test_log_neg_roundtrip_impl);

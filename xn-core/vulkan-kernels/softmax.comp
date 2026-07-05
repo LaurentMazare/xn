@@ -1,0 +1,48 @@
+#version 450
+#include "dtype.glsl"
+// Row-wise softmax. One workgroup per row; `ncols` elements per row. Reductions
+// accumulate in f32.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer D { SCALAR dst[]; };
+
+layout(push_constant) uniform PC {
+    uint ncols;
+} pc;
+
+shared float sh[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.ncols;
+
+    float m = -3.402823466e+38;
+    for (uint c = tid; c < pc.ncols; c += 256u) m = max(m, LOAD(src[base + c]));
+    sh[tid] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sh[tid] = max(sh[tid], sh[tid + s]);
+        barrier();
+    }
+    float maxv = sh[0];
+    barrier();
+
+    float sum = 0.0;
+    for (uint c = tid; c < pc.ncols; c += 256u) {
+        float e = exp(LOAD(src[base + c]) - maxv);
+        dst[base + c] = STORE(e);
+        sum += e;
+    }
+    sh[tid] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        barrier();
+    }
+    float inv = 1.0 / sh[0];
+    barrier();
+
+    for (uint c = tid; c < pc.ncols; c += 256u) dst[base + c] = STORE(LOAD(dst[base + c]) * inv);
+}

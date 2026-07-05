@@ -1,0 +1,25 @@
+#version 450
+#include "dtype.glsl"
+// 2D strided copy: dst[dst_o + i*dst_s + j] = src[src_o + i*src_s + j]
+// for i in [0,d1), j in [0,d2).
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer D { SCALAR dst[]; };
+
+layout(push_constant) uniform PC {
+    uint d1;
+    uint d2;
+    uint src_s;
+    uint dst_s;
+    uint src_o;
+    uint dst_o;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.d1 * pc.d2) return;
+    uint i1 = idx / pc.d2;
+    uint i2 = idx - pc.d2 * i1;
+    dst[pc.dst_o + i1 * pc.dst_s + i2] = src[pc.src_o + i1 * pc.src_s + i2];
+}

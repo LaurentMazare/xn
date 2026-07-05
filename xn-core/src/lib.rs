@@ -40,6 +40,11 @@ pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub use cuda_backend::Device as CudaDevice;
 
+#[cfg(feature = "vulkan")]
+pub mod vulkan_backend;
+#[cfg(feature = "vulkan")]
+pub use vulkan_backend::Device as VulkanDevice;
+
 pub fn with_avx() -> bool {
     cfg!(target_feature = "avx")
 }
@@ -132,7 +137,16 @@ pub fn run_with_device<W: WithQ>(w: W, _cpu_only: bool, _device_id: usize) -> Re
             w.run::<Unquantized<half::bf16, _>>(dev)?;
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(feature = "vulkan", not(feature = "cuda")))]
+    {
+        if _cpu_only {
+            w.run::<Unquantized<f32, _>>(CpuDevice)?;
+        } else {
+            let dev = vulkan_backend::Device::new(_device_id)?;
+            w.run::<Unquantized<f32, _>>(dev)?;
+        }
+    }
+    #[cfg(all(not(feature = "cuda"), not(feature = "vulkan")))]
     {
         w.run::<Unquantized<f32, _>>(CpuDevice)?;
     }
@@ -191,6 +205,37 @@ impl Runner {
                             self.dtype
                         )));
                     }
+                }
+            }
+        }
+        #[cfg(all(feature = "vulkan", not(feature = "cuda")))]
+        {
+            // The Vulkan backend computes in f32, f16 or bf16 (device
+            // permitting). Quantized formats stay on CPU.
+            if !self.cpu_only {
+                match self.dtype {
+                    DTypeQ::F32 => {
+                        let dev = vulkan_backend::Device::new(_device_id)?;
+                        w.run::<Unquantized<f32, _>>(dev)?;
+                        return Ok(());
+                    }
+                    DTypeQ::F16 => {
+                        let dev = vulkan_backend::Device::new(_device_id)?;
+                        if !dev.supports_f16() {
+                            return Err(Error::msg("vulkan device does not support f16"));
+                        }
+                        w.run::<Unquantized<half::f16, _>>(dev)?;
+                        return Ok(());
+                    }
+                    DTypeQ::BF16 => {
+                        let dev = vulkan_backend::Device::new(_device_id)?;
+                        if !dev.supports_bf16() {
+                            return Err(Error::msg("vulkan device does not support bf16"));
+                        }
+                        w.run::<Unquantized<half::bf16, _>>(dev)?;
+                        return Ok(());
+                    }
+                    _ => {}
                 }
             }
         }

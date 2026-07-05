@@ -1,0 +1,35 @@
+#version 450
+#include "dtype.glsl"
+// Rotary position embedding, interleaved.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer C { SCALAR cosb[]; };
+layout(std430, set = 0, binding = 1) buffer Sn { SCALAR sinb[]; };
+layout(std430, set = 0, binding = 2) buffer Src { SCALAR src[]; };
+layout(std430, set = 0, binding = 3) buffer Dst { SCALAR dst[]; };
+
+layout(push_constant) uniform PC {
+    uint bh;
+    uint td;
+    uint h;
+    uint cs_stride_b;
+    uint cos_off;
+    uint sin_off;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (2u * idx >= pc.bh * pc.td) return;
+
+    uint half_td = pc.td / 2u;
+    uint i_bh = idx / half_td;
+    uint cos_idx = idx % half_td;
+    if (pc.cs_stride_b > 0u) cos_idx += (i_bh / pc.h) * pc.cs_stride_b;
+
+    float c = LOAD(cosb[pc.cos_off + cos_idx]);
+    float s = LOAD(sinb[pc.sin_off + cos_idx]);
+    float a = LOAD(src[2u * idx]);
+    float b = LOAD(src[2u * idx + 1u]);
+    dst[2u * idx] = STORE(a * c - b * s);
+    dst[2u * idx + 1u] = STORE(a * s + b * c);
+}

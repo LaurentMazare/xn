@@ -1,0 +1,41 @@
+#version 450
+#include "dtype.glsl"
+// Row-wise RMSNorm, f32 accumulation. One workgroup per row.
+// dst = x * rsqrt(mean(x^2) + eps) * alpha
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer D { SCALAR dst[]; };
+layout(std430, set = 0, binding = 2) buffer A { SCALAR alpha[]; };
+
+layout(push_constant) uniform PC {
+    uint ncols;
+    float eps;
+} pc;
+
+shared float sh[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.ncols;
+
+    float acc = 0.0;
+    for (uint c = tid; c < pc.ncols; c += 256u) {
+        float x = LOAD(src[base + c]);
+        acc += x * x;
+    }
+    sh[tid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        barrier();
+    }
+    float mean = sh[0] / float(pc.ncols);
+    float scale = inversesqrt(mean + pc.eps);
+    barrier();
+
+    for (uint c = tid; c < pc.ncols; c += 256u) {
+        dst[base + c] = STORE(scale * LOAD(src[base + c]) * LOAD(alpha[c]));
+    }
+}

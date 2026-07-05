@@ -1,0 +1,28 @@
+#version 450
+#include "dtype.glsl"
+// scatter_set: for each src element at flat position i,
+//   dst[left*dst_dim_size*right + ids[i]*right + right_idx] = src[i]
+// where left = i/(right*src_dim_size), right_idx = i % right.
+// ids is an i64 array viewed as u32 pairs; only the low word is read.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer D { SCALAR dst[]; };
+layout(std430, set = 0, binding = 1) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Ids { uint ids[]; };
+
+layout(push_constant) uniform PC {
+    uint numel;
+    uint right_size;
+    uint src_dim_size;
+    uint dst_dim_size;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.numel) return;
+    uint right = i % pc.right_size;
+    uint left = i / (pc.right_size * pc.src_dim_size);
+    uint idx = ids[2u * i];
+    uint dst_off = left * pc.dst_dim_size * pc.right_size + idx * pc.right_size + right;
+    dst[dst_off] = src[i];
+}

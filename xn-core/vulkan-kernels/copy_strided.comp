@@ -1,0 +1,30 @@
+#version 450
+#include "dtype.glsl"
+// Copy from a strided source to a contiguous destination.
+// `info` packs [dims (num_dims), src_strides (num_dims)].
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer D { SCALAR dst[]; };
+layout(std430, set = 0, binding = 2) readonly buffer I { uint info[]; };
+
+layout(push_constant) uniform PC {
+    uint numel;
+    uint num_dims;
+    uint src_offset;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.numel) return;
+    uint nd = pc.num_dims;
+    uint si = 0u;
+    uint rem = idx;
+    for (uint d = 0u; d < nd; d++) {
+        uint di = nd - 1u - d;
+        uint dimv = info[di];
+        si += (rem % dimv) * info[nd + di];
+        rem /= dimv;
+    }
+    dst[idx] = src[pc.src_offset + si];
+}

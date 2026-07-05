@@ -1,0 +1,45 @@
+#version 450
+#include "dtype.glsl"
+// Reduction over one dimension. One workgroup per output; f32 accumulation.
+// Iteration shape (outer, inner, dim); physical layout (outer, dim, inner).
+//   op: 0 = sum, 1 = max, 2 = min
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer D { SCALAR dst[]; };
+
+layout(push_constant) uniform PC {
+    uint num_outputs;
+    uint dim_size;
+    uint inner_size;
+    uint op;
+} pc;
+
+shared float sh[256];
+
+void main() {
+    uint o = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint a_inner = o % pc.inner_size;
+    uint a_outer = o / pc.inner_size;
+    uint outer_base = a_outer * pc.dim_size * pc.inner_size + a_inner;
+
+    float acc = pc.op == 0u ? 0.0 : (pc.op == 1u ? -3.402823466e+38 : 3.402823466e+38);
+    for (uint k = tid; k < pc.dim_size; k += 256u) {
+        float v = LOAD(src[outer_base + k * pc.inner_size]);
+        if (pc.op == 0u) acc += v;
+        else if (pc.op == 1u) acc = max(acc, v);
+        else acc = min(acc, v);
+    }
+    sh[tid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            if (pc.op == 0u) sh[tid] += sh[tid + s];
+            else if (pc.op == 1u) sh[tid] = max(sh[tid], sh[tid + s]);
+            else sh[tid] = min(sh[tid], sh[tid + s]);
+        }
+        barrier();
+    }
+    if (tid == 0u) dst[o] = STORE(sh[0]);
+}
