@@ -482,11 +482,14 @@ impl crate::Backend for Device {
             .usize(dst_cs)
             .usize(lhs.1)
             .usize(rhs.1);
-        let buffers = [dst.buffer, lhs.0.buffer, rhs.0.buffer];
         if m == 1 {
             // Decode path: one workgroup per output column, grid (n, batch, 1).
+            // rhs is bound twice: once scalar, once as a vec4 view for the
+            // shader's aligned-fast-path loads (see gemv.comp).
+            let buffers = [dst.buffer, lhs.0.buffer, rhs.0.buffer, rhs.0.buffer];
             dst.device.dispatch_nd(&format!("gemv_{dt}"), &buffers, &push, (n as u32, lhs_b as u32, 1))
         } else {
+            let buffers = [dst.buffer, lhs.0.buffer, rhs.0.buffer];
             // Tiled kernel: grid (ceil(n/16), ceil(m/16), batch), local (16, 16, 1).
             const TILE: u32 = 16;
             let groups = (div_ceil(n, TILE), div_ceil(m, TILE), lhs_b as u32);
