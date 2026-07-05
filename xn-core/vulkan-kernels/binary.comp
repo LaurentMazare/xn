@@ -1,0 +1,32 @@
+#version 450
+#include "dtype.glsl"
+// Elementwise binary op: dst = lhs op rhs, same shape/contiguous.
+// For `bin_assign` (dst = dst op s), bind lhs=dst and rhs=s.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer L { SCALAR lhs[]; };
+layout(std430, set = 0, binding = 1) buffer R { SCALAR rhs[]; };
+layout(std430, set = 0, binding = 2) buffer D { SCALAR dst[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint op;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float a = float(lhs[i]);
+    float b = float(rhs[i]);
+    float r;
+    switch (pc.op) {
+        case 0u: r = a + b; break;
+        case 1u: r = a - b; break;
+        case 2u: r = a * b; break;
+        case 3u: r = a / b; break;
+        case 4u: r = max(a, b); break;
+        case 5u: r = min(a, b); break;
+        default: r = a;
+    }
+    dst[i] = SCALAR(r);
+}

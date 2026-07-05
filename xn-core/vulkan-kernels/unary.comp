@@ -1,0 +1,51 @@
+#version 450
+#include "dtype.glsl"
+// Elementwise unary ops. For in-place use, bind the same buffer to both
+// `src` and `dst`. `op` selects the operation, matching the `UnaryOp` order
+// used by the CPU/CUDA backends.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer Src { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer Dst { SCALAR dst[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint op;
+    float alpha;
+} pc;
+
+// Abramowitz & Stegun 7.1.26 approximation of erf, max abs error ~1.5e-7.
+float erf_approx(float x) {
+    float s = sign(x);
+    x = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * x);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                     - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return s * y;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float x = float(src[i]);
+    float r;
+    switch (pc.op) {
+        case 0u:  r = cos(x); break;
+        case 1u:  r = sin(x); break;
+        case 2u:  r = exp(x); break;
+        case 3u:  r = log(x); break;
+        case 4u:  r = -x; break;
+        case 5u:  r = x * x; break;
+        case 6u:  r = sqrt(x); break;
+        case 7u:  r = inversesqrt(x); break;
+        case 8u:  r = abs(x); break;
+        case 9u:  r = x * 0.5 * (1.0 + erf_approx(x * 0.7071067811865476)); break;
+        case 10u: r = x > 0.0 ? x : pc.alpha * (exp(x) - 1.0); break;
+        case 11u: r = max(x, 0.0); break;
+        case 12u: r = x / (1.0 + exp(-x)); break;
+        case 13u: r = tanh(x); break;
+        case 14u: r = 1.0 / (1.0 + exp(-x)); break;
+        default:  r = x;
+    }
+    dst[i] = SCALAR(r);
+}

@@ -1,0 +1,59 @@
+#version 450
+#include "dtype.glsl"
+// Arg-reduction over one dimension (-> i64 index). One workgroup per output.
+// The output buffer is an i64 array, viewed here as pairs of u32 (little-endian):
+// low word = index, high word = 0.
+//   op: 0 = argmin, 1 = argmax
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer D { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint num_outputs;
+    uint dim_size;
+    uint inner_size;
+    uint op;
+} pc;
+
+shared float shv[256];
+shared uint shi[256];
+
+void main() {
+    uint o = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint a_inner = o % pc.inner_size;
+    uint a_outer = o / pc.inner_size;
+    uint outer_base = a_outer * pc.dim_size * pc.inner_size + a_inner;
+
+    float best = pc.op == 1u ? -3.402823466e+38 : 3.402823466e+38;
+    uint bidx = 0u;
+    bool set = false;
+    for (uint k = tid; k < pc.dim_size; k += 256u) {
+        float v = float(src[outer_base + k * pc.inner_size]);
+        bool better = pc.op == 1u ? v > best : v < best;
+        if (!set || better) {
+            best = v;
+            bidx = k;
+            set = true;
+        }
+    }
+    shv[tid] = best;
+    shi[tid] = bidx;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            bool better = pc.op == 1u ? shv[tid + s] > shv[tid] : shv[tid + s] < shv[tid];
+            bool tie_lower = shv[tid + s] == shv[tid] && shi[tid + s] < shi[tid];
+            if (better || tie_lower) {
+                shv[tid] = shv[tid + s];
+                shi[tid] = shi[tid + s];
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        dst[2u * o] = shi[0];
+        dst[2u * o + 1u] = 0u;
+    }
+}

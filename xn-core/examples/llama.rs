@@ -57,9 +57,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     raw_tokens: bool,
 
-    /// Use the cpu device even if cuda is available.
+    /// Use the cpu device even if a GPU is available.
     #[arg(long, default_value_t = false)]
     cpu: bool,
+
+    /// Force f32 on the Vulkan backend (default is f16 when supported).
+    #[arg(long, default_value_t = false)]
+    f32: bool,
 
     /// Sampling temperature (0 = greedy/argmax, higher = more random)
     #[arg(short, long, default_value_t = 0.7)]
@@ -201,32 +205,50 @@ fn main() -> Result<()> {
     {
         if args.cpu {
             println!("Using CPU despite CUDA being available");
-            run_for_device(args, xn::CPU)?;
+            run_for_device::<f32, _>(args, xn::CPU)?;
         } else {
             println!("Using CUDA backend");
             let dev = xn::cuda_backend::Device::new(0)?;
             unsafe {
                 dev.disable_event_tracking();
             }
-            run_for_device(args, dev)?;
+            run_for_device::<f32, _>(args, dev)?;
         }
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(all(feature = "vulkan", not(feature = "cuda")))]
+    {
+        if args.cpu {
+            println!("Using CPU backend (f32)");
+            run_for_device::<f32, _>(args, xn::CPU)?;
+        } else {
+            let dev = xn::vulkan_backend::Device::new(0)?;
+            // The Vulkan backend runs f16 when the device supports it (halves
+            // memory traffic; decode is bandwidth-bound). `--f32` forces f32.
+            if dev.supports_f16() && !args.f32 {
+                println!("Using Vulkan backend (f16): {}", dev.name());
+                run_for_device::<half::f16, _>(args, dev)?;
+            } else {
+                println!("Using Vulkan backend (f32): {}", dev.name());
+                run_for_device::<f32, _>(args, dev)?;
+            }
+        }
+    }
+    #[cfg(all(not(feature = "cuda"), not(feature = "vulkan")))]
     {
         println!("Using CPU backend");
-        run_for_device(args, xn::CPU)?;
+        run_for_device::<f32, _>(args, xn::CPU)?;
     }
 
     Ok(())
 }
 
-fn run_for_device<Dev: xn::Backend>(args: Args, dev: Dev) -> Result<()> {
+fn run_for_device<T: xn::WithDTypeF, Dev: xn::Backend>(args: Args, dev: Dev) -> Result<()> {
     let config = args.model_size.config();
 
     println!("Model: {:?}", args.model_size);
     println!("Config: {:?}", config);
 
-    let (model, tokenizer): (Llama<f32, Dev>, _) = if let Some(repo_id) = args.model_size.hf_repo()
+    let (model, tokenizer): (Llama<T, Dev>, _) = if let Some(repo_id) = args.model_size.hf_repo()
     {
         let model_files = download_model(repo_id)?;
 
@@ -266,7 +288,7 @@ fn run_for_device<Dev: xn::Backend>(args: Args, dev: Dev) -> Result<()> {
 
     // Autoregressive generation loop
     let mut rng = rand::rng();
-    let mut kv_cache: Option<KvCache<f32, Dev>> = None;
+    let mut kv_cache: Option<KvCache<T, Dev>> = None;
     let mut pos = 0;
     let mut generated_tokens = Vec::new();
     let mut autoregressive_start: Option<std::time::Instant> = None;
@@ -289,7 +311,8 @@ fn run_for_device<Dev: xn::Backend>(args: Args, dev: Dev) -> Result<()> {
             autoregressive_start = Some(std::time::Instant::now());
         }
 
-        // Sample next token
+        // Sample next token (sampling is done in f32 on the host).
+        let logits = logits.to::<f32>()?;
         let next_token = sample_token(&logits, args.temperature, &mut rng)?;
         tokens.push(next_token);
         generated_tokens.push(next_token);

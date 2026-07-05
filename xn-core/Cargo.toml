@@ -9,6 +9,7 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
+ash = { workspace = true, optional = true }
 byteorder = { workspace = true }
 cudarc = { workspace = true, optional = true }
 gemm = { workspace = true }
@@ -50,6 +51,7 @@ default = []
 accelerate = ["dep:libc"]
 audio = ["dep:kaudio"]
 cuda = ["dep:cudarc", "dep:bindgen_cuda"]
+vulkan = ["dep:ash"]
 
 [[example]]
 name = "mimi"
@@ -62,6 +64,10 @@ required-features = ["audio"]
 [[example]]
 name = "basic_cuda"
 required-features = ["cuda"]
+
+[[example]]
+name = "basic_vulkan"
+required-features = ["vulkan"]
 
 [[example]]
 name = "cuda_benchmarks"

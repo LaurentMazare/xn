@@ -1,0 +1,62 @@
+#version 450
+#include "dtype.glsl"
+// GEMV: the m == 1 case of the batched GEMM (the LLM-decode hot path).
+//   dst[b, 0, j] = sum_l lhs[b, 0, l] * rhs[b, l, j]
+// One workgroup per output column j (per batch b); the workgroup's threads
+// cooperatively reduce over the k dimension in f32. For weight matrices stored
+// row-major with `rhs_rs == 1` (the matmul_t case), each workgroup reads a
+// contiguous weight row, giving coalesced, bandwidth-bound reads.
+//
+// This K-split decomposition (one output per workgroup, many threads over k)
+// keeps a large number of in-flight memory requests, which is what a
+// bandwidth-bound GEMV needs on this APU. Alternatives that compute several
+// columns per workgroup (llama.cpp's mul_mat_vec style) reduce the workgroup
+// count and measured slower here.
+// Grid: (n, batch, 1). Push constants match the GEMM kernels.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer D { SCALAR dst[]; };
+layout(std430, set = 0, binding = 1) buffer L { SCALAR lhs[]; };
+layout(std430, set = 0, binding = 2) buffer R { SCALAR rhs[]; };
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint batch;
+    uint lhs_b_stride;
+    uint rhs_b_stride;
+    uint lhs_cs;
+    uint lhs_rs;
+    uint rhs_cs;
+    uint rhs_rs;
+    uint dst_rs;
+    uint dst_cs;
+    uint lhs_o;
+    uint rhs_o;
+} pc;
+
+shared float sh[256];
+
+void main() {
+    uint j = gl_WorkGroupID.x;
+    uint b = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint lbase = pc.lhs_o + b * pc.lhs_b_stride; // row i = 0
+    uint rbase = pc.rhs_o + b * pc.rhs_b_stride + j * pc.rhs_cs;
+
+    float acc = 0.0;
+    for (uint l = tid; l < pc.k; l += 256u) {
+        acc += float(lhs[lbase + l * pc.lhs_cs]) * float(rhs[rbase + l * pc.rhs_rs]);
+    }
+    sh[tid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        barrier();
+    }
+    if (tid == 0u) {
+        dst[b * pc.n + j * pc.dst_cs] = SCALAR(sh[0]);
+    }
+}

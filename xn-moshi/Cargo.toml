@@ -30,6 +30,7 @@ default = []
 cuda = ["xn/cuda"]
 accelerate = ["xn/accelerate"]
 audio = ["dep:kaudio"]
+vulkan = ["xn/vulkan"]
 
 [[example]]
 name = "moshi"

@@ -1,0 +1,54 @@
+#version 450
+#include "dtype.glsl"
+// Row-wise LayerNorm, f32 accumulation. One workgroup per row.
+// remove_mean == 1: y = (x - mean) / sqrt(var + eps) * weight + bias
+// remove_mean == 0: y =  x        / sqrt(var + eps) * weight + bias
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer S { SCALAR src[]; };
+layout(std430, set = 0, binding = 1) buffer D { SCALAR dst[]; };
+layout(std430, set = 0, binding = 2) buffer W { SCALAR weight[]; };
+layout(std430, set = 0, binding = 3) buffer B { SCALAR bias[]; };
+
+layout(push_constant) uniform PC {
+    uint ncols;
+    float eps;
+    uint remove_mean;
+} pc;
+
+shared float sh_sum[256];
+shared float sh_sq[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.ncols;
+
+    float s1 = 0.0;
+    float s2 = 0.0;
+    for (uint c = tid; c < pc.ncols; c += 256u) {
+        float x = float(src[base + c]);
+        s1 += x;
+        s2 += x * x;
+    }
+    sh_sum[tid] = s1;
+    sh_sq[tid] = s2;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sh_sum[tid] += sh_sum[tid + s];
+            sh_sq[tid] += sh_sq[tid + s];
+        }
+        barrier();
+    }
+    float mean = sh_sum[0] / float(pc.ncols);
+    float var = sh_sq[0] / float(pc.ncols) - mean * mean;
+    float inv_std = inversesqrt(var + pc.eps);
+    float mean_off = pc.remove_mean != 0u ? mean : 0.0;
+    barrier();
+
+    for (uint c = tid; c < pc.ncols; c += 256u) {
+        float lhs = (float(src[base + c]) - mean_off) * inv_std;
+        dst[base + c] = SCALAR(lhs * float(weight[c]) + float(bias[c]));
+    }
+}

@@ -1,0 +1,26 @@
+#version 450
+#include "dtype.glsl"
+// Apply causal mask in place: set dst to -inf where idx2 > offset + idx1.
+// Linear index decomposes as (b, idx1, idx2) over (bh, t1, t2).
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer D { SCALAR dst[]; };
+
+layout(push_constant) uniform PC {
+    uint bh;
+    uint t1;
+    uint t2;
+    uint offset;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.bh * pc.t1 * pc.t2;
+    if (idx >= total) return;
+    uint idx2 = idx % pc.t2;
+    uint tmp = idx / pc.t2;
+    uint idx1 = tmp % pc.t1;
+    if (idx2 > pc.offset + idx1) {
+        dst[idx] = SCALAR(uintBitsToFloat(0xff800000u)); // -inf
+    }
+}
