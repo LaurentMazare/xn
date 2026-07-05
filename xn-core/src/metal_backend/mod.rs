@@ -589,6 +589,22 @@ impl Device {
     }
 }
 
+impl Drop for DeviceInner {
+    fn drop(&mut self) {
+        // The last batch may still be open: recorded but never submitted
+        // because nothing read its results back. Metal asserts if a live
+        // command encoder is released without endEncoding, so close it here.
+        // The uncommitted command buffer itself (and its now-unreachable
+        // results) can simply be dropped.
+        if let Ok(ctx) = self.ctx.get_mut() {
+            if let Some(enc) = ctx.encoder.take() {
+                enc.end_encoding();
+            }
+            ctx.cmd_buffer = None;
+        }
+    }
+}
+
 /// Metal tensor storage: a `StorageModeShared` buffer, accessed from the host
 /// through its `contents()` pointer.
 pub struct Storage<T: WithDType> {

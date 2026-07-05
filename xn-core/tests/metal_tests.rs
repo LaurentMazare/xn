@@ -43,6 +43,25 @@ fn iota(n: usize) -> Vec<f32> {
 // -----------------------------------------------------------------------------
 
 #[test]
+fn drop_device_with_pending_batch() -> Result<()> {
+    // Regression test: dropping the device while a batch is still recorded
+    // but unsubmitted (results never read back, so nothing forced a flush)
+    // used to release the live command encoder without endEncoding, tripping
+    // a Metal assertion:
+    //   -[_MTLCommandEncoder dealloc]: failed assertion
+    //   `Command encoder released without endEncoding'
+    // This device is intentionally separate from the thread-local `dev()` so
+    // it (and its recorded batch) actually drops at the end of the test.
+    let d = Mt::new(0)?;
+    let a: Tensor<f32, Mt> = Tensor::from_vec(vec![1.0f32; 64], vec![64], &d)?;
+    let b = a.relu()?;
+    let c = Tensor::cat(&[&a, &b], 0)?; // also records a blit copy
+    drop((a, b, c));
+    drop(d);
+    Ok(())
+}
+
+#[test]
 fn roundtrip_f32() -> Result<()> {
     let data = vec![1.0f32, -2.5, 3.0, 4.25, 5.0];
     let t: Tensor<f32, Mt> = Tensor::from_vec(data.clone(), vec![5], &dev())?;
