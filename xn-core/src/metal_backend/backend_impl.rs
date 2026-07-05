@@ -507,8 +507,10 @@ impl crate::Backend for Device {
             .usize(rhs.1);
         let buffers: [&metal::BufferRef; 3] = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer];
         if m == 1 {
-            // Decode path: one threadgroup per output column, grid (n, batch, 1).
-            dst.device.dispatch_nd(&format!("gemv_{dt}"), &buffers, &push, (n as u32, lhs_b as u32, 1))
+            // Decode path: one simdgroup per output column, GEMV_NSG columns
+            // per threadgroup, grid (ceil(n / GEMV_NSG), batch, 1).
+            let groups = (div_ceil(n, GEMV_NSG), lhs_b as u32, 1);
+            dst.device.dispatch_nd(&format!("gemv_{dt}"), &buffers, &push, groups)
         } else {
             // Tiled kernel: grid (ceil(n/16), ceil(m/16), batch), threadgroup (16, 16, 1).
             const TILE: u32 = 16;

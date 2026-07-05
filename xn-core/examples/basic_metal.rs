@@ -4,6 +4,37 @@
 
 use xn::{Backend, Result, Tensor, metal_backend::Device};
 
+/// GEMV decode-path benchmark: y = x @ W^T with a row-major W (n, k), the
+/// bandwidth-bound matmul_t shape used per token by LLM decoding.
+fn bench_gemv<T: xn::WithDTypeF>(name: &str, device: &Device, n: usize, k: usize) -> Result<()> {
+    let x: Tensor<T, Device> = Tensor::from_vec(
+        (0..k).map(|i| T::from_f32((i % 127) as f32 * 0.01)).collect(),
+        (1, k),
+        device,
+    )?;
+    let w: Tensor<T, Device> = Tensor::from_vec(
+        (0..n * k).map(|i| T::from_f32((i % 113) as f32 * 0.01)).collect(),
+        (n, k),
+        device,
+    )?;
+    let _ = x.matmul_t(&w)?;
+    device.synchronize()?;
+    let iters = 200;
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        let _y = x.matmul_t(&w)?;
+    }
+    device.synchronize()?;
+    let elapsed = start.elapsed();
+    let bytes = (n * k * T::BYTE_SIZE * iters) as f64;
+    println!(
+        "gemv {name} 1x{k} @ ({n}x{k})^T: {:.1} us/iter, {:.1} GB/s",
+        elapsed.as_micros() as f64 / iters as f64,
+        bytes / elapsed.as_secs_f64() / 1e9,
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let device = Device::new(0)?;
     println!("Metal device initialized: {}", device.name());
@@ -44,6 +75,13 @@ fn main() -> Result<()> {
             elapsed.as_micros() as f64 / iters as f64,
             flops / elapsed.as_secs_f64() / 1e9,
         );
+    }
+
+    // Decode-shaped GEMVs (TinyLlama's projection shapes plus a square case).
+    for (n, k) in [(4096usize, 4096usize), (5632, 2048), (2048, 2048), (2048, 5632), (32000, 2048)]
+    {
+        bench_gemv::<f32>("f32", &device, n, k)?;
+        bench_gemv::<half::f16>("f16", &device, n, k)?;
     }
     Ok(())
 }

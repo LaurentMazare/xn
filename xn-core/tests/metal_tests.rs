@@ -193,6 +193,57 @@ fn matmul_shapes() -> Result<()> {
 }
 
 #[test]
+fn gemv_matmul_t_shapes() -> Result<()> {
+    // m == 1 matmul_t is the decode hot path (gemv). k % 4 == 0 with aligned
+    // offsets takes the vectorized SCALAR4 loop; odd k takes the in-kernel
+    // scalar fallback. Values are small and positive: no cancellation in the
+    // dot products, so the f16/bf16 input rounding stays within tolerance of
+    // the f32 CPU reference, and results stay finite.
+    let data =
+        |len: usize| -> Vec<f32> { (0..len).map(|i| ((i * 7 + 3) % 23) as f32 * 0.01).collect() };
+    for (k, n) in [(512usize, 384usize), (510, 33), (64, 7), (2048, 256), (100, 1)] {
+        let a = data(k);
+        let w = data(n * k);
+        let ac: Tensor<f32, _> = Tensor::from_vec(a.clone(), vec![1, k], &CPU)?;
+        let wc: Tensor<f32, _> = Tensor::from_vec(w.clone(), vec![n, k], &CPU)?;
+        let expected = ac.matmul_t(&wc)?.to_vec()?;
+
+        let av: Tensor<f32, Mt> = Tensor::from_vec(a.clone(), vec![1, k], &dev())?;
+        let wv: Tensor<f32, Mt> = Tensor::from_vec(w.clone(), vec![n, k], &dev())?;
+        assert_close(&expected, &av.matmul_t(&wv)?.to_vec()?, 1e-4);
+
+        let av: Tensor<half::f16, Mt> = Tensor::from_vec(to_f16_vec(&a), vec![1, k], &dev())?;
+        let wv: Tensor<half::f16, Mt> = Tensor::from_vec(to_f16_vec(&w), vec![n, k], &dev())?;
+        assert_close(&expected, &f16_to_f32(&av.matmul_t(&wv)?.to_vec()?), 3e-2);
+
+        let av: Tensor<half::bf16, Mt> = Tensor::from_vec(to_bf16_vec(&a), vec![1, k], &dev())?;
+        let wv: Tensor<half::bf16, Mt> = Tensor::from_vec(to_bf16_vec(&w), vec![n, k], &dev())?;
+        assert_close(&expected, &bf16_to_f32(&av.matmul_t(&wv)?.to_vec()?), 5e-2);
+    }
+    Ok(())
+}
+
+#[test]
+fn gemv_unaligned_view() -> Result<()> {
+    // A narrowed lhs view gives the gemv an odd element offset: the kernel
+    // must take its scalar path and still match the CPU.
+    let k = 64usize;
+    let n = 16usize;
+    let data =
+        |len: usize| -> Vec<f32> { (0..len).map(|i| ((i * 5 + 1) % 19) as f32 * 0.1).collect() };
+    let a = data(k + 1);
+    let w = data(n * k);
+    let ac: Tensor<f32, _> = Tensor::from_vec(a.clone(), vec![1, k + 1], &CPU)?;
+    let wc: Tensor<f32, _> = Tensor::from_vec(w.clone(), vec![n, k], &CPU)?;
+    let av: Tensor<f32, Mt> = Tensor::from_vec(a, vec![1, k + 1], &dev())?;
+    let wv: Tensor<f32, Mt> = Tensor::from_vec(w, vec![n, k], &dev())?;
+    let rc = ac.narrow(1, 1..k + 1)?.matmul_t(&wc)?;
+    let rv = av.narrow(1, 1..k + 1)?.matmul_t(&wv)?;
+    assert_close(&rc.to_vec()?, &rv.to_vec()?, 1e-5);
+    Ok(())
+}
+
+#[test]
 fn matmul_t_and_transposed_view() -> Result<()> {
     // matmul_t exercises a non-contiguous rhs stride pattern.
     let a = iota(6 * 4);

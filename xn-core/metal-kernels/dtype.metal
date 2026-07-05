@@ -13,13 +13,20 @@ using namespace metal;
 
 #if defined(USE_F16)
 typedef half SCALAR;
+typedef half4 SCALAR4;
 #define LOAD(x) float(x)
+#define LOAD4(x) float4(x)
 #define STORE(v) SCALAR(v)
 #elif defined(USE_BF16)
 typedef ushort SCALAR;
+typedef ushort4 SCALAR4;
 inline float bf16_load(ushort x) {
     return as_type<float>(uint(x) << 16);
 }
+inline float4 bf16_load4(ushort4 x) {
+    return float4(bf16_load(x.x), bf16_load(x.y), bf16_load(x.z), bf16_load(x.w));
+}
+#define LOAD4(x) bf16_load4(x)
 inline ushort bf16_store(float v) {
     uint b = as_type<uint>(v);
     // NaN check on the bit pattern (robust under fast-math): quieten instead
@@ -35,6 +42,8 @@ inline ushort bf16_store(float v) {
 #define STORE(v) bf16_store(v)
 #else
 typedef float SCALAR;
+typedef float4 SCALAR4;
 #define LOAD(x) (x)
+#define LOAD4(x) (x)
 #define STORE(v) (v)
 #endif

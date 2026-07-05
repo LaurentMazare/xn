@@ -190,6 +190,11 @@ const MLX_BM: usize = 32;
 const MLX_BN: usize = 32;
 const MLX_BK: usize = 16;
 
+/// Output columns per gemv threadgroup (one simdgroup each); must match
+/// `GEMV_NSG` in `gemv.metal` and the kernel's 32 * GEMV_NSG threadgroup size
+/// in `kernel_def`.
+const GEMV_NSG: u32 = 8;
+
 /// Command-recording state, guarded by a mutex.
 ///
 /// Dispatches are recorded into a serial compute encoder on `cmd_buffer` and
