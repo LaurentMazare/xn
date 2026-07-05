@@ -423,15 +423,62 @@ impl crate::Backend for Device {
         let (dst_cs, dst_rs) = dst_strides;
         let (lhs_cs, lhs_rs) = lhs_strides;
         let (rhs_cs, rhs_rs) = rhs_strides;
+        // MLX GEMV path for m == 1: `gemv` when each output reads a
+        // contiguous matrix row (matmul_t against row-major weights, the
+        // decode hot path), `gemv_t` when the matrix is contiguous along its
+        // output columns (plain matmul). The block-shape heuristic mirrors
+        // MLX's `matmul.cpp` and only picks instantiated specializations.
+        // Ineligible or unavailable cases fall through to the steel GEMM /
+        // local gemv below.
+        if m == 1 && dst.device.use_mlx_gemv && dst_rs == n && dst_cs == 1 && lhs_cs == 1 {
+            let vec_byte_off = lhs.1 * T::BYTE_SIZE;
+            let mat_byte_off = rhs.1 * T::BYTE_SIZE;
+            // (kernel name, matrix ld, outputs per threadgroup, group (y, z))
+            let sel = if rhs_rs == 1 {
+                let bm = if n >= 4096 { 8u64 } else { 4 };
+                let tm = if n < 4 { 1u64 } else { 4 };
+                let name = format!("gemv_{dt}_bm{bm}_bn1_sm1_sn32_tm{tm}_tn4");
+                Some((name, rhs_cs, bm * tm, (1u64, bm)))
+            } else if rhs_cs == 1 {
+                let (sm, sn) = if k >= 8192 && n >= 2048 { (4u64, 8u64) } else { (8, 4) };
+                let bn = if n >= 2048 {
+                    16u64
+                } else if n >= 512 {
+                    4
+                } else {
+                    2
+                };
+                let tn = if n < 4 { 1u64 } else { 4 };
+                let name = format!("gemv_t_{dt}_bm1_bn{bn}_sm{sm}_sn{sn}_tm4_tn{tn}");
+                Some((name, rhs_rs, bn * sn * tn, (bn, 1u64)))
+            } else {
+                None
+            };
+            if vec_byte_off % 16 == 0
+                && mat_byte_off % 16 == 0
+                && let Some((name, ld, n_out_per_tgp, (gy, gz))) = sel
+                && let Some(pipeline) = dst.device.get_mlx_gemv_pipeline(&name)
+            {
+                let n_tgp = (n as u64).div_ceil(n_out_per_tgp);
+                return dst.device.dispatch_mlx_gemv(
+                    &pipeline,
+                    &name,
+                    (&rhs.0.buffer, mat_byte_off as u64),
+                    (&lhs.0.buffer, vec_byte_off as u64),
+                    &dst.buffer,
+                    (k as i32, n as i32, ld as i32),
+                    (lhs_b_stride as u64, rhs_b_stride as u64),
+                    (n_tgp, 1, lhs_b as u64),
+                    (32, gy, gz),
+                );
+            }
+        }
         // MLX steel GEMM path (simdgroup-matrix kernels), much faster than the
         // plain tiled kernel. It needs a contiguous row-major dst and a unit
         // minor stride on each input (the nn/nt/tn/tt layouts, with a free
         // leading dimension). Buffer byte offsets are kept 16-byte aligned for
-        // the vectorized block loaders. The `m == 1, rhs_rs == 1` decode case
-        // (matmul_t against a row-major weight) stays on the gemv kernel
-        // below, whose per-column threadgroup reduction reads each contiguous
-        // weight row once and measures faster than a 32-row GEMM tile there.
-        // Anything else falls through to the generic kernels.
+        // the vectorized block loaders. Anything else falls through to the
+        // generic kernels.
         if (m > 1 || rhs_rs != 1) && dst_rs == n && dst_cs == 1 {
             // (leading dimension, transposed) when the layout is compatible.
             let a_layout = if lhs_cs == 1 {

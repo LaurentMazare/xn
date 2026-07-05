@@ -36,6 +36,10 @@ const DTYPE_SRC: &str = include_str!("../../metal-kernels/dtype.metal");
 /// specializations selected via function constants.
 const MLX_GEMM_SRC: &str = include_str!("../../metal-kernels/mlx_gemm.metal");
 
+/// MLX GEMV kernels (`gemv` for a row-major weight matrix / matmul_t, `gemv_t`
+/// for the transposed layout), adapted from MLX with f32 accumulation.
+const MLX_GEMV_SRC: &str = include_str!("../../metal-kernels/mlx_gemv.metal");
+
 /// All kernel bodies; concatenated (after the prelude) into one MSL library
 /// per dtype variant.
 const KERNEL_SRCS: &[&str] = &[
@@ -269,16 +273,22 @@ pub struct DeviceInner {
     libraries: [metal::Library; 3],
     /// MLX steel GEMM library (simdgroup-matrix kernels, own source file).
     mlx_gemm_library: metal::Library,
+    /// MLX GEMV library (own source file).
+    mlx_gemv_library: metal::Library,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
-    /// MLX GEMM pipelines, keyed by (kernel name, function constants). `None`
-    /// caches a failed specialization (e.g. bf16 on an OS without `bfloat`) so
-    /// the caller falls back to the plain tiled kernel without retrying.
+    /// MLX GEMM/GEMV pipelines, keyed by (kernel name, function constants).
+    /// `None` caches a failed specialization (e.g. bf16 on an OS without
+    /// `bfloat`) so the caller falls back to the generic kernels without
+    /// retrying.
     mlx_pipelines: Mutex<HashMap<String, Option<metal::ComputePipelineState>>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
     /// Set when `XN_METAL_PROFILE=1`: flush after every command and collect
     /// per-kernel GPU times.
     profile_enabled: bool,
+    /// MLX gemv kernels for large m == 1 matmuls (disable with
+    /// `XN_METAL_NO_MLX_GEMV=1`).
+    use_mlx_gemv: bool,
     pstats: Mutex<ProfStats>,
     device_name: String,
 }
@@ -333,15 +343,21 @@ impl Device {
         let mlx_gemm_library = device
             .new_library_with_source(MLX_GEMM_SRC, &metal::CompileOptions::new())
             .map_err(|e| crate::Error::msg(format!("metal: mlx gemm compilation failed: {e}")))?;
+        let mlx_gemv_library = device
+            .new_library_with_source(MLX_GEMV_SRC, &metal::CompileOptions::new())
+            .map_err(|e| crate::Error::msg(format!("metal: mlx gemv compilation failed: {e}")))?;
 
         let profile_enabled =
             std::env::var("XN_METAL_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
+        let use_mlx_gemv =
+            !std::env::var("XN_METAL_NO_MLX_GEMV").is_ok_and(|v| !v.is_empty() && v != "0");
 
         let inner = DeviceInner {
             device,
             queue,
             libraries,
             mlx_gemm_library,
+            mlx_gemv_library,
             pipelines: Mutex::new(HashMap::new()),
             mlx_pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
@@ -353,6 +369,7 @@ impl Device {
                 prof_names: Vec::new(),
             }),
             profile_enabled,
+            use_mlx_gemv,
             pstats: Mutex::new(ProfStats::default()),
             device_name,
         };
@@ -461,6 +478,64 @@ impl Device {
             .and_then(|f| self.device.new_compute_pipeline_state_with_function(&f).ok());
         cache.insert(key, pipeline.clone());
         pipeline
+    }
+
+    /// Look up (or build) an MLX GEMV pipeline. Returns `None` (cached) when
+    /// the instantiation is unavailable, e.g. bf16 without `bfloat` support.
+    fn get_mlx_gemv_pipeline(&self, name: &str) -> Option<metal::ComputePipelineState> {
+        let mut cache = self.mlx_pipelines.lock().unwrap();
+        if let Some(p) = cache.get(name) {
+            return p.clone();
+        }
+        let pipeline = self
+            .mlx_gemv_library
+            .get_function(name, None)
+            .ok()
+            .and_then(|f| self.device.new_compute_pipeline_state_with_function(&f).ok());
+        cache.insert(name.to_string(), pipeline.clone());
+        pipeline
+    }
+
+    /// Record an MLX GEMV dispatch into the current batch. `mat`/`vec` carry
+    /// byte offsets; `sizes` is (in_vec_size, out_vec_size, matrix ld).
+    fn dispatch_mlx_gemv(
+        &self,
+        pipeline: &metal::ComputePipelineState,
+        name: &str,
+        mat: (&metal::BufferRef, u64),
+        vec: (&metal::BufferRef, u64),
+        out: &metal::BufferRef,
+        sizes: (i32, i32, i32),
+        batch_strides: (u64, u64),
+        grid: (u64, u64, u64),
+        group: (u64, u64, u64),
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        let mut ctx = self.ctx.lock().unwrap();
+        if ctx.n_dispatches >= MAX_DISPATCHES_PER_BATCH {
+            self.flush_locked(&mut ctx)?;
+        }
+        let enc = self.compute_encoder(&mut ctx)?;
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(mat.0), mat.1);
+        enc.set_buffer(1, Some(vec.0), vec.1);
+        enc.set_buffer(2, Some(out), 0);
+        let (in_size, out_size, ld) = sizes;
+        enc.set_bytes(3, 4, &in_size as *const i32 as *const c_void);
+        enc.set_bytes(4, 4, &out_size as *const i32 as *const c_void);
+        enc.set_bytes(5, 4, &ld as *const i32 as *const c_void);
+        enc.set_bytes(6, 8, &batch_strides.0 as *const u64 as *const c_void);
+        enc.set_bytes(7, 8, &batch_strides.1 as *const u64 as *const c_void);
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(grid.0, grid.1, grid.2),
+            metal::MTLSize::new(group.0, group.1, group.2),
+        );
+        ctx.n_dispatches += 1;
+        if self.profile_enabled {
+            let name = format!("mlx_{name} (n={out_size}, k={in_size})");
+            self.profile_flush(&mut ctx, name)?;
+        }
+        Ok(())
     }
 
     /// Record an MLX GEMM dispatch into the current batch. `a`/`b` carry byte
