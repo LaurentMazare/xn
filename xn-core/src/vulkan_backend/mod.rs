@@ -92,7 +92,7 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
         }
         "scatter_set" => (SCATTER_SET_F32, Some(SCATTER_SET_F16), Some(SCATTER_SET_BF16), 3),
         "gemm_tiled" => (GEMM_TILED_F32, Some(GEMM_TILED_F16), Some(GEMM_TILED_BF16), 3),
-        "gemv" => (GEMV_F32, Some(GEMV_F16), Some(GEMV_BF16), 3),
+        "gemv" => (GEMV_F32, Some(GEMV_F16), Some(GEMV_BF16), 4),
         // conv shaders are f32-only; other dtypes must fail pipeline lookup.
         "conv1d" => (CONV1D_F32, None, None, 3),
         "conv_transpose1d" => (CONV_TRANSPOSE1D_F32, None, None, 3),
