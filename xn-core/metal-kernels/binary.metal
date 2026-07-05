@@ -14,9 +14,9 @@ kernel void binary(
     uint i [[thread_position_in_grid]]
 ) {
     if (i >= pc.n) return;
-    float a = LOAD(lhs[i]);
-    float b = LOAD(rhs[i]);
-    float r;
+    ACC a = LOAD(lhs[i]);
+    ACC b = LOAD(rhs[i]);
+    ACC r;
     switch (pc.op) {
         case 0u: r = a + b; break;
         case 1u: r = a - b; break;
