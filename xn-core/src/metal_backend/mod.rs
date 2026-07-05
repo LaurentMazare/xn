@@ -119,6 +119,19 @@ fn mtlerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ 
     move |e| crate::Error::msg(format!("metal: {context}: {e:?}"))
 }
 
+/// GPUStartTime/GPUEndTime of a completed command buffer, in seconds. Not
+/// exposed by metal-rs, so the Objective-C selectors are sent directly
+/// (registered at runtime rather than via `msg_send!`, whose expansion trips
+/// the `unexpected_cfgs` lint).
+fn command_buffer_gpu_times(cmd: &metal::CommandBufferRef) -> (f64, f64) {
+    use metal::objc::Message;
+    use metal::objc::runtime::Sel;
+    let send = |name: &str| -> f64 {
+        unsafe { cmd.send_message(Sel::register(name), ()) }.unwrap_or_default()
+    };
+    (send("GPUStartTime"), send("GPUEndTime"))
+}
+
 /// Little-endian push-constant byte builder. The MSL kernels declare their
 /// push constants as a struct of `uint`/`float` fields, which have identical
 /// sequential layout.
@@ -193,6 +206,25 @@ struct OpCtx {
     /// Buffers (dropped tensors + scratch) to recycle into the pool on the
     /// next flush, once any batch referencing them has finished executing.
     free_bufs: Vec<PooledBuf>,
+    /// Profiling: kernel name per recorded command in the current batch.
+    prof_names: Vec<String>,
+}
+
+/// Accumulated profiling counters (enabled via `XN_METAL_PROFILE=1`).
+/// In profiling mode every recorded command is flushed in its own command
+/// buffer, so the buffer's GPUStartTime/GPUEndTime delta is an accurate
+/// per-command GPU duration (per-dispatch timestamps inside a batch are not
+/// available on Apple GPUs). Batching is disabled, so wall-clock numbers are
+/// pessimistic; the per-kernel GPU times and shares are the useful output.
+#[derive(Default)]
+struct ProfStats {
+    /// kernel name -> (dispatch count, total gpu ns)
+    per_kernel: HashMap<String, (u64, u128)>,
+    gpu_ns: u128,
+    dispatches: u64,
+    flushes: u64,
+    /// CPU time spent in submit + wait.
+    wait_ns: u128,
 }
 
 /// A buffer plus its shared-memory pointer, as kept in the recycling pool. The
@@ -239,6 +271,10 @@ pub struct DeviceInner {
     mlx_pipelines: Mutex<HashMap<String, Option<metal::ComputePipelineState>>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
+    /// Set when `XN_METAL_PROFILE=1`: flush after every command and collect
+    /// per-kernel GPU times.
+    profile_enabled: bool,
+    pstats: Mutex<ProfStats>,
     device_name: String,
 }
 
@@ -293,6 +329,9 @@ impl Device {
             .new_library_with_source(MLX_GEMM_SRC, &metal::CompileOptions::new())
             .map_err(|e| crate::Error::msg(format!("metal: mlx gemm compilation failed: {e}")))?;
 
+        let profile_enabled =
+            std::env::var("XN_METAL_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0");
+
         let inner = DeviceInner {
             device,
             queue,
@@ -306,7 +345,10 @@ impl Device {
                 encoder: None,
                 n_dispatches: 0,
                 free_bufs: Vec::new(),
+                prof_names: Vec::new(),
             }),
+            profile_enabled,
+            pstats: Mutex::new(ProfStats::default()),
             device_name,
         };
         Ok(Self(Arc::new(inner)))
@@ -456,6 +498,10 @@ impl Device {
             metal::MTLSize::new(32, 2, 2),
         );
         ctx.n_dispatches += 1;
+        if self.profile_enabled {
+            let name = format!("mlx_gemm (m={}, n={}, k={})", params.m, params.n, params.k);
+            self.profile_flush(&mut ctx, name)?;
+        }
         Ok(())
     }
 
@@ -504,6 +550,19 @@ impl Device {
             metal::MTLSize::new(wg.0, wg.1, wg.2),
         );
         ctx.n_dispatches += 1;
+        if self.profile_enabled {
+            // The matmul kernels' push constants start with (m, n, k); decode
+            // them so the profile splits matmuls by shape.
+            let is_matmul = kernel.starts_with("gemv") || kernel.starts_with("gemm_tiled");
+            let name = if is_matmul && push.bytes.len() >= 12 {
+                let f =
+                    |i: usize| u32::from_le_bytes(push.bytes[4 * i..4 * i + 4].try_into().unwrap());
+                format!("{kernel} (m={}, n={}, k={})", f(0), f(1), f(2))
+            } else {
+                kernel.to_string()
+            };
+            self.profile_flush(&mut ctx, name)?;
+        }
         Ok(())
     }
 
@@ -534,7 +593,18 @@ impl Device {
             blit.end_encoding();
         });
         ctx.n_dispatches += 1;
+        if self.profile_enabled {
+            self.profile_flush(&mut ctx, "buffer_copy".to_string())?;
+        }
         Ok(())
+    }
+
+    /// Profiling mode: attribute the just-recorded command to `name` and
+    /// flush it in its own command buffer so its GPU start/end times measure
+    /// exactly that command.
+    fn profile_flush(&self, ctx: &mut OpCtx, name: String) -> Result<()> {
+        ctx.prof_names.push(name);
+        self.flush_locked(ctx)
     }
 
     /// The current batch's command buffer, creating it if needed.
@@ -573,8 +643,27 @@ impl Device {
             enc.end_encoding();
         }
         if let Some(cmd) = ctx.cmd_buffer.take() {
+            let t0 = if self.profile_enabled { Some(std::time::Instant::now()) } else { None };
             cmd.commit();
             cmd.wait_until_completed();
+            if let Some(t0) = t0 {
+                // GPUStartTime/GPUEndTime are not exposed by metal-rs; call
+                // the Objective-C selectors directly (CFTimeInterval seconds).
+                let (gpu_t0, gpu_t1) = command_buffer_gpu_times(&cmd);
+                let dt_ns = ((gpu_t1 - gpu_t0).max(0.0) * 1e9) as u128;
+                let mut stats = self.pstats.lock().unwrap();
+                stats.flushes += 1;
+                stats.wait_ns += t0.elapsed().as_nanos();
+                // In profiling mode each command is flushed on its own, so
+                // the batch holds at most one name.
+                for name in ctx.prof_names.drain(..) {
+                    let e = stats.per_kernel.entry(name).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += dt_ns;
+                    stats.dispatches += 1;
+                }
+                stats.gpu_ns += dt_ns;
+            }
         }
         // The GPU is now idle for this batch: buffers freed during it can be
         // recycled for future allocations.
@@ -589,8 +678,55 @@ impl Device {
     }
 }
 
+impl DeviceInner {
+    /// Print accumulated per-kernel GPU times (profiling mode only).
+    fn print_profile(&self) {
+        let stats = self.pstats.lock().unwrap();
+        if stats.dispatches == 0 {
+            return;
+        }
+        let mut rows: Vec<_> = stats.per_kernel.iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
+        eprintln!("\n=== xn metal profile: {} ===", self.device_name);
+        eprintln!(
+            "{:<38} {:>9} {:>11} {:>9} {:>7}",
+            "kernel", "count", "total ms", "avg us", "%gpu"
+        );
+        for (name, (cnt, ns)) in rows {
+            eprintln!(
+                "{:<38} {:>9} {:>11.2} {:>9.1} {:>6.1}%",
+                name,
+                cnt,
+                *ns as f64 / 1e6,
+                *ns as f64 / 1e3 / *cnt as f64,
+                100.0 * *ns as f64 / stats.gpu_ns as f64,
+            );
+        }
+        eprintln!(
+            "gpu total: {:.2} ms over {} commands in {} flushes; cpu submit+wait: {:.2} ms",
+            stats.gpu_ns as f64 / 1e6,
+            stats.dispatches,
+            stats.flushes,
+            stats.wait_ns as f64 / 1e6,
+        );
+        let pool = self.pool.lock().unwrap();
+        let total = pool.hits + pool.misses;
+        if total > 0 {
+            eprintln!(
+                "buffer pool: {} hits / {} allocs ({:.1}% reuse)",
+                pool.hits,
+                total,
+                100.0 * pool.hits as f64 / total as f64,
+            );
+        }
+    }
+}
+
 impl Drop for DeviceInner {
     fn drop(&mut self) {
+        if self.profile_enabled {
+            self.print_profile();
+        }
         // The last batch may still be open: recorded but never submitted
         // because nothing read its results back. Metal asserts if a live
         // command encoder is released without endEncoding, so close it here.
