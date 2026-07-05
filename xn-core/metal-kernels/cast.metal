@@ -32,11 +32,50 @@ kernel void name(                                                     \
     dst[i] = (EXPR);                                                  \
 }
 
+// Float -> integer casts follow Rust `as` semantics: truncate toward zero,
+// saturate out-of-range values, NaN -> 0 (checked on the bit pattern so
+// fast-math cannot elide it).
+inline long cast_f32_to_i64(float v) {
+    if ((as_type<uint>(v) & 0x7fffffffu) > 0x7f800000u) {
+        return 0;
+    }
+    if (v >= 9223372036854775808.0f) {
+        return 0x7fffffffffffffff;
+    }
+    if (v <= -9223372036854775808.0f) {
+        return as_type<long>(0x8000000000000000);
+    }
+    return long(v);
+}
+inline uchar cast_f32_to_u8(float v) {
+    if ((as_type<uint>(v) & 0x7fffffffu) > 0x7f800000u) {
+        return 0;
+    }
+    return uchar(clamp(v, 0.0f, 255.0f));
+}
+
 XN_CAST(cast_f32_f16, float, half, half(v))
 XN_CAST(cast_f16_f32, half, float, float(v))
 XN_CAST(cast_f32_bf16, float, ushort, cast_bf16_store(v))
 XN_CAST(cast_bf16_f32, ushort, float, cast_bf16_load(v))
 XN_CAST(cast_f16_bf16, half, ushort, cast_bf16_store(float(v)))
 XN_CAST(cast_bf16_f16, ushort, half, half(cast_bf16_load(v)))
+
+XN_CAST(cast_f32_i64, float, long, cast_f32_to_i64(v))
+XN_CAST(cast_f32_u8, float, uchar, cast_f32_to_u8(v))
+XN_CAST(cast_f16_i64, half, long, cast_f32_to_i64(float(v)))
+XN_CAST(cast_f16_u8, half, uchar, cast_f32_to_u8(float(v)))
+XN_CAST(cast_bf16_i64, ushort, long, cast_f32_to_i64(cast_bf16_load(v)))
+XN_CAST(cast_bf16_u8, ushort, uchar, cast_f32_to_u8(cast_bf16_load(v)))
+
+XN_CAST(cast_i64_f32, long, float, float(v))
+XN_CAST(cast_i64_f16, long, half, half(float(v)))
+XN_CAST(cast_i64_bf16, long, ushort, cast_bf16_store(float(v)))
+XN_CAST(cast_u8_f32, uchar, float, float(v))
+XN_CAST(cast_u8_f16, uchar, half, half(float(v)))
+XN_CAST(cast_u8_bf16, uchar, ushort, cast_bf16_store(float(v)))
+
+XN_CAST(cast_i64_u8, long, uchar, uchar(v))
+XN_CAST(cast_u8_i64, uchar, long, long(v))
 
 #endif

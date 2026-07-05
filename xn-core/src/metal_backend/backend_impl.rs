@@ -12,29 +12,6 @@ fn scalar_to_f32<T: WithDType>(v: T) -> f32 {
     }
 }
 
-fn bin_apply<T: WithDType>(op: BinaryOp, a: T, b: T) -> T {
-    match op {
-        BinaryOp::Add => a + b,
-        BinaryOp::Sub => a - b,
-        BinaryOp::Mul => a * b,
-        BinaryOp::Div => a / b,
-        BinaryOp::Maximum => {
-            if a > b {
-                a
-            } else {
-                b
-            }
-        }
-        BinaryOp::Minimum => {
-            if a < b {
-                a
-            } else {
-                b
-            }
-        }
-    }
-}
-
 impl crate::Backend for Device {
     type Storage<T: WithDType> = Storage<T>;
 
@@ -53,7 +30,15 @@ impl crate::Backend for Device {
 
     unsafe fn alloc_uninit<T: WithDType>(len: usize, dev: &Self) -> Result<Self::Storage<T>> {
         let (buffer, ptr, class) = dev.alloc_buffer(len * T::BYTE_SIZE)?;
-        Ok(Storage { buffer, ptr, len, class, device: dev.clone(), _t: PhantomData })
+        Ok(Storage {
+            buffer,
+            ptr,
+            len,
+            class,
+            gpu_used: std::sync::atomic::AtomicBool::new(false),
+            device: dev.clone(),
+            _t: PhantomData,
+        })
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, dev: &Self) -> Result<Self::Storage<T>> {
@@ -72,15 +57,19 @@ impl crate::Backend for Device {
         let elem_bytes =
             unsafe { std::slice::from_raw_parts(&elem as *const T as *const u8, T::BYTE_SIZE) };
         if elem_bytes.iter().all(|&b| b == elem_bytes[0]) {
-            return dst.device.record_fill(&dst.buffer, elem_bytes[0], len * T::BYTE_SIZE);
+            return dst.device.record_fill(dst.buf(), elem_bytes[0], len * T::BYTE_SIZE);
         }
-        dst.device.flush("host fill")?;
+        if dst.is_gpu_used() {
+            dst.device.flush("host fill")?;
+        }
         dst.as_mut_slice()[..len].fill(elem);
         Ok(())
     }
 
     fn rand_uniform(dst: &mut Self::Storage<f32>, len: usize, lo: f32, up: f32) -> Result<()> {
-        dst.device.flush("rand_uniform")?;
+        if dst.is_gpu_used() {
+            dst.device.flush("rand_uniform")?;
+        }
         let range = up - lo;
         for v in dst.as_mut_slice()[..len].iter_mut() {
             *v = rand::random::<f32>() * range + lo;
@@ -94,7 +83,9 @@ impl crate::Backend for Device {
             Ok(d) => d,
             Err(e) => crate::bail!("failed to create normal distribution for randn: {e}"),
         };
-        dst.device.flush("randn")?;
+        if dst.is_gpu_used() {
+            dst.device.flush("randn")?;
+        }
         let mut rng = rand::rng();
         for v in dst.as_mut_slice()[..len].iter_mut() {
             *v = distr.sample(&mut rng);
@@ -104,7 +95,7 @@ impl crate::Backend for Device {
 
     fn copy<T: WithDType>(dst: &mut Self::Storage<T>, src: &Self::Storage<T>, len: usize) -> Result<()> {
         // Recorded as a GPU blit so it stays in the batch.
-        dst.device.record_copy(&dst.buffer, &src.buffer, len * T::BYTE_SIZE)
+        dst.device.record_copy(dst.buf(), src.buf(), len * T::BYTE_SIZE)
     }
 
     fn to_dtype<T: WithDType, U: WithDType>(
@@ -112,72 +103,27 @@ impl crate::Backend for Device {
         src: &Self::Storage<T>,
         len: usize,
     ) -> Result<()> {
-        use half::{bf16, f16};
-        // Same-dtype conversion is a plain buffer copy; conversions between
-        // the float dtypes run as GPU cast kernels. Both stay in the batch
-        // pipeline. Only integer<->float conversions drain and run on host.
+        // Same-dtype conversion is a plain buffer copy; everything else runs
+        // as a GPU cast kernel. Nothing drains the pipeline. The float->int
+        // kernels follow the host `as` semantics (truncate, saturate,
+        // NaN -> 0).
         if T::DTYPE == U::DTYPE {
-            return src.device.record_copy(&dst.buffer, &src.buffer, len * T::BYTE_SIZE);
+            return src.device.record_copy(dst.buf(), src.buf(), len * T::BYTE_SIZE);
         }
-        let sfx = |d: DType| match d {
-            DType::F32 => Some("f32"),
-            DType::F16 => Some("f16"),
-            DType::BF16 => Some("bf16"),
-            _ => None,
-        };
-        if let (Some(s), Some(d)) = (sfx(T::DTYPE), sfx(U::DTYPE)) {
-            let push = Pc::new().usize(len);
-            return src.device.dispatch(
-                &format!("cast_{s}_{d}"),
-                &[&src.buffer, &dst.buffer],
-                &push,
-                div_ceil(len, WORKGROUP_SIZE),
-            );
-        }
-        src.device.flush("host to_dtype")?;
-        macro_rules! cast {
-            ($s:ty, $d:ty, |$v:ident| $e:expr) => {{
-                let s = unsafe { std::slice::from_raw_parts(src.ptr as *const $s, len) };
-                let d = unsafe { std::slice::from_raw_parts_mut(dst.ptr as *mut $d, len) };
-                for (o, i) in d.iter_mut().zip(s.iter()) {
-                    let $v = *i;
-                    *o = $e;
-                }
-            }};
-        }
-        use DType::*;
-        match (T::DTYPE, U::DTYPE) {
-            (F16, F16) => cast!(f16, f16, |v| v),
-            (BF16, BF16) => cast!(bf16, bf16, |v| v),
-            (F32, F32) => cast!(f32, f32, |v| v),
-            (I64, I64) => cast!(i64, i64, |v| v),
-            (U8, U8) => cast!(u8, u8, |v| v),
-            (F32, F16) => cast!(f32, f16, |v| f16::from_f32(v)),
-            (F32, BF16) => cast!(f32, bf16, |v| bf16::from_f32(v)),
-            (F16, F32) => cast!(f16, f32, |v| v.to_f32()),
-            (BF16, F32) => cast!(bf16, f32, |v| v.to_f32()),
-            (F16, BF16) => cast!(f16, bf16, |v| bf16::from_f32(v.to_f32())),
-            (BF16, F16) => cast!(bf16, f16, |v| f16::from_f32(v.to_f32())),
-            (F32, I64) => cast!(f32, i64, |v| v as i64),
-            (F32, U8) => cast!(f32, u8, |v| v as u8),
-            (F16, I64) => cast!(f16, i64, |v| v.to_f32() as i64),
-            (F16, U8) => cast!(f16, u8, |v| v.to_f32() as u8),
-            (BF16, I64) => cast!(bf16, i64, |v| v.to_f32() as i64),
-            (BF16, U8) => cast!(bf16, u8, |v| v.to_f32() as u8),
-            (I64, F32) => cast!(i64, f32, |v| v as f32),
-            (I64, F16) => cast!(i64, f16, |v| f16::from_f32(v as f32)),
-            (I64, BF16) => cast!(i64, bf16, |v| bf16::from_f32(v as f32)),
-            (U8, F32) => cast!(u8, f32, |v| v as f32),
-            (U8, F16) => cast!(u8, f16, |v| f16::from_f32(v as f32)),
-            (U8, BF16) => cast!(u8, bf16, |v| bf16::from_f32(v as f32)),
-            (I64, U8) => cast!(i64, u8, |v| v as u8),
-            (U8, I64) => cast!(u8, i64, |v| v as i64),
-        }
-        Ok(())
+        let (s, d) = (any_suffix::<T>(), any_suffix::<U>());
+        let push = Pc::new().usize(len);
+        src.device.dispatch(
+            &format!("cast_{s}_{d}"),
+            &[src.buf(), dst.buf()],
+            &push,
+            div_ceil(len, WORKGROUP_SIZE),
+        )
     }
 
     fn data<T: WithDType>(src: &Self::Storage<T>, len: usize) -> Result<std::borrow::Cow<'_, [T]>> {
-        src.device.flush("readback")?;
+        if src.is_gpu_used() {
+            src.device.flush("readback")?;
+        }
         Ok(std::borrow::Cow::Owned(src.as_slice()[..len].to_vec()))
     }
 
@@ -187,7 +133,7 @@ impl crate::Backend for Device {
         let push = Pc::new().usize(len).u32(code).f32(alpha);
         dst.device.dispatch(
             &format!("unary_{dt}"),
-            &[&dst.buffer, &dst.buffer],
+            &[dst.buf(), dst.buf()],
             &push,
             div_ceil(len, WORKGROUP_SIZE),
         )
@@ -204,7 +150,7 @@ impl crate::Backend for Device {
         let push = Pc::new().usize(len).u32(code).f32(alpha);
         dst.device.dispatch(
             &format!("unary_{dt}"),
-            &[&src.buffer, &dst.buffer],
+            &[src.buf(), dst.buf()],
             &push,
             div_ceil(len, WORKGROUP_SIZE),
         )
@@ -216,22 +162,14 @@ impl crate::Backend for Device {
         len: usize,
         op: BinaryOp,
     ) -> Result<()> {
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let push = Pc::new().usize(len).u32(binary_op_code(op));
-            dst.device.dispatch(
-                &format!("binary_{dt}"),
-                &[&dst.buffer, &s.buffer, &dst.buffer],
-                &push,
-                div_ceil(len, WORKGROUP_SIZE),
-            )
-        } else {
-            dst.device.flush("host op fallback")?;
-            let src = s.as_slice()[..len].to_vec();
-            for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(src) {
-                *d = bin_apply(op, *d, sv);
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let push = Pc::new().usize(len).u32(binary_op_code(op));
+        dst.device.dispatch(
+            &format!("binary_{dt}"),
+            &[dst.buf(), s.buf(), dst.buf()],
+            &push,
+            div_ceil(len, WORKGROUP_SIZE),
+        )
     }
 
     fn binary<T: WithDType>(
@@ -241,24 +179,14 @@ impl crate::Backend for Device {
         len: usize,
         op: BinaryOp,
     ) -> Result<()> {
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let push = Pc::new().usize(len).u32(binary_op_code(op));
-            dst.device.dispatch(
-                &format!("binary_{dt}"),
-                &[&lhs.buffer, &rhs.buffer, &dst.buffer],
-                &push,
-                div_ceil(len, WORKGROUP_SIZE),
-            )
-        } else {
-            dst.device.flush("host op fallback")?;
-            let l = lhs.as_slice();
-            let r = rhs.as_slice();
-            let d = dst.as_mut_slice();
-            for i in 0..len {
-                d[i] = bin_apply(op, l[i], r[i]);
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let push = Pc::new().usize(len).u32(binary_op_code(op));
+        dst.device.dispatch(
+            &format!("binary_{dt}"),
+            &[lhs.buf(), rhs.buf(), dst.buf()],
+            &push,
+            div_ceil(len, WORKGROUP_SIZE),
+        )
     }
 
     fn scale_add<T: WithDType>(
@@ -275,12 +203,12 @@ impl crate::Backend for Device {
             let push = Pc::new().usize(len).f32(scalar_to_f32(scale)).f32(scalar_to_f32(add));
             dst.device.dispatch(
                 &format!("scale_add_{dt}"),
-                &[&src.buffer, &dst.buffer],
+                &[src.buf(), dst.buf()],
                 &push,
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush("host op fallback")?;
+            dst.device.flush("host scale_add")?;
             let s = src.as_slice()[..len].to_vec();
             for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(s) {
                 *d = sv * scale + add;
@@ -306,38 +234,14 @@ impl crate::Backend for Device {
         let d_k: usize = dims[(dim2 + 1)..].iter().product();
         let d1 = dims[dim1];
         let d2 = dims[dim2];
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let push = Pc::new().usize(numel).usize(d1).usize(d2).usize(d_i).usize(d_j).usize(d_k);
-            dst.device.dispatch(
-                &format!("transpose_{dt}"),
-                &[&src.buffer, &dst.buffer],
-                &push,
-                div_ceil(numel, WORKGROUP_SIZE),
-            )
-        } else {
-            dst.device.flush("host op fallback")?;
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
-            for dst_idx in 0..numel {
-                let mut rem = dst_idx;
-                let i = rem / (d2 * d_j * d1 * d_k);
-                rem -= i * (d2 * d_j * d1 * d_k);
-                let a2 = rem / (d_j * d1 * d_k);
-                rem -= a2 * (d_j * d1 * d_k);
-                let j = rem / (d1 * d_k);
-                rem -= j * (d1 * d_k);
-                let a1 = rem / d_k;
-                rem -= a1 * d_k;
-                let k = rem;
-                let src_idx = i * d1 * d_j * d2 * d_k
-                    + a1 * d_j * d2 * d_k
-                    + j * d2 * d_k
-                    + a2 * d_k
-                    + k;
-                d[dst_idx] = s[src_idx];
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let push = Pc::new().usize(numel).usize(d1).usize(d2).usize(d_i).usize(d_j).usize(d_k);
+        dst.device.dispatch(
+            &format!("transpose_{dt}"),
+            &[src.buf(), dst.buf()],
+            &push,
+            div_ceil(numel, WORKGROUP_SIZE),
+        )
     }
 
     fn copy2d<T: WithDType>(
@@ -353,26 +257,15 @@ impl crate::Backend for Device {
         if d1 == 0 || d2 == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let push =
-                Pc::new().usize(d1).usize(d2).usize(src_s).usize(dst_s).usize(src_o).usize(dst_o);
-            dst.device.dispatch(
-                &format!("copy2d_{dt}"),
-                &[&src.buffer, &dst.buffer],
-                &push,
-                div_ceil(d1 * d2, WORKGROUP_SIZE),
-            )
-        } else {
-            dst.device.flush("host op fallback")?;
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
-            for i1 in 0..d1 {
-                for i2 in 0..d2 {
-                    d[dst_o + i1 * dst_s + i2] = s[src_o + i1 * src_s + i2];
-                }
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let push =
+            Pc::new().usize(d1).usize(d2).usize(src_s).usize(dst_s).usize(src_o).usize(dst_o);
+        dst.device.dispatch(
+            &format!("copy2d_{dt}"),
+            &[src.buf(), dst.buf()],
+            &push,
+            div_ceil(d1 * d2, WORKGROUP_SIZE),
+        )
     }
 
     fn rope<T: WithDTypeF>(
@@ -402,7 +295,7 @@ impl crate::Backend for Device {
             .usize(off);
         dst.device.dispatch(
             &format!("rope_{dt}"),
-            &[&cos.buffer, &sin.buffer, &src.buffer, &dst.buffer],
+            &[cos.buf(), sin.buf(), src.buf(), dst.buf()],
             &push,
             div_ceil(bh * td / 2, WORKGROUP_SIZE),
         )
@@ -428,7 +321,7 @@ impl crate::Backend for Device {
         let push = Pc::new().usize(bh).usize(td).usize(h).usize(cs_stride_b).usize(off).usize(off);
         dst.device.dispatch(
             &format!("rope_i_{dt}"),
-            &[&cos.buffer, &sin.buffer, &src.buffer, &dst.buffer],
+            &[cos.buf(), sin.buf(), src.buf(), dst.buf()],
             &push,
             div_ceil(bh * td / 2, WORKGROUP_SIZE),
         )
@@ -492,9 +385,9 @@ impl crate::Backend for Device {
                 return dst.device.dispatch_mlx_gemv(
                     &pipeline,
                     &name,
-                    (&rhs.0.buffer, mat_byte_off as u64),
-                    (&lhs.0.buffer, vec_byte_off as u64),
-                    &dst.buffer,
+                    (rhs.0.buf(), mat_byte_off as u64),
+                    (lhs.0.buf(), vec_byte_off as u64),
+                    dst.buf(),
                     (k as i32, n as i32, ld as i32),
                     (lhs_b_stride as u64, rhs_b_stride as u64),
                     (n_tgp, 1, lhs_b as u64),
@@ -555,9 +448,9 @@ impl crate::Backend for Device {
                     };
                     return dst.device.dispatch_mlx_gemm(
                         &pipeline,
-                        (&lhs.0.buffer, a_byte_off as u64),
-                        (&rhs.0.buffer, b_byte_off as u64),
-                        &dst.buffer,
+                        (lhs.0.buf(), a_byte_off as u64),
+                        (rhs.0.buf(), b_byte_off as u64),
+                        dst.buf(),
                         &params,
                         lhs_b as i32,
                         &[lhs_b_stride as isize, rhs_b_stride as isize],
@@ -581,7 +474,7 @@ impl crate::Backend for Device {
             .usize(dst_cs)
             .usize(lhs.1)
             .usize(rhs.1);
-        let buffers: [&metal::BufferRef; 3] = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer];
+        let buffers: [&metal::BufferRef; 3] = [dst.buf(), lhs.0.buf(), rhs.0.buf()];
         if m == 1 {
             // Decode path: one simdgroup per output column, GEMV_NSG columns
             // per threadgroup, grid (ceil(n / GEMV_NSG), batch, 1).
@@ -607,35 +500,14 @@ impl crate::Backend for Device {
         let right_size: usize = dims[dim + 1..].iter().product::<usize>().max(1);
         let src_dim_size = dims[dim];
         let total = left_size * num_ids * right_size;
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let push = Pc::new().usize(left_size).usize(num_ids).usize(right_size).usize(src_dim_size);
-            dst.device.dispatch(
-                &format!("index_select_{dt}"),
-                &[&src.buffer, &dst.buffer, &ids.buffer],
-                &push,
-                div_ceil(total, WORKGROUP_SIZE),
-            )
-        } else {
-            dst.device.flush("host op fallback")?;
-            let ids_h = ids.as_slice();
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
-            for left in 0..left_size {
-                for id_i in 0..num_ids {
-                    let idx = ids_h[id_i];
-                    for r in 0..right_size {
-                        let dst_off = (left * num_ids + id_i) * right_size + r;
-                        if idx == -1 {
-                            d[dst_off] = T::zero();
-                        } else {
-                            let src_off = (left * src_dim_size + idx as usize) * right_size + r;
-                            d[dst_off] = s[src_off];
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let push = Pc::new().usize(left_size).usize(num_ids).usize(right_size).usize(src_dim_size);
+        dst.device.dispatch(
+            &format!("index_select_{dt}"),
+            &[src.buf(), dst.buf(), ids.buf()],
+            &push,
+            div_ceil(total, WORKGROUP_SIZE),
+        )
     }
 
     fn apply_causality_mask<T: WithDTypeF>(
@@ -650,7 +522,7 @@ impl crate::Backend for Device {
         let push = Pc::new().usize(bh).usize(t1).usize(t2).usize(offset);
         dst.device.dispatch(
             &format!("causality_mask_{dt}"),
-            &[&dst.buffer],
+            &[dst.buf()],
             &push,
             div_ceil(total, WORKGROUP_SIZE),
         )
@@ -664,7 +536,7 @@ impl crate::Backend for Device {
     ) -> Result<()> {
         let dt = dtype_suffix::<T>(&dst.device, "softmax")?;
         let push = Pc::new().usize(dim_m1);
-        dst.device.dispatch(&format!("softmax_{dt}"), &[&src.buffer, &dst.buffer], &push, d as u32)
+        dst.device.dispatch(&format!("softmax_{dt}"), &[src.buf(), dst.buf()], &push, d as u32)
     }
 
     fn rms_norm<T: WithDTypeF>(
@@ -679,7 +551,7 @@ impl crate::Backend for Device {
         let push = Pc::new().usize(dim_m1).f32(eps);
         dst.device.dispatch(
             &format!("rmsnorm_{dt}"),
-            &[&src.buffer, &dst.buffer, &alpha.buffer],
+            &[src.buf(), dst.buf(), alpha.buf()],
             &push,
             d as u32,
         )
@@ -699,7 +571,7 @@ impl crate::Backend for Device {
         let push = Pc::new().usize(dim_m1).f32(eps).u32(if remove_mean { 1 } else { 0 });
         dst.device.dispatch(
             &format!("layernorm_{dt}"),
-            &[&src.buffer, &dst.buffer, &weight.buffer, &bias.buffer],
+            &[src.buf(), dst.buf(), weight.buf(), bias.buf()],
             &push,
             d as u32,
         )
@@ -766,36 +638,19 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let info: Vec<u32> =
-                dims.iter().chain(src_strides.iter()).map(|&v| v as u32).collect();
-            let scratch = dst.device.scratch_u32(&info)?;
-            let push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset);
-            let res = dst.device.dispatch(
-                &format!("copy_strided_{dt}"),
-                &[&src.buffer, &dst.buffer, &scratch.buffer],
-                &push,
-                div_ceil(numel, WORKGROUP_SIZE),
-            );
-            // Only defer after the dispatch is recorded (see defer_free).
-            dst.device.defer_free(scratch);
-            res
-        } else {
-            dst.device.flush("host op fallback")?;
-            let n = dims.len();
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
-            for idx in 0..numel {
-                let mut si = 0usize;
-                let mut rem = idx;
-                for di in (0..n).rev() {
-                    si += (rem % dims[di]) * src_strides[di];
-                    rem /= dims[di];
-                }
-                d[idx] = s[src_offset + si];
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let info: Vec<u32> = dims.iter().chain(src_strides.iter()).map(|&v| v as u32).collect();
+        let scratch = dst.device.scratch_u32(&info)?;
+        let push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset);
+        let res = dst.device.dispatch(
+            &format!("copy_strided_{dt}"),
+            &[src.buf(), dst.buf(), &scratch.buffer],
+            &push,
+            div_ceil(numel, WORKGROUP_SIZE),
+        );
+        // Only defer after the dispatch is recorded (see defer_free).
+        dst.device.defer_free(scratch);
+        res
     }
 
     fn scatter_set<T: WithDType>(
@@ -813,28 +668,14 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let push = Pc::new().usize(numel).usize(right_size).usize(src_dim_size).usize(dst_dim_size);
-            dst.device.dispatch(
-                &format!("scatter_set_{dt}"),
-                &[&dst.buffer, &src.buffer, &ids.buffer],
-                &push,
-                div_ceil(numel, WORKGROUP_SIZE),
-            )
-        } else {
-            dst.device.flush("host op fallback")?;
-            let ids_h = ids.as_slice();
-            let s = src.as_slice();
-            let d = dst.as_mut_slice();
-            for i in 0..numel {
-                let right = i % right_size;
-                let left = i / (right_size * src_dim_size);
-                let idx = ids_h[i] as usize;
-                let dst_off = left * dst_dim_size * right_size + idx * right_size + right;
-                d[dst_off] = s[i];
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let push = Pc::new().usize(numel).usize(right_size).usize(src_dim_size).usize(dst_dim_size);
+        dst.device.dispatch(
+            &format!("scatter_set_{dt}"),
+            &[dst.buf(), src.buf(), ids.buf()],
+            &push,
+            div_ceil(numel, WORKGROUP_SIZE),
+        )
     }
 
     fn broadcast_binary<T: WithDType>(
@@ -850,44 +691,24 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
-            let info: Vec<u32> = dst_shape
-                .iter()
-                .chain(lhs_strides.iter())
-                .chain(rhs_strides.iter())
-                .map(|&v| v as u32)
-                .collect();
-            let scratch = dst.device.scratch_u32(&info)?;
-            let push = Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op));
-            let res = dst.device.dispatch(
-                &format!("broadcast_{dt}"),
-                &[&lhs.buffer, &rhs.buffer, &dst.buffer, &scratch.buffer],
-                &push,
-                div_ceil(numel, WORKGROUP_SIZE),
-            );
-            // Only defer after the dispatch is recorded (see defer_free).
-            dst.device.defer_free(scratch);
-            res
-        } else {
-            dst.device.flush("host op fallback")?;
-            let n = dst_shape.len();
-            let l = lhs.as_slice();
-            let r = rhs.as_slice();
-            let d = dst.as_mut_slice();
-            for idx in 0..numel {
-                let mut li = 0usize;
-                let mut ri = 0usize;
-                let mut rem = idx;
-                for di in (0..n).rev() {
-                    let coord = rem % dst_shape[di];
-                    rem /= dst_shape[di];
-                    li += coord * lhs_strides[di];
-                    ri += coord * rhs_strides[di];
-                }
-                d[idx] = bin_apply(op, l[li], r[ri]);
-            }
-            Ok(())
-        }
+        let dt = any_suffix::<T>();
+        let info: Vec<u32> = dst_shape
+            .iter()
+            .chain(lhs_strides.iter())
+            .chain(rhs_strides.iter())
+            .map(|&v| v as u32)
+            .collect();
+        let scratch = dst.device.scratch_u32(&info)?;
+        let push = Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op));
+        let res = dst.device.dispatch(
+            &format!("broadcast_{dt}"),
+            &[lhs.buf(), rhs.buf(), dst.buf(), &scratch.buffer],
+            &push,
+            div_ceil(numel, WORKGROUP_SIZE),
+        );
+        // Only defer after the dispatch is recorded (see defer_free).
+        dst.device.defer_free(scratch);
+        res
     }
 
     fn conv1d<T: WithDTypeF>(
@@ -920,7 +741,7 @@ impl crate::Backend for Device {
             .usize(groups);
         dst.device.dispatch(
             "conv1d_f32",
-            &[&dst.buffer, &src.buffer, &kernel.buffer],
+            &[dst.buf(), src.buf(), kernel.buf()],
             &push,
             div_ceil(total, WORKGROUP_SIZE),
         )
@@ -955,7 +776,7 @@ impl crate::Backend for Device {
             .usize(groups);
         dst.device.dispatch(
             "conv_transpose1d_f32",
-            &[&dst.buffer, &src.buffer, &kernel.buffer],
+            &[dst.buf(), src.buf(), kernel.buf()],
             &push,
             div_ceil(total, WORKGROUP_SIZE),
         )
@@ -978,7 +799,7 @@ impl Device {
             return Ok(());
         }
         let push = Pc::new().usize(num_outputs).usize(dim_size).usize(inner_size).u32(op);
-        dst.device.dispatch(&format!("reduce_{dt}"), &[&src.buffer, &dst.buffer], &push, num_outputs as u32)
+        dst.device.dispatch(&format!("reduce_{dt}"), &[src.buf(), dst.buf()], &push, num_outputs as u32)
     }
 
     fn reduce_arg<T: WithDTypeF>(
@@ -998,7 +819,7 @@ impl Device {
         let push = Pc::new().usize(num_outputs).usize(dim_size).usize(inner_size).u32(op);
         dst.device.dispatch(
             &format!("reduce_arg_{dt}"),
-            &[&src.buffer, &dst.buffer],
+            &[src.buf(), dst.buf()],
             &push,
             num_outputs as u32,
         )

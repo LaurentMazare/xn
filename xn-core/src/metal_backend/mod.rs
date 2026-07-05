@@ -67,6 +67,20 @@ const KERNEL_SRCS: &[&str] = &[
     include_str!("../../metal-kernels/cast.metal"),
 ];
 
+/// The dtype-generic kernels (integer arithmetic or pure data movement); only
+/// these are compiled into the i64/u8 library variants, so that non-float
+/// tensors stay on the GPU instead of falling back to host loops that drain
+/// the pipeline.
+const KERNEL_SRCS_INT: &[&str] = &[
+    include_str!("../../metal-kernels/binary.metal"),
+    include_str!("../../metal-kernels/broadcast.metal"),
+    include_str!("../../metal-kernels/transpose.metal"),
+    include_str!("../../metal-kernels/copy2d.metal"),
+    include_str!("../../metal-kernels/copy_strided.metal"),
+    include_str!("../../metal-kernels/index_select.metal"),
+    include_str!("../../metal-kernels/scatter_set.metal"),
+];
+
 /// Definition of a compute kernel given a dtype-suffixed name such as
 /// `"unary_f16"`: returns its library index (0 = f32, 1 = f16, 2 = bf16), the
 /// MSL entry point, its number of storage-buffer bindings (bound at buffer
@@ -82,36 +96,45 @@ fn kernel_def(name: &str) -> Option<KernelDef<'_>> {
         return Some((0, name, 2, wg1d));
     }
     let (base, dt) = name.rsplit_once('_')?;
-    // (bindings, threads-per-threadgroup, f32-only)
-    let (bindings, wg, f32_only) = match base {
-        "unary" => (2, wg1d, false),
-        "binary" => (3, wg1d, false),
-        "scale_add" => (2, wg1d, false),
-        "broadcast" => (4, wg1d, false),
-        "softmax" => (2, wg1d, false),
-        "rmsnorm" => (3, wg1d, false),
-        "layernorm" => (4, wg1d, false),
-        "rope" => (4, wg1d, false),
-        "rope_i" => (4, wg1d, false),
-        "reduce" => (2, wg1d, false),
-        "reduce_arg" => (2, wg1d, false),
-        "transpose" => (2, wg1d, false),
-        "copy2d" => (2, wg1d, false),
-        "copy_strided" => (3, wg1d, false),
-        "index_select" => (3, wg1d, false),
-        "causality_mask" => (1, wg1d, false),
-        "scatter_set" => (3, wg1d, false),
-        "gemm_tiled" => (3, (16, 16, 1), false),
-        "gemv" => (3, wg1d, false),
+    // Which dtype variants each kernel exists for.
+    #[derive(PartialEq)]
+    enum Dt {
+        F32Only,
+        Float,
+        Any,
+    }
+    // (bindings, threads-per-threadgroup, dtype coverage)
+    let (bindings, wg, dts) = match base {
+        "unary" => (2, wg1d, Dt::Float),
+        "binary" => (3, wg1d, Dt::Any),
+        "scale_add" => (2, wg1d, Dt::Float),
+        "broadcast" => (4, wg1d, Dt::Any),
+        "softmax" => (2, wg1d, Dt::Float),
+        "rmsnorm" => (3, wg1d, Dt::Float),
+        "layernorm" => (4, wg1d, Dt::Float),
+        "rope" => (4, wg1d, Dt::Float),
+        "rope_i" => (4, wg1d, Dt::Float),
+        "reduce" => (2, wg1d, Dt::Float),
+        "reduce_arg" => (2, wg1d, Dt::Float),
+        "transpose" => (2, wg1d, Dt::Any),
+        "copy2d" => (2, wg1d, Dt::Any),
+        "copy_strided" => (3, wg1d, Dt::Any),
+        "index_select" => (3, wg1d, Dt::Any),
+        "causality_mask" => (1, wg1d, Dt::Float),
+        "scatter_set" => (3, wg1d, Dt::Any),
+        "gemm_tiled" => (3, (16, 16, 1), Dt::Float),
+        "gemv" => (3, wg1d, Dt::Float),
         // conv kernels are f32-only; other dtypes must fail pipeline lookup.
-        "conv1d" => (3, wg1d, true),
-        "conv_transpose1d" => (3, wg1d, true),
+        "conv1d" => (3, wg1d, Dt::F32Only),
+        "conv_transpose1d" => (3, wg1d, Dt::F32Only),
         _ => return None,
     };
     let lib_idx = match dt {
-        "f16" if !f32_only => 1,
-        "bf16" if !f32_only => 2,
         "f32" => 0,
+        "f16" if dts != Dt::F32Only => 1,
+        "bf16" if dts != Dt::F32Only => 2,
+        "i64" if dts == Dt::Any => 3,
+        "u8" if dts == Dt::Any => 4,
         _ => return None,
     };
     Some((lib_idx, base, bindings, wg))
@@ -308,8 +331,9 @@ fn size_class(bytes: usize) -> u64 {
 pub struct DeviceInner {
     device: metal::Device,
     queue: metal::CommandQueue,
-    /// Per-dtype-variant libraries: [f32, f16, bf16].
-    libraries: [metal::Library; 3],
+    /// Per-dtype-variant libraries: [f32, f16, bf16, i64, u8] (the integer
+    /// variants only hold the dtype-generic kernels).
+    libraries: [metal::Library; 5],
     /// MLX steel GEMM library (simdgroup-matrix kernels, own source file).
     mlx_gemm_library: metal::Library,
     /// MLX GEMV library (own source file).
@@ -368,17 +392,23 @@ impl Device {
         let device_name = device.name().to_string();
         let queue = device.new_command_queue();
 
-        // Compile the three dtype variants of the kernel library.
-        let body: String = KERNEL_SRCS.concat();
-        let compile = |defines: &str| -> Result<metal::Library> {
+        // Compile the dtype variants of the kernel library.
+        let compile = |defines: &str, body: &str| -> Result<metal::Library> {
             let src = format!("{defines}{DTYPE_SRC}{body}");
             let options = metal::CompileOptions::new();
             device
                 .new_library_with_source(&src, &options)
                 .map_err(|e| crate::Error::msg(format!("metal: kernel compilation failed: {e}")))
         };
-        let libraries =
-            [compile("")?, compile("#define USE_F16 1\n")?, compile("#define USE_BF16 1\n")?];
+        let body: String = KERNEL_SRCS.concat();
+        let int_body: String = KERNEL_SRCS_INT.concat();
+        let libraries = [
+            compile("", &body)?,
+            compile("#define USE_F16 1\n", &body)?,
+            compile("#define USE_BF16 1\n", &body)?,
+            compile("#define USE_I64 1\n", &int_body)?,
+            compile("#define USE_U8 1\n", &int_body)?,
+        ];
         let mlx_gemm_library = device
             .new_library_with_source(MLX_GEMM_SRC, &metal::CompileOptions::new())
             .map_err(|e| crate::Error::msg(format!("metal: mlx gemm compilation failed: {e}")))?;
@@ -981,6 +1011,11 @@ pub struct Storage<T: WithDType> {
     len: usize,
     /// Allocation size class; used to return the buffer to the pool on drop.
     class: u64,
+    /// Whether the buffer has ever been referenced by a recorded GPU command.
+    /// While false, host reads/writes need no pipeline drain: the pool only
+    /// recycles buffers from completed batches, so a fresh storage has no
+    /// pending GPU references.
+    gpu_used: std::sync::atomic::AtomicBool,
     device: Device,
     _t: PhantomData<T>,
 }
@@ -996,6 +1031,17 @@ impl<T: WithDType> Storage<T> {
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The underlying buffer, for use in a recorded GPU command; marks the
+    /// storage as GPU-referenced so later host accesses drain the pipeline.
+    fn buf(&self) -> &metal::BufferRef {
+        self.gpu_used.store(true, std::sync::atomic::Ordering::Relaxed);
+        &self.buffer
+    }
+
+    fn is_gpu_used(&self) -> bool {
+        self.gpu_used.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Host view of the shared memory as `&[T]`.
@@ -1063,14 +1109,26 @@ fn dtype_suffix<T: WithDType>(_dev: &Device, op: &str) -> Result<&'static str> {
     }
 }
 
-/// Suffix for the GPU path of dtype-generic ops, or `None` to take the host
-/// fallback (non-float dtypes).
+/// Suffix for the GPU path of ops whose scalar parameters are pushed as f32,
+/// or `None` to take the host fallback (non-float dtypes).
 fn float_suffix<T: WithDType>(_dev: &Device) -> Option<&'static str> {
     match T::DTYPE {
         DType::F32 => Some("f32"),
         DType::F16 => Some("f16"),
         DType::BF16 => Some("bf16"),
         _ => None,
+    }
+}
+
+/// Kernel dtype suffix for any storage dtype; the dtype-generic kernels exist
+/// in all five library variants.
+fn any_suffix<T: WithDType>() -> &'static str {
+    match T::DTYPE {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        DType::I64 => "i64",
+        DType::U8 => "u8",
     }
 }
 

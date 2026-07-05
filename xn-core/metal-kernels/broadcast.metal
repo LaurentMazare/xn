@@ -29,9 +29,9 @@ kernel void broadcast(
         li += coord * info[nd + di];
         ri += coord * info[2u * nd + di];
     }
-    float a = LOAD(lhs[li]);
-    float b = LOAD(rhs[ri]);
-    float r;
+    ACC a = LOAD(lhs[li]);
+    ACC b = LOAD(rhs[ri]);
+    ACC r;
     switch (pc.op) {
         case 0u: r = a + b; break;
         case 1u: r = a - b; break;

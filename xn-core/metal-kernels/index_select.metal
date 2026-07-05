@@ -27,7 +27,7 @@ kernel void index_select(
     int idx = int(ids[2u * id_i]);
     uint dst_off = (left * pc.num_ids + id_i) * pc.right_size + r;
     if (idx == -1) {
-        dst[dst_off] = STORE(0.0);
+        dst[dst_off] = SCALAR(0);
         return;
     }
     uint src_off = (left * pc.src_dim_size + uint(idx)) * pc.right_size + r;

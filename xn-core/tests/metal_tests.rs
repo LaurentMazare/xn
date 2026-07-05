@@ -123,6 +123,88 @@ fn gpu_cast_and_fill_paths() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn int_ops_on_gpu() -> Result<()> {
+    // i64/u8 tensors run the dtype-generic kernels on the GPU (no host
+    // fallback, no pipeline drain); compare against CPU.
+    let a: Vec<i64> = (0..24).map(|i| (i * 37 - 11) as i64).collect();
+    let b: Vec<i64> = (0..24).map(|i| (i % 5 + 1) as i64).collect();
+    let av: Tensor<i64, Mt> = Tensor::from_vec(a.clone(), vec![4, 6], &dev())?;
+    let bv: Tensor<i64, Mt> = Tensor::from_vec(b.clone(), vec![4, 6], &dev())?;
+    let ac: Tensor<i64, _> = Tensor::from_vec(a, vec![4, 6], &CPU)?;
+    let bc: Tensor<i64, _> = Tensor::from_vec(b, vec![4, 6], &CPU)?;
+    assert_eq!(ac.add(&bc)?.to_vec()?, av.add(&bv)?.to_vec()?);
+    assert_eq!(ac.mul(&bc)?.to_vec()?, av.mul(&bv)?.to_vec()?);
+    assert_eq!(ac.div(&bc)?.to_vec()?, av.div(&bv)?.to_vec()?);
+    assert_eq!(ac.maximum(&bc)?.to_vec()?, av.maximum(&bv)?.to_vec()?);
+    assert_eq!(
+        ac.transpose(0, 1)?.contiguous()?.to_vec()?,
+        av.transpose(0, 1)?.contiguous()?.to_vec()?
+    );
+    let cc = Tensor::cat(&[&ac, &bc], 1)?;
+    let cv = Tensor::cat(&[&av, &bv], 1)?;
+    assert_eq!(cc.to_vec()?, cv.to_vec()?);
+    assert_eq!(
+        cc.narrow(1, 2..9)?.contiguous()?.to_vec()?,
+        cv.narrow(1, 2..9)?.contiguous()?.to_vec()?
+    );
+    let ids = vec![3i64, 0, 2, 0];
+    let ic: Tensor<i64, _> = Tensor::from_vec(ids.clone(), vec![4], &CPU)?;
+    let iv: Tensor<i64, Mt> = Tensor::from_vec(ids, vec![4], &dev())?;
+    assert_eq!(ac.index_select(&ic, 0)?.to_vec()?, av.index_select(&iv, 0)?.to_vec()?);
+
+    // u8 binary ops (sums stay below 256: u8 overflow panics on the CPU
+    // reference in debug builds).
+    let au: Vec<u8> = (0..32).map(|i| (i * 7 % 120) as u8).collect();
+    let bu: Vec<u8> = (0..32).map(|i| (i * 3 % 89 + 1) as u8).collect();
+    let auv: Tensor<u8, Mt> = Tensor::from_vec(au.clone(), vec![32], &dev())?;
+    let buv: Tensor<u8, Mt> = Tensor::from_vec(bu.clone(), vec![32], &dev())?;
+    let auc: Tensor<u8, _> = Tensor::from_vec(au, vec![32], &CPU)?;
+    let buc: Tensor<u8, _> = Tensor::from_vec(bu, vec![32], &CPU)?;
+    assert_eq!(auc.add(&buc)?.to_vec()?, auv.add(&buv)?.to_vec()?);
+    assert_eq!(auc.minimum(&buc)?.to_vec()?, auv.minimum(&buv)?.to_vec()?);
+
+    // Values beyond f32's exact integer range survive GPU ops bit-exactly
+    // (the integer kernels do no float roundtrip).
+    let big = vec![i64::MAX - 1, i64::MIN + 2, 1 << 40, -(1 << 50)];
+    let gv: Tensor<i64, Mt> = Tensor::from_vec(big.clone(), vec![4], &dev())?;
+    let zv: Tensor<i64, Mt> = Tensor::zeros(vec![4], &dev())?;
+    assert_eq!(gv.add(&zv)?.to_vec()?, big);
+    Ok(())
+}
+
+#[test]
+fn cast_edge_semantics() -> Result<()> {
+    // GPU float->int casts must match the host `as` semantics: truncate
+    // toward zero, saturate out-of-range, NaN -> 0.
+    let data = vec![
+        1.7f32,
+        -1.7,
+        0.0,
+        -0.0,
+        255.9,
+        256.3,
+        -3.0,
+        1e20,
+        -1e20,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    let n = data.len();
+    let cpu: Tensor<f32, _> = Tensor::from_vec(data.clone(), vec![n], &CPU)?;
+    let mt: Tensor<f32, Mt> = Tensor::from_vec(data, vec![n], &dev())?;
+    assert_eq!(cpu.to::<i64>()?.to_vec()?, mt.to::<i64>()?.to_vec()?);
+    assert_eq!(cpu.to::<u8>()?.to_vec()?, mt.to::<u8>()?.to_vec()?);
+    // Integer sources.
+    let ids = vec![-5i64, 0, 7, 300, 1 << 30];
+    let ic: Tensor<i64, _> = Tensor::from_vec(ids.clone(), vec![5], &CPU)?;
+    let iv: Tensor<i64, Mt> = Tensor::from_vec(ids, vec![5], &dev())?;
+    assert_eq!(ic.to::<f32>()?.to_vec()?, iv.to::<f32>()?.to_vec()?);
+    assert_eq!(ic.to::<u8>()?.to_vec()?, iv.to::<u8>()?.to_vec()?);
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Elementwise binary / unary, compared against CPU
 // -----------------------------------------------------------------------------
