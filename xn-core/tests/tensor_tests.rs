@@ -17,6 +17,13 @@ macro_rules! test_all_backends {
                 $test_fn(&device)
             }
 
+            #[cfg(feature = "metal")]
+            #[test]
+            fn [<$test_name _metal>]() -> Result<()> {
+                let device = xn::metal_backend::Device::new(0)?;
+                $test_fn(&device)
+            }
+
             #[cfg(feature = "vulkan")]
             #[test]
             fn [<$test_name _vulkan>]() -> Result<()> {
