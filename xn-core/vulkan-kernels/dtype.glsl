@@ -14,6 +14,14 @@
 #define SCALAR float16_t
 #define LOAD(x) float(x)
 #define STORE(v) float16_t(v)
+#elif defined(USE_I64)
+// i64 as a pair of u32 words (std430 stride 8). Only the pure data-movement
+// kernels (copy2d/copy_strided/transpose/index_select/scatter_set) are built
+// with this variant: they assign SCALAR directly and never do arithmetic.
+// STORE(0.0) (index_select's -1 -> zeros case) maps to the i64 zero.
+#define SCALAR uvec2
+#define LOAD(x) 0.0
+#define STORE(v) uvec2(0u, 0u)
 #elif defined(USE_BF16)
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require

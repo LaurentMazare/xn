@@ -82,6 +82,60 @@ fn dtype_roundtrip_conversions() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn cast_pairs_cmp() -> Result<()> {
+    // Exercises the GPU cast kernels (f32/f16/bf16 pairs + i64->f32) against
+    // the CPU backend doing the same conversions.
+    let d = dev();
+    let data = iota(64);
+    let vk: Tensor<f32, Vk> = Tensor::from_vec(data.clone(), vec![64], &d)?;
+    let cpu: Tensor<f32, _> = Tensor::from_vec(data, vec![64], &CPU)?;
+    if d.supports_f16() {
+        let (a, b) = (vk.to::<half::f16>()?, cpu.to::<half::f16>()?);
+        assert_eq!(a.to_vec()?, b.to_vec()?);
+        assert_eq!(a.to::<f32>()?.to_vec()?, b.to::<f32>()?.to_vec()?);
+        if d.supports_bf16() {
+            assert_eq!(a.to::<half::bf16>()?.to_vec()?, b.to::<half::bf16>()?.to_vec()?);
+        }
+    }
+    if d.supports_bf16() {
+        let (a, b) = (vk.to::<half::bf16>()?, cpu.to::<half::bf16>()?);
+        assert_eq!(a.to_vec()?, b.to_vec()?);
+        assert_eq!(a.to::<f32>()?.to_vec()?, b.to::<f32>()?.to_vec()?);
+        if d.supports_f16() {
+            assert_eq!(a.to::<half::f16>()?.to_vec()?, b.to::<half::f16>()?.to_vec()?);
+        }
+    }
+    // i64 -> f32 (rope position path).
+    let ids = vec![0i64, 1, -1, 42, -12345, 1 << 20];
+    let iv: Tensor<i64, Vk> = Tensor::from_vec(ids.clone(), vec![6], &d)?;
+    let ic: Tensor<i64, _> = Tensor::from_vec(ids, vec![6], &CPU)?;
+    assert_eq!(iv.to::<f32>()?.to_vec()?, ic.to::<f32>()?.to_vec()?);
+    Ok(())
+}
+
+#[test]
+fn fill_16bit_and_rand() -> Result<()> {
+    let d = dev();
+    // GPU fill for 16-bit dtypes (zeros/full go through the fill kernel).
+    if d.supports_f16() {
+        let f: Tensor<half::f16, Vk> = Tensor::full(half::f16::from_f32(1.5), vec![33], &d)?;
+        assert!(f.to_vec()?.iter().all(|&x| x == half::f16::from_f32(1.5)));
+    }
+    if d.supports_bf16() {
+        let f: Tensor<half::bf16, Vk> = Tensor::full(half::bf16::from_f32(-2.25), vec![33], &d)?;
+        assert!(f.to_vec()?.iter().all(|&x| x == half::bf16::from_f32(-2.25)));
+    }
+    // rand_uniform: bounds + rough mean (flushless scratch-copy path).
+    let base: Tensor<f32, Vk> = Tensor::zeros(vec![4096], &d)?;
+    let r = base.rand_uniform_like(2.0, 3.0)?;
+    let v = r.to_vec()?;
+    assert!(v.iter().all(|&x| (2.0..3.0).contains(&x)), "values out of range");
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    assert!((mean - 2.5).abs() < 0.05, "mean {mean} too far from 2.5");
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Elementwise binary / unary, compared against CPU
 // -----------------------------------------------------------------------------

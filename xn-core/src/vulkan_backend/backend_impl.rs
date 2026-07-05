@@ -44,7 +44,7 @@ impl crate::Backend for Device {
 
     fn synchronize(&self) -> Result<()> {
         // Submit any pending batch and wait for it.
-        self.flush()?;
+        self.flush("synchronize")?;
         unsafe { self.device.device_wait_idle() }.map_err(vkerr("device_wait_idle"))?;
         Ok(())
     }
@@ -68,18 +68,31 @@ impl crate::Backend for Device {
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, elem: T, len: usize) -> Result<()> {
-        dst.device.flush()?;
+        // GPU fill for float dtypes so zeros/full stay inside the batch.
+        if let Some(dt) = float_suffix::<T>(&dst.device) {
+            let push = Pc::new().usize(len).f32(scalar_to_f32(elem));
+            return dst.device.dispatch(
+                &format!("fill_{dt}"),
+                &[dst.buffer],
+                &push,
+                div_ceil(len, WORKGROUP_SIZE),
+            );
+        }
+        dst.device.flush("fill-host")?;
         dst.as_mut_slice()[..len].fill(elem);
         Ok(())
     }
 
     fn rand_uniform(dst: &mut Self::Storage<f32>, len: usize, lo: f32, up: f32) -> Result<()> {
-        dst.device.flush()?;
+        // Values are generated on the host, but into a *fresh* scratch buffer
+        // (no pending GPU references) and copied into dst inside the batch, so
+        // no flush is needed.
         let range = up - lo;
-        for v in dst.as_mut_slice()[..len].iter_mut() {
-            *v = rand::random::<f32>() * range + lo;
-        }
-        Ok(())
+        let data: Vec<f32> = (0..len).map(|_| rand::random::<f32>() * range + lo).collect();
+        let scratch = dst.device.scratch_from_slice(&data)?;
+        let res = dst.device.record_copy(dst.buffer, scratch.buffer, len * 4);
+        dst.device.defer_free(scratch);
+        res
     }
 
     fn randn(dst: &mut Self::Storage<f32>, len: usize, mean: f32, std: f32) -> Result<()> {
@@ -88,12 +101,12 @@ impl crate::Backend for Device {
             Ok(d) => d,
             Err(e) => crate::bail!("failed to create normal distribution for randn: {e}"),
         };
-        dst.device.flush()?;
         let mut rng = rand::rng();
-        for v in dst.as_mut_slice()[..len].iter_mut() {
-            *v = distr.sample(&mut rng);
-        }
-        Ok(())
+        let data: Vec<f32> = (0..len).map(|_| distr.sample(&mut rng)).collect();
+        let scratch = dst.device.scratch_from_slice(&data)?;
+        let res = dst.device.record_copy(dst.buffer, scratch.buffer, len * 4);
+        dst.device.defer_free(scratch);
+        res
     }
 
     fn copy<T: WithDType>(dst: &mut Self::Storage<T>, src: &Self::Storage<T>, len: usize) -> Result<()> {
@@ -107,7 +120,36 @@ impl crate::Backend for Device {
         len: usize,
     ) -> Result<()> {
         use half::{bf16, f16};
-        src.device.flush()?;
+        let dev = &src.device;
+        // Same dtype: a plain in-batch buffer copy.
+        if T::DTYPE == U::DTYPE {
+            return dev.record_copy(dst.buffer, src.buffer, len * T::BYTE_SIZE);
+        }
+        // GPU cast kernels for the hot pairs (models cast around rope and
+        // sampling every step; a host cast would force a flush per call).
+        let f16_ok = dev.supports_f16;
+        let bf16_ok = dev.supports_bf16;
+        let kname = match (T::DTYPE, U::DTYPE) {
+            (DType::F32, DType::F16) if f16_ok => Some("cast_f32_f16"),
+            (DType::F16, DType::F32) if f16_ok => Some("cast_f16_f32"),
+            (DType::F32, DType::BF16) if bf16_ok => Some("cast_f32_bf16"),
+            (DType::BF16, DType::F32) if bf16_ok => Some("cast_bf16_f32"),
+            (DType::F16, DType::BF16) if f16_ok && bf16_ok => Some("cast_f16_bf16"),
+            (DType::BF16, DType::F16) if f16_ok && bf16_ok => Some("cast_bf16_f16"),
+            (DType::I64, DType::F32) => Some("cast_i64_f32"),
+            _ => None,
+        };
+        if let Some(kname) = kname {
+            let push = Pc::new().usize(len);
+            return dev.dispatch(
+                kname,
+                &[src.buffer, dst.buffer],
+                &push,
+                div_ceil(len, WORKGROUP_SIZE),
+            );
+        }
+        // Host fallback for the remaining pairs.
+        dev.flush("to_dtype-host")?;
         macro_rules! cast {
             ($s:ty, $d:ty, |$v:ident| $e:expr) => {{
                 let s = unsafe { std::slice::from_raw_parts(src.ptr as *const $s, len) };
@@ -150,7 +192,7 @@ impl crate::Backend for Device {
     }
 
     fn data<T: WithDType>(src: &Self::Storage<T>, len: usize) -> Result<std::borrow::Cow<'_, [T]>> {
-        src.device.flush()?;
+        src.device.flush("data-readback")?;
         Ok(std::borrow::Cow::Owned(src.as_slice()[..len].to_vec()))
     }
 
@@ -198,7 +240,7 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("bin_assign-host")?;
             let src = s.as_slice()[..len].to_vec();
             for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(src) {
                 *d = bin_apply(op, *d, sv);
@@ -223,7 +265,7 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("binary-host")?;
             let l = lhs.as_slice();
             let r = rhs.as_slice();
             let d = dst.as_mut_slice();
@@ -253,7 +295,7 @@ impl crate::Backend for Device {
                 div_ceil(len, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("scale_add-host")?;
             let s = src.as_slice()[..len].to_vec();
             for (d, sv) in dst.as_mut_slice()[..len].iter_mut().zip(s) {
                 *d = sv * scale + add;
@@ -279,7 +321,7 @@ impl crate::Backend for Device {
         let d_k: usize = dims[(dim2 + 1)..].iter().product();
         let d1 = dims[dim1];
         let d2 = dims[dim2];
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
+        if let Some(dt) = movement_suffix::<T>(&dst.device) {
             let push = Pc::new().usize(numel).usize(d1).usize(d2).usize(d_i).usize(d_j).usize(d_k);
             dst.device.dispatch(
                 &format!("transpose_{dt}"),
@@ -288,7 +330,7 @@ impl crate::Backend for Device {
                 div_ceil(numel, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("transpose-host")?;
             let s = src.as_slice();
             let d = dst.as_mut_slice();
             for dst_idx in 0..numel {
@@ -326,7 +368,7 @@ impl crate::Backend for Device {
         if d1 == 0 || d2 == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
+        if let Some(dt) = movement_suffix::<T>(&dst.device) {
             let push =
                 Pc::new().usize(d1).usize(d2).usize(src_s).usize(dst_s).usize(src_o).usize(dst_o);
             dst.device.dispatch(
@@ -336,7 +378,7 @@ impl crate::Backend for Device {
                 div_ceil(d1 * d2, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("copy2d-host")?;
             let s = src.as_slice();
             let d = dst.as_mut_slice();
             for i1 in 0..d1 {
@@ -464,7 +506,7 @@ impl crate::Backend for Device {
         let right_size: usize = dims[dim + 1..].iter().product::<usize>().max(1);
         let src_dim_size = dims[dim];
         let total = left_size * num_ids * right_size;
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
+        if let Some(dt) = movement_suffix::<T>(&dst.device) {
             let push = Pc::new().usize(left_size).usize(num_ids).usize(right_size).usize(src_dim_size);
             dst.device.dispatch(
                 &format!("index_select_{dt}"),
@@ -473,7 +515,7 @@ impl crate::Backend for Device {
                 div_ceil(total, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("index_select-host")?;
             let ids_h = ids.as_slice();
             let s = src.as_slice();
             let d = dst.as_mut_slice();
@@ -623,10 +665,10 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
+        if let Some(dt) = movement_suffix::<T>(&dst.device) {
             let info: Vec<u32> =
                 dims.iter().chain(src_strides.iter()).map(|&v| v as u32).collect();
-            let scratch = dst.device.scratch_u32(&info)?;
+            let scratch = dst.device.scratch_from_slice(&info)?;
             let push = Pc::new().usize(numel).usize(dims.len()).usize(src_offset);
             let res = dst.device.dispatch(
                 &format!("copy_strided_{dt}"),
@@ -638,7 +680,7 @@ impl crate::Backend for Device {
             dst.device.defer_free(scratch);
             res
         } else {
-            dst.device.flush()?;
+            dst.device.flush("copy_strided-host")?;
             let n = dims.len();
             let s = src.as_slice();
             let d = dst.as_mut_slice();
@@ -670,7 +712,7 @@ impl crate::Backend for Device {
         if numel == 0 {
             return Ok(());
         }
-        if let Some(dt) = float_suffix::<T>(&dst.device) {
+        if let Some(dt) = movement_suffix::<T>(&dst.device) {
             let push = Pc::new().usize(numel).usize(right_size).usize(src_dim_size).usize(dst_dim_size);
             dst.device.dispatch(
                 &format!("scatter_set_{dt}"),
@@ -679,7 +721,7 @@ impl crate::Backend for Device {
                 div_ceil(numel, WORKGROUP_SIZE),
             )
         } else {
-            dst.device.flush()?;
+            dst.device.flush("scatter_set-host")?;
             let ids_h = ids.as_slice();
             let s = src.as_slice();
             let d = dst.as_mut_slice();
@@ -714,7 +756,7 @@ impl crate::Backend for Device {
                 .chain(rhs_strides.iter())
                 .map(|&v| v as u32)
                 .collect();
-            let scratch = dst.device.scratch_u32(&info)?;
+            let scratch = dst.device.scratch_from_slice(&info)?;
             let push = Pc::new().usize(numel).usize(dst_shape.len()).u32(binary_op_code(op));
             let res = dst.device.dispatch(
                 &format!("broadcast_{dt}"),
@@ -726,7 +768,7 @@ impl crate::Backend for Device {
             dst.device.defer_free(scratch);
             res
         } else {
-            dst.device.flush()?;
+            dst.device.flush("broadcast-host")?;
             let n = dst_shape.len();
             let l = lhs.as_slice();
             let r = rhs.as_slice();

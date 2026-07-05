@@ -1,0 +1,70 @@
+#version 450
+// Dtype conversion: dst[i] = convert(src[i]), all arithmetic through f32.
+// Compiled once per (SRC_*, DST_*) define pair — see build.rs. Keeping casts on
+// the GPU lets them stay inside the recorded batch instead of forcing a host
+// round trip (models cast around rope / sampling every step).
+#if defined(SRC_F16) || defined(DST_F16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+#if defined(SRC_BF16) || defined(DST_BF16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+layout(local_size_x = 256) in;
+
+#if defined(SRC_F32)
+layout(std430, set = 0, binding = 0) buffer S { float src[]; };
+float load_src(uint i) { return src[i]; }
+#elif defined(SRC_F16)
+layout(std430, set = 0, binding = 0) buffer S { float16_t src[]; };
+float load_src(uint i) { return float(src[i]); }
+#elif defined(SRC_BF16)
+layout(std430, set = 0, binding = 0) buffer S { uint16_t src[]; };
+float load_src(uint i) { return uintBitsToFloat(uint(src[i]) << 16); }
+#elif defined(SRC_I64)
+// i64 viewed as little-endian u32 pairs; exact for |v| < 2^24 (e.g. positions).
+// The magnitude is computed in integer space first: converting the raw words
+// to float independently loses the low bits of negative values (e.g. -2 has
+// lo = 0xFFFFFFFE, which rounds to 2^32 in f32 and cancels the high word).
+layout(std430, set = 0, binding = 0) buffer S { uint src[]; };
+float load_src(uint i) {
+    uint lo = src[2u * i];
+    uint hi = src[2u * i + 1u];
+    bool neg = (int(hi) < 0);
+    if (neg) {
+        // Two's-complement negate the 64-bit value.
+        lo = ~lo + 1u;
+        hi = ~hi + (lo == 0u ? 1u : 0u);
+    }
+    float mag = float(hi) * 4294967296.0 + float(lo);
+    return neg ? -mag : mag;
+}
+#endif
+
+#if defined(DST_F32)
+layout(std430, set = 0, binding = 1) buffer D { float dst[]; };
+void store_dst(uint i, float v) { dst[i] = v; }
+#elif defined(DST_F16)
+layout(std430, set = 0, binding = 1) buffer D { float16_t dst[]; };
+void store_dst(uint i, float v) { dst[i] = float16_t(v); }
+#elif defined(DST_BF16)
+layout(std430, set = 0, binding = 1) buffer D { uint16_t dst[]; };
+void store_dst(uint i, float v) {
+    // Round to nearest even; quieten NaN (see dtype.glsl bf16_store).
+    uint b = floatBitsToUint(v);
+    dst[i] = isnan(v) ? uint16_t((b >> 16) | 0x40u)
+                      : uint16_t((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+}
+#endif
+
+layout(push_constant) uniform PC {
+    uint n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    store_dst(i, load_src(i));
+}

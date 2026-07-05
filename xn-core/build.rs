@@ -55,8 +55,22 @@ fn build_vulkan_shaders() {
     for path in &entries {
         println!("cargo:rerun-if-changed={}", path.display());
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
+        if stem == "cast" {
+            // cast.comp uses (SRC, DST) define pairs instead of dtype variants.
+            continue;
+        }
         let base = stem.to_uppercase().replace('-', "_");
-        for (suffix, target, define) in &variants {
+        // Pure data-movement kernels also get an i64 (uvec2) variant so that
+        // i64 tensors (kv-cache indices, token ids) stay on the GPU path.
+        let i64_variant: &[_] = if matches!(
+            stem,
+            "copy2d" | "copy_strided" | "transpose" | "index_select" | "scatter_set"
+        ) {
+            &[("I64", "vulkan1.0", Some("USE_I64"))]
+        } else {
+            &[]
+        };
+        for (suffix, target, define) in variants.iter().chain(i64_variant) {
             let spv_path = Path::new(&out_dir).join(format!("{stem}_{suffix}.spv"));
             let mut cmd = std::process::Command::new("glslc");
             cmd.arg(format!("--target-env={target}")).arg("-O");
@@ -77,6 +91,33 @@ fn build_vulkan_shaders() {
                 spv_path.display()
             ));
         }
+    }
+
+    // cast.comp: one compile per supported (src, dst) dtype pair.
+    let cast_pairs =
+        ["f32_f16", "f16_f32", "f32_bf16", "bf16_f32", "f16_bf16", "bf16_f16", "i64_f32"];
+    let cast_src = shader_dir.join("cast.comp");
+    for pair in cast_pairs {
+        let (src, dst) = pair.split_once('_').unwrap();
+        let spv_path = Path::new(&out_dir).join(format!("cast_{pair}.spv"));
+        let status = std::process::Command::new("glslc")
+            .arg("--target-env=vulkan1.1")
+            .arg("-O")
+            .arg(format!("-DSRC_{}", src.to_uppercase()))
+            .arg(format!("-DDST_{}", dst.to_uppercase()))
+            .arg("-o")
+            .arg(&spv_path)
+            .arg(&cast_src)
+            .status()
+            .expect("failed to spawn glslc - is the Vulkan SDK / shaderc installed?");
+        if !status.success() {
+            panic!("glslc failed to compile cast.comp ({pair})");
+        }
+        generated.push_str(&format!(
+            "pub static CAST_{}: &[u8] = include_bytes!(r\"{}\");\n",
+            pair.to_uppercase(),
+            spv_path.display()
+        ));
     }
 
     let dest = Path::new(&out_dir).join("vulkan_shaders.rs");

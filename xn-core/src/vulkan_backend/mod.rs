@@ -44,10 +44,34 @@ fn vkerr<E: std::fmt::Debug>(context: &str) -> impl Fn(E) -> crate::Error + '_ {
 /// dispatch fails loudly instead of silently running the wrong variant.
 fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
     use shaders::*;
+    // Cast kernels are named by (src, dst) dtype pair rather than one dtype.
+    if let Some(pair) = name.strip_prefix("cast_") {
+        let bytes: &'static [u8] = match pair {
+            "f32_f16" => CAST_F32_F16,
+            "f16_f32" => CAST_F16_F32,
+            "f32_bf16" => CAST_F32_BF16,
+            "bf16_f32" => CAST_BF16_F32,
+            "f16_bf16" => CAST_F16_BF16,
+            "bf16_f16" => CAST_BF16_F16,
+            "i64_f32" => CAST_I64_F32,
+            _ => return None,
+        };
+        return Some((bytes, 2));
+    }
     let (base, dt) = name.rsplit_once('_')?;
+    // Pure data-movement kernels also exist as an i64 (uvec2) variant.
+    let i64b: Option<&'static [u8]> = match base {
+        "copy2d" => Some(COPY2D_I64),
+        "copy_strided" => Some(COPY_STRIDED_I64),
+        "transpose" => Some(TRANSPOSE_I64),
+        "index_select" => Some(INDEX_SELECT_I64),
+        "scatter_set" => Some(SCATTER_SET_I64),
+        _ => None,
+    };
     type Def = (&'static [u8], Option<&'static [u8]>, Option<&'static [u8]>, u32);
     // (f32 spirv, f16 spirv, bf16 spirv, binding count)
     let (f32b, f16b, bf16b, bindings): Def = match base {
+        "fill" => (FILL_F32, Some(FILL_F16), Some(FILL_BF16), 1),
         "unary" => (UNARY_F32, Some(UNARY_F16), Some(UNARY_BF16), 2),
         "binary" => (BINARY_F32, Some(BINARY_F16), Some(BINARY_BF16), 3),
         "scale_add" => (SCALE_ADD_F32, Some(SCALE_ADD_F16), Some(SCALE_ADD_BF16), 2),
@@ -77,6 +101,7 @@ fn kernel_def(name: &str) -> Option<(&'static [u8], u32)> {
     let bytes = match dt {
         "f16" => f16b?,
         "bf16" => bf16b?,
+        "i64" => i64b?,
         _ => f32b,
     };
     Some((bytes, bindings))
@@ -186,6 +211,9 @@ struct ProfStats {
     gpu_ns: u128,
     dispatches: u64,
     flushes: u64,
+    /// What triggered each flush (profiling only) — readbacks vs host
+    /// fallbacks vs forced batch splits.
+    flush_reasons: HashMap<&'static str, u64>,
     /// CPU time spent in submit + fence wait.
     wait_ns: u128,
 }
@@ -594,6 +622,9 @@ impl Device {
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let mut ctx = self.ctx.lock().unwrap();
         if ctx.n_sets >= MAX_SETS_PER_BATCH || ctx.n_queries + 1 >= QUERY_CAP {
+            if self.profile_enabled {
+                *self.pstats.lock().unwrap().flush_reasons.entry("batch-full").or_insert(0) += 1;
+            }
             self.flush_locked(&mut ctx)?;
         }
         self.begin_if_needed(&mut ctx)?;
@@ -728,9 +759,13 @@ impl Device {
     }
 
     /// Submit any pending recorded commands and wait for completion. Safe to
-    /// call when nothing is pending.
-    fn flush(&self) -> Result<()> {
+    /// call when nothing is pending. `reason` attributes the flush in the
+    /// profiling report (only recorded when the flush actually submits work).
+    fn flush(&self, reason: &'static str) -> Result<()> {
         let mut ctx = self.ctx.lock().unwrap();
+        if self.profile_enabled && ctx.open {
+            *self.pstats.lock().unwrap().flush_reasons.entry(reason).or_insert(0) += 1;
+        }
         self.flush_locked(&mut ctx)
     }
 
@@ -826,6 +861,13 @@ impl DeviceInner {
             stats.flushes,
             stats.wait_ns as f64 / 1e6,
         );
+        if !stats.flush_reasons.is_empty() {
+            let mut reasons: Vec<_> = stats.flush_reasons.iter().collect();
+            reasons.sort_by_key(|r| std::cmp::Reverse(*r.1));
+            let s: Vec<String> =
+                reasons.iter().map(|(name, count)| format!("{name}: {count}")).collect();
+            eprintln!("flush reasons: {}", s.join(", "));
+        }
         let pool = self.pool.lock().unwrap();
         let total = pool.hits + pool.misses;
         if total > 0 {
@@ -930,14 +972,18 @@ impl<T: WithDType> Drop for Storage<T> {
 }
 
 impl Device {
-    /// Allocate a small host-visible buffer holding `data`, for passing `info`
-    /// arrays (dims/strides) to shaders. The caller must pass the returned
-    /// `PooledBuf` to [`Self::defer_free`] *after* recording the dispatch that
-    /// uses it (see the `defer_free` invariant).
-    fn scratch_u32(&self, data: &[u32]) -> Result<PooledBuf> {
-        let (buffer, memory, ptr, class) = self.alloc_buffer(data.len() * 4)?;
+    /// Allocate a host-visible buffer holding `data` (e.g. `info` dims/strides
+    /// arrays, or host-generated random values). Writing it host-side is safe
+    /// without a flush because a freshly allocated buffer is never referenced
+    /// by the pending batch (pool entries are only recycled after their batch
+    /// completes). The caller must pass the returned `PooledBuf` to
+    /// [`Self::defer_free`] *after* recording the command that uses it (see
+    /// the `defer_free` invariant).
+    fn scratch_from_slice<T: Copy>(&self, data: &[T]) -> Result<PooledBuf> {
+        let bytes = std::mem::size_of_val(data);
+        let (buffer, memory, ptr, class) = self.alloc_buffer(bytes)?;
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, ptr, data.len() * 4);
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, ptr, bytes);
         }
         Ok(PooledBuf { buffer, memory, ptr: ptr as usize, class })
     }
@@ -983,6 +1029,16 @@ fn float_suffix<T: WithDType>(dev: &Device) -> Option<&'static str> {
         DType::F16 if dev.supports_f16 => Some("f16"),
         DType::BF16 if dev.supports_bf16 => Some("bf16"),
         _ => None,
+    }
+}
+
+/// Suffix for pure data-movement ops (copy2d/copy_strided/transpose/
+/// index_select/scatter_set), which additionally have an i64 (uvec2) shader
+/// variant so kv-cache indices and token ids stay on the GPU path.
+fn movement_suffix<T: WithDType>(dev: &Device) -> Option<&'static str> {
+    match T::DTYPE {
+        DType::I64 => Some("i64"),
+        _ => float_suffix::<T>(dev),
     }
 }
 
