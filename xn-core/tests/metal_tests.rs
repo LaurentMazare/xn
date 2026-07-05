@@ -596,6 +596,21 @@ fn cmp_conv1d(
     padding: usize,
     groups: usize,
 ) -> Result<()> {
+    cmp_conv1d_dilated(batch, in_c, out_c, len, ks, stride, padding, 1, groups)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmp_conv1d_dilated(
+    batch: usize,
+    in_c: usize,
+    out_c: usize,
+    len: usize,
+    ks: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> Result<()> {
     let src = iota(batch * in_c * len);
     let kern = iota(out_c * (in_c / groups) * ks);
     let sv: Tensor<f32, Mt> = Tensor::from_vec(src.clone(), vec![batch, in_c, len], &dev())?;
@@ -603,8 +618,8 @@ fn cmp_conv1d(
         Tensor::from_vec(kern.clone(), vec![out_c, in_c / groups, ks], &dev())?;
     let sc: Tensor<f32, _> = Tensor::from_vec(src, vec![batch, in_c, len], &CPU)?;
     let kc: Tensor<f32, _> = Tensor::from_vec(kern, vec![out_c, in_c / groups, ks], &CPU)?;
-    let rc = sc.conv1d(&kc, None, stride, padding, 1, groups)?;
-    let rv = sv.conv1d(&kv, None, stride, padding, 1, groups)?;
+    let rc = sc.conv1d(&kc, None, stride, padding, dilation, groups)?;
+    let rv = sv.conv1d(&kv, None, stride, padding, dilation, groups)?;
     assert_close(&rc.to_vec()?, &rv.to_vec()?, 1e-4);
     Ok(())
 }
@@ -616,6 +631,10 @@ fn conv1d_cmp() -> Result<()> {
     cmp_conv1d(1, 1, 1, 6, 3, 2, 0, 1)?;
     cmp_conv1d(2, 3, 4, 7, 3, 1, 1, 1)?;
     cmp_conv1d(1, 4, 4, 7, 3, 1, 1, 2)?;
+    // Dilated, groups == 1 (the im2col fast path): matches Mimi's SEANet
+    // residual blocks, which use dilation > 1 with groups == 1.
+    cmp_conv1d_dilated(2, 3, 4, 20, 3, 1, 2, 3, 1)?;
+    cmp_conv1d_dilated(1, 2, 2, 25, 3, 1, 9, 9, 1)?;
     Ok(())
 }
 

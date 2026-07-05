@@ -727,6 +727,22 @@ impl crate::Backend for Device {
         groups: usize,
     ) -> Result<()> {
         check_f32::<T>("conv1d")?;
+        if groups == 1 {
+            return conv1d_im2col(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            );
+        }
         let total = batch * out_channels * out_length;
         let push = Pc::new()
             .usize(batch)
@@ -759,10 +775,26 @@ impl crate::Backend for Device {
         kernel_size: usize,
         stride: usize,
         padding: usize,
-        _output_padding: usize,
+        output_padding: usize,
         groups: usize,
     ) -> Result<()> {
         check_f32::<T>("conv_transpose1d")?;
+        // col2im assumes groups == 1, no padding/output_padding and (per the
+        // Backend trait, which has no dilation param here) dilation == 1.
+        if groups == 1 && padding == 0 && output_padding == 0 {
+            return conv_transpose1d_col2im(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+            );
+        }
         let total = batch * out_channels * out_length;
         let push = Pc::new()
             .usize(batch)
@@ -781,6 +813,127 @@ impl crate::Backend for Device {
             div_ceil(total, WORKGROUP_SIZE),
         )
     }
+}
+
+/// `groups == 1` conv1d via im2col + GEMM + transpose (mirrors the CUDA and
+/// Vulkan backends): unfold `src` into `col` [batch, out_length, in_channels*kernel_size],
+/// multiply by the [out_channels, in_channels*kernel_size] weight matrix
+/// (matmul_t), then transpose the [batch, out_length, out_channels] GEMM
+/// result into dst's [batch, out_channels, out_length] layout. This trades
+/// conv1d's naive per-output-element gather loop for the MLX GEMM/GEMV path
+/// used everywhere else, at the cost of the `col` scratch buffer.
+#[allow(clippy::too_many_arguments)]
+fn conv1d_im2col<T: WithDTypeF>(
+    dst: &mut Storage<T>,
+    src: &Storage<T>,
+    kernel: &Storage<T>,
+    batch: usize,
+    in_channels: usize,
+    out_channels: usize,
+    length: usize,
+    out_length: usize,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+) -> Result<()> {
+    let dev = dst.device.clone();
+    let k = in_channels * kernel_size;
+
+    let col =
+        unsafe { <Device as crate::Backend>::alloc_uninit::<T>(batch * out_length * k, &dev)? };
+    let push = Pc::new()
+        .usize(batch)
+        .usize(in_channels)
+        .usize(length)
+        .usize(out_length)
+        .usize(kernel_size)
+        .usize(stride)
+        .usize(padding)
+        .usize(dilation);
+    dev.dispatch(
+        "im2col1d_f32",
+        &[col.buf(), src.buf()],
+        &push,
+        div_ceil(batch * out_length * k, WORKGROUP_SIZE),
+    )?;
+
+    // result[b, l, oc] = sum_k col[b, l, k] * kernel[oc, k]
+    let mut result = unsafe {
+        <Device as crate::Backend>::alloc_uninit::<T>(batch * out_length * out_channels, &dev)?
+    };
+    <Device as crate::Backend>::gemm(
+        &mut result,
+        (&col, 0),
+        (kernel, 0),
+        out_length,
+        out_channels,
+        k,
+        batch,
+        out_length * k,
+        0,
+        (1, out_channels),
+        (1, k),
+        (k, 1),
+    )?;
+
+    // [batch, out_length, out_channels] -> dst's [batch, out_channels, out_length].
+    <Device as crate::Backend>::transpose(dst, &result, 1, 2, &[batch, out_length, out_channels])
+}
+
+/// `groups == 1`, no padding/output_padding conv_transpose1d via transpose +
+/// GEMM + col2im (mirrors the CUDA and Vulkan backends): transpose `src` to
+/// [batch, length, in_channels], multiply by the [in_channels, out_channels*kernel_size]
+/// weight matrix to get `col` [batch, length, out_channels*kernel_size], then
+/// fold `col` into dst via col2im's gather (each output position sums the
+/// compatible (input position, kernel offset) pairs directly, no atomics).
+#[allow(clippy::too_many_arguments)]
+fn conv_transpose1d_col2im<T: WithDTypeF>(
+    dst: &mut Storage<T>,
+    src: &Storage<T>,
+    kernel: &Storage<T>,
+    batch: usize,
+    in_channels: usize,
+    out_channels: usize,
+    length: usize,
+    out_length: usize,
+    kernel_size: usize,
+    stride: usize,
+) -> Result<()> {
+    let dev = dst.device.clone();
+    let n = out_channels * kernel_size;
+
+    let mut src_t =
+        unsafe { <Device as crate::Backend>::alloc_uninit::<T>(batch * length * in_channels, &dev)? };
+    <Device as crate::Backend>::transpose(&mut src_t, src, 1, 2, &[batch, in_channels, length])?;
+
+    // col[b, l, j] = sum_c src_t[b, l, c] * kernel[c, j]
+    let mut col =
+        unsafe { <Device as crate::Backend>::alloc_uninit::<T>(batch * length * n, &dev)? };
+    <Device as crate::Backend>::gemm(
+        &mut col,
+        (&src_t, 0),
+        (kernel, 0),
+        length,
+        n,
+        in_channels,
+        batch,
+        length * in_channels,
+        0,
+        (1, n),
+        (1, in_channels),
+        (1, n),
+    )?;
+
+    let push = Pc::new()
+        .usize(batch)
+        .usize(length)
+        .usize(out_channels)
+        .usize(out_length)
+        .usize(kernel_size)
+        .usize(stride);
+    let total = batch * out_channels * out_length;
+    dev.dispatch("col2im1d_f32", &[dst.buf(), col.buf()], &push, div_ceil(total, WORKGROUP_SIZE))
 }
 
 impl Device {
