@@ -359,7 +359,7 @@ impl<Q: BackendQ> State<Q> {
         use xn::ModuleT;
         // Project the (constant) cross-attention source once, then reuse.
         if self.cross_kv.is_none() {
-            self.cross_kv = Some(self.model.transformer.compute_cross_kv(ca_src)?);
+            self.cross_kv = Some(self.model.transformer.compute_cross_kv_ca_src(ca_src)?);
         }
         let model = &self.model;
         let device = model.device();

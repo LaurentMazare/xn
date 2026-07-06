@@ -95,27 +95,36 @@ impl<Q: BackendQ> BatchedMultiheadCrossAttention<Q> {
     /// Project the cross-attention source into (K, V). When the source is
     /// already pre-projected, this is a no-op.
     #[allow(clippy::type_complexity)]
-    fn compute_kv(&self, ca_src: &CaSrc<Q>) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
-        use xn::ModuleT;
+    fn compute_kv_ca_src(
+        &self,
+        ca_src: &CaSrc<Q>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
         match ca_src {
             CaSrc::KeysValues(k, v) => Ok((k.clone(), v.clone())),
-            CaSrc::Tokens(xs) => {
-                let kv = self.in_proj_kv.forward(xs)?;
-                let (cab, cat, _) = kv.dims3()?;
-                let kv_dim = self.num_heads * self.head_dim;
-                let k = kv
-                    .narrow(2, ..kv_dim)?
-                    .reshape((cab, cat, self.num_heads, self.head_dim))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
-                let v = kv
-                    .narrow(2, kv_dim..2 * kv_dim)?
-                    .reshape((cab, cat, self.num_heads, self.head_dim))?
-                    .transpose(1, 2)?
-                    .contiguous()?;
-                Ok((k, v))
-            }
+            CaSrc::Tokens(xs) => self.compute_kv(xs),
         }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn compute_kv(
+        &self,
+        xs: &Tensor<Q::T, Q::B>,
+    ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
+        use xn::ModuleT;
+        let kv = self.in_proj_kv.forward(xs)?;
+        let (cab, cat, _) = kv.dims3()?;
+        let kv_dim = self.num_heads * self.head_dim;
+        let k = kv
+            .narrow(2, ..kv_dim)?
+            .reshape((cab, cat, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = kv
+            .narrow(2, kv_dim..2 * kv_dim)?
+            .reshape((cab, cat, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        Ok((k, v))
     }
 
     #[tracing::instrument(name = "batched-mhca", skip_all)]
@@ -136,7 +145,7 @@ impl<Q: BackendQ> BatchedMultiheadCrossAttention<Q> {
         // done once via `Transformer::compute_cross_kv` because the source is
         // constant across timesteps (otherwise it would redo the same large GEMM
         // on every layer at every step).
-        let (k, v) = self.compute_kv(ca_src)?; // (b, h, k, d)
+        let (k, v) = self.compute_kv_ca_src(ca_src)?; // (b, h, k, d)
 
         let scale = Q::T::from_f32(1.0 / (self.head_dim as f32).sqrt());
         let attn_weights = q.matmul_t(&k)?.scale(scale)?; // (b, h, t, k)
@@ -296,17 +305,23 @@ impl<Q: BackendQ> Transformer<Q> {
         Ok(BatchedTransformerState { builder, kv_caches })
     }
 
-    /// Project the cross-attention source into one pre-computed
-    /// [`CaSrc::KeysValues`] per layer. The source (the speaker embeddings) is
-    /// constant across the whole generation, so its KV projection only needs to
-    /// run once; recomputing it inside every layer on every timestep was
-    /// previously the dominant cost of the main transformer (one large GEMM per
-    /// layer per step). Call once per generation and pass the result to
-    /// [`Self::forward`].
-    pub fn compute_cross_kv(&self, ca_src: &CaSrc<Q>) -> Result<Vec<CaSrc<Q>>> {
+    #[allow(clippy::type_complexity)]
+    pub fn compute_cross_kv(
+        &self,
+        xs: &Tensor<Q::T, Q::B>,
+    ) -> Result<Vec<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)>> {
         let mut per_layer = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let (k, v) = layer.cross_attn.compute_kv(ca_src)?;
+            let (k, v) = layer.cross_attn.compute_kv(xs)?;
+            per_layer.push((k, v));
+        }
+        Ok(per_layer)
+    }
+
+    pub fn compute_cross_kv_ca_src(&self, ca_src: &CaSrc<Q>) -> Result<Vec<CaSrc<Q>>> {
+        let mut per_layer = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (k, v) = layer.cross_attn.compute_kv_ca_src(ca_src)?;
             per_layer.push(CaSrc::KeysValues(k, v));
         }
         Ok(per_layer)
