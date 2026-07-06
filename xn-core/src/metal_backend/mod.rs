@@ -64,6 +64,8 @@ const KERNEL_SRCS: &[&str] = &[
     include_str!("../../metal-kernels/gemv.metal"),
     include_str!("../../metal-kernels/conv1d.metal"),
     include_str!("../../metal-kernels/conv_transpose1d.metal"),
+    include_str!("../../metal-kernels/im2col1d.metal"),
+    include_str!("../../metal-kernels/col2im1d.metal"),
     include_str!("../../metal-kernels/cast.metal"),
 ];
 
@@ -127,6 +129,8 @@ fn kernel_def(name: &str) -> Option<KernelDef<'_>> {
         // conv kernels are f32-only; other dtypes must fail pipeline lookup.
         "conv1d" => (3, wg1d, Dt::F32Only),
         "conv_transpose1d" => (3, wg1d, Dt::F32Only),
+        "im2col1d" => (2, wg1d, Dt::F32Only),
+        "col2im1d" => (2, wg1d, Dt::F32Only),
         _ => return None,
     };
     let lib_idx = match dt {

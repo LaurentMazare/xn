@@ -1,0 +1,50 @@
+// Col2Im for 1D transposed convolution (f32), gather form. Only used for the
+// groups == 1, padding == 0, output_padding == 0, dilation == 1 case (see
+// `can_use_col2im` on the Rust side); the general case still uses the direct
+// conv_transpose1d kernel.
+//   src (col): [batch, l_in, out_channels, kernel_size]
+//   dst: [batch, out_channels, out_length]
+// One thread per output element; dst is written in its natural flat order so
+// gid doubles as the destination index directly.
+
+struct Col2Im1dPc {
+    uint batch;
+    uint l_in;
+    uint out_channels;
+    uint out_length;
+    uint kernel_size;
+    uint stride;
+};
+
+kernel void col2im1d(
+    device float *dst [[buffer(0)]],
+    device const float *src [[buffer(1)]],
+    constant Col2Im1dPc &pc [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint total = pc.batch * pc.out_channels * pc.out_length;
+    if (gid >= total) return;
+
+    uint l_out_idx = gid % pc.out_length;
+    uint tmp = gid / pc.out_length;
+    uint c_idx = tmp % pc.out_channels;
+    uint b = tmp / pc.out_channels;
+
+    uint src_s1 = pc.out_channels * pc.kernel_size;
+    uint src_batch_base = b * pc.l_in * src_s1;
+
+    // out_l = in_l * stride + k  =>  in_l = (out_l - k) / stride for k in
+    // [0, stride) so that the numerator is non-negative and divisible.
+    int l_in_idx = int(l_out_idx / pc.stride);
+    int k = int(l_out_idx) - l_in_idx * int(pc.stride);
+
+    float sum = 0.0;
+    for (; k < int(pc.kernel_size) && l_in_idx >= 0; k += int(pc.stride), l_in_idx -= 1) {
+        if (l_in_idx < int(pc.l_in)) {
+            uint src_idx =
+                src_batch_base + uint(l_in_idx) * src_s1 + c_idx * pc.kernel_size + uint(k);
+            sum += src[src_idx];
+        }
+    }
+    dst[gid] = sum;
+}

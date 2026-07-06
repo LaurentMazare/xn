@@ -1,0 +1,44 @@
+#version 450
+// Im2Col for 1D convolution (f32), groups == 1 only.
+//   src: [batch, in_channels, in_len]
+//   dst (col): [batch, out_length, in_channels * kernel_size]
+// One thread per output element; dst is written in its natural flat order so
+// gid doubles as the destination index directly.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer D { float dst[]; };
+layout(std430, set = 0, binding = 1) buffer S { float src[]; };
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint in_channels;
+    uint in_len;
+    uint out_length;
+    uint kernel_size;
+    uint stride;
+    uint padding;
+    uint dilation;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint ck = pc.in_channels * pc.kernel_size;
+    uint total = pc.batch * pc.out_length * ck;
+    if (gid >= total) return;
+
+    uint ck_idx = gid % ck;
+    uint tmp = gid / ck;
+    uint l = tmp % pc.out_length;
+    uint b = tmp / pc.out_length;
+
+    uint k_idx = ck_idx % pc.kernel_size;
+    uint c_idx = ck_idx / pc.kernel_size;
+
+    uint src_l_raw = l * pc.stride + k_idx * pc.dilation;
+    float v = 0.0;
+    if (src_l_raw >= pc.padding && src_l_raw < pc.padding + pc.in_len) {
+        uint src_l = src_l_raw - pc.padding;
+        v = src[(b * pc.in_channels + c_idx) * pc.in_len + src_l];
+    }
+    dst[gid] = v;
+}

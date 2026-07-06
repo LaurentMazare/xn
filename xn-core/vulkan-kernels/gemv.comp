@@ -12,12 +12,43 @@
 // bandwidth-bound GEMV needs on this APU. Alternatives that compute several
 // columns per workgroup (llama.cpp's mul_mat_vec style) reduce the workgroup
 // count and measured slower here.
+//
+// `rhs` (the dominant, bandwidth-bound stream) is bound a second time as a
+// 4-wide vector view (`rhs4`, binding 3, same underlying buffer) so that when
+// the row is 4-element-aligned we can issue one 64/128-bit load per thread
+// instead of four scalar loads, quartering instruction count without
+// touching the coalescing pattern above. `lhs` stays scalar: it is a single
+// tiny row re-read by every workgroup, so it lives in cache and isn't worth
+// vectorizing. Any k % 4 remainder falls back to the scalar `rhs` binding, and
+// the whole fast path is skipped (falls back to the original scalar loop)
+// whenever the row start isn't 4-aligned (e.g. sliced/viewed tensors).
 // Grid: (n, batch, 1). Push constants match the GEMM kernels.
 layout(local_size_x = 256) in;
+
+#ifdef USE_F16
+#define SCALAR4 f16vec4
+#define LOAD4_0(v) float((v).x)
+#define LOAD4_1(v) float((v).y)
+#define LOAD4_2(v) float((v).z)
+#define LOAD4_3(v) float((v).w)
+#elif defined(USE_BF16)
+#define SCALAR4 u16vec4
+#define LOAD4_0(v) bf16_load((v).x)
+#define LOAD4_1(v) bf16_load((v).y)
+#define LOAD4_2(v) bf16_load((v).z)
+#define LOAD4_3(v) bf16_load((v).w)
+#else
+#define SCALAR4 vec4
+#define LOAD4_0(v) ((v).x)
+#define LOAD4_1(v) ((v).y)
+#define LOAD4_2(v) ((v).z)
+#define LOAD4_3(v) ((v).w)
+#endif
 
 layout(std430, set = 0, binding = 0) buffer D { SCALAR dst[]; };
 layout(std430, set = 0, binding = 1) buffer L { SCALAR lhs[]; };
 layout(std430, set = 0, binding = 2) buffer R { SCALAR rhs[]; };
+layout(std430, set = 0, binding = 3) buffer R4 { SCALAR4 rhs4[]; };
 
 layout(push_constant) uniform PC {
     uint m;
@@ -47,8 +78,25 @@ void main() {
     uint rbase = pc.rhs_o + b * pc.rhs_b_stride + j * pc.rhs_cs;
 
     float acc = 0.0;
-    for (uint l = tid; l < pc.k; l += 256u) {
-        acc += LOAD(lhs[lbase + l * pc.lhs_cs]) * LOAD(rhs[rbase + l * pc.rhs_rs]);
+    if (pc.rhs_rs == 1u && pc.k >= 4u && (rbase & 3u) == 0u) {
+        uint k4 = pc.k >> 2u;
+        uint kbulk = k4 << 2u;
+        uint base4 = rbase >> 2u;
+        for (uint g = tid; g < k4; g += 256u) {
+            SCALAR4 rv = rhs4[base4 + g];
+            uint l = g * 4u;
+            acc += LOAD4_0(rv) * LOAD(lhs[lbase + (l + 0u) * pc.lhs_cs]);
+            acc += LOAD4_1(rv) * LOAD(lhs[lbase + (l + 1u) * pc.lhs_cs]);
+            acc += LOAD4_2(rv) * LOAD(lhs[lbase + (l + 2u) * pc.lhs_cs]);
+            acc += LOAD4_3(rv) * LOAD(lhs[lbase + (l + 3u) * pc.lhs_cs]);
+        }
+        for (uint l = kbulk + tid; l < pc.k; l += 256u) {
+            acc += LOAD(lhs[lbase + l * pc.lhs_cs]) * LOAD(rhs[rbase + l]);
+        }
+    } else {
+        for (uint l = tid; l < pc.k; l += 256u) {
+            acc += LOAD(lhs[lbase + l * pc.lhs_cs]) * LOAD(rhs[rbase + l * pc.rhs_rs]);
+        }
     }
     sh[tid] = acc;
     barrier();
