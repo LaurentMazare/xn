@@ -21,6 +21,7 @@ memmap2 = { workspace = true }
 metal = { workspace = true, optional = true }
 num-traits = { workspace = true }
 num_cpus = { workspace = true }
+pollster = { workspace = true, optional = true }
 rand = { workspace = true, features = ["thread_rng"] }
 rand_distr = { workspace = true }
 rayon = { workspace = true }
@@ -28,6 +29,7 @@ safetensors = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+wgpu = { workspace = true, optional = true }
 yoke = { workspace = true }
 
 [dev-dependencies]
@@ -54,6 +56,7 @@ audio = ["dep:kaudio"]
 cuda = ["dep:cudarc", "dep:bindgen_cuda"]
 metal = ["dep:metal"]
 vulkan = ["dep:ash"]
+webgpu = ["dep:wgpu", "dep:pollster"]
 
 [[example]]
 name = "mimi"
@@ -74,6 +77,10 @@ required-features = ["vulkan"]
 [[example]]
 name = "basic_metal"
 required-features = ["metal"]
+
+[[example]]
+name = "basic_webgpu"
+required-features = ["webgpu"]
 
 [[example]]
 name = "cuda_benchmarks"

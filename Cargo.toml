@@ -33,6 +33,7 @@ metal = "0.33"
 num-traits = "0.2.19"
 num_cpus = "1.17.0"
 paste = "1"
+pollster = "0.4"
 rand = { version = "0.9.0", default-features = false }
 rand_distr = "0.5.0"
 rayon = "1.11.0"
@@ -45,6 +46,7 @@ tokenizers = "0.21"
 tracing = "0.1.44"
 tracing-chrome = "0.7.2"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+wgpu = "26"
 yoke = { version = "0.8.1", features = ["derive"] }
 
 [profile.release]
