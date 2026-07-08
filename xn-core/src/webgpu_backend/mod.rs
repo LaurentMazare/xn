@@ -63,7 +63,8 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "causality_mask" => (include_str!("../../webgpu-kernels/causality_mask.wgsl"), 1),
         "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3),
         "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3),
-        "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 3),
+        // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
+        "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
         "conv_transpose1d" => (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3),
         "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2),
