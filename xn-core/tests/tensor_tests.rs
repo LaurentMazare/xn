@@ -30,8 +30,26 @@ macro_rules! test_all_backends {
                 let device = xn::vulkan_backend::Device::new(0)?;
                 $test_fn(&device)
             }
+
+            #[cfg(feature = "webgpu")]
+            #[test]
+            fn [<$test_name _webgpu>]() -> Result<()> {
+                $test_fn(&webgpu_device())
+            }
         }
     };
+}
+
+/// A single WebGPU device shared across the whole test binary. Unlike the
+/// native backends, opening many independent `wgpu` devices (one per test
+/// thread) and driving them concurrently is unreliable, so all tests share one
+/// device. The backend serializes GPU submission internally and each tensor
+/// owns a distinct buffer, so parallel tests interleave batches safely.
+#[cfg(feature = "webgpu")]
+fn webgpu_device() -> xn::webgpu_backend::Device {
+    use std::sync::OnceLock;
+    static DEVICE: OnceLock<xn::webgpu_backend::Device> = OnceLock::new();
+    DEVICE.get_or_init(|| xn::webgpu_backend::Device::new(0).expect("init webgpu device")).clone()
 }
 
 // =============================================================================

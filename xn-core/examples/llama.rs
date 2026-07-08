@@ -251,7 +251,22 @@ fn main() -> Result<()> {
             }
         }
     }
-    #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "metal")))]
+    #[cfg(all(
+        feature = "webgpu",
+        not(any(feature = "cuda", feature = "vulkan", feature = "metal"))
+    ))]
+    {
+        if args.cpu {
+            println!("Using CPU backend (f32)");
+            run_for_device::<f32, _>(args, xn::CPU)?;
+        } else {
+            // The WebGPU backend computes in f32.
+            let dev = xn::webgpu_backend::Device::new(0)?;
+            println!("Using WebGPU backend (f32): {}", dev.name());
+            run_for_device::<f32, _>(args, dev)?;
+        }
+    }
+    #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "metal", feature = "webgpu")))]
     {
         println!("Using CPU backend");
         run_for_device::<f32, _>(args, xn::CPU)?;
