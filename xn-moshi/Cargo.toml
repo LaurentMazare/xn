@@ -32,6 +32,7 @@ accelerate = ["xn/accelerate"]
 audio = ["dep:kaudio"]
 metal = ["xn/metal"]
 vulkan = ["xn/vulkan"]
+webgpu = ["xn/webgpu"]
 
 [[example]]
 name = "moshi"
