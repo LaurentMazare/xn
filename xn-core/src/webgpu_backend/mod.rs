@@ -137,6 +137,28 @@ fn size_class(bytes: usize) -> u64 {
     if np2 <= (1 << 20) { np2.max(256) } else { bytes.div_ceil(np2 / 16) * (np2 / 16) }
 }
 
+/// Profiling counters (enabled via `XN_WEBGPU_PROFILE=1`). Because a whole
+/// forward pass records into one encoder and flushes exactly once (at the
+/// logits readback), the per-op timeline is: record ops (GPU idle) -> submit +
+/// poll-wait (GPU busy) -> readback. Timing those phases separately shows
+/// whether wall-clock is spent building commands on the CPU (`record_ns`),
+/// blocked waiting on the GPU (`submit_wait_ns`), or in host readback.
+#[derive(Default)]
+struct ProfStats {
+    dispatches: u64,
+    copies: u64,
+    submits: u64,
+    readbacks: u64,
+    /// CPU time building dispatches/copies into the encoder (GPU idle).
+    record_ns: u128,
+    /// CPU time in submit + `poll(Wait)` (blocked on GPU execution).
+    submit_wait_ns: u128,
+    /// CPU time in the readback staging copy + map (excludes the inner flush).
+    readback_ns: u128,
+    /// Per-kernel dispatch counts.
+    per_kernel: HashMap<String, u64>,
+}
+
 /// Command-recording state, guarded by a mutex. Dispatches/copies are recorded
 /// into `encoder` and only submitted on flush.
 struct OpCtx {
@@ -159,6 +181,7 @@ pub struct DeviceInner {
     ctx: Mutex<OpCtx>,
     device_name: String,
     profile: bool,
+    pstats: Mutex<ProfStats>,
 }
 
 #[derive(Clone)]
@@ -280,6 +303,7 @@ impl Device {
             ctx: Mutex::new(OpCtx { encoder: None, open: false, free_bufs: Vec::new() }),
             device_name,
             profile,
+            pstats: Mutex::new(ProfStats::default()),
         };
         Ok(Self(Arc::new(inner)))
     }
@@ -367,6 +391,7 @@ impl Device {
         if gx == 0 || gy == 0 || gz == 0 {
             return Ok(());
         }
+        let t0 = self.profile.then(std::time::Instant::now);
         let (pipeline, bindings) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
         let entries: Vec<wgpu::BindGroupEntry> = buffers
@@ -395,6 +420,13 @@ impl Device {
             cpass.set_push_constants(0, &push.bytes);
             cpass.dispatch_workgroups(gx, gy, gz);
         }
+        drop(ctx);
+        if let Some(t0) = t0 {
+            let mut p = self.pstats.lock().unwrap();
+            p.dispatches += 1;
+            p.record_ns += t0.elapsed().as_nanos();
+            *p.per_kernel.entry(kernel.to_string()).or_insert(0) += 1;
+        }
         Ok(())
     }
 
@@ -403,12 +435,19 @@ impl Device {
         if bytes == 0 {
             return;
         }
+        let t0 = self.profile.then(std::time::Instant::now);
         // Copies are size-aligned to 4 bytes; buffers are class-sized (>= 256,
         // multiple of 256) so rounding up never overruns the allocation.
         let bytes = round4(bytes) as u64;
         let mut ctx = self.ctx.lock().unwrap();
         self.begin_if_needed(&mut ctx);
         ctx.encoder.as_mut().unwrap().copy_buffer_to_buffer(src, 0, dst, 0, bytes);
+        drop(ctx);
+        if let Some(t0) = t0 {
+            let mut p = self.pstats.lock().unwrap();
+            p.copies += 1;
+            p.record_ns += t0.elapsed().as_nanos();
+        }
     }
 
     fn begin_if_needed(&self, ctx: &mut OpCtx) {
@@ -429,6 +468,8 @@ impl Device {
     }
 
     fn flush_locked(&self, ctx: &mut OpCtx) -> Result<()> {
+        let had_work = ctx.open;
+        let t0 = (self.profile && had_work).then(std::time::Instant::now);
         if ctx.open {
             let enc = ctx.encoder.take().unwrap();
             self.queue.submit(Some(enc.finish()));
@@ -437,6 +478,11 @@ impl Device {
         // Drive the queue to completion so host reads and buffer recycling are
         // safe. `poll(Wait)` blocks until all submitted work has finished.
         self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll"))?;
+        if let Some(t0) = t0 {
+            let mut p = self.pstats.lock().unwrap();
+            p.submits += 1;
+            p.submit_wait_ns += t0.elapsed().as_nanos();
+        }
         if !ctx.free_bufs.is_empty() {
             let mut pool = self.pool.lock().unwrap();
             for b in ctx.free_bufs.drain(..) {
@@ -460,6 +506,7 @@ impl Device {
             return Ok(Vec::new());
         }
         self.flush()?;
+        let t0 = self.profile.then(std::time::Instant::now);
         let bytes = len * T::BYTE_SIZE;
         let padded = round4(bytes) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -488,6 +535,11 @@ impl Device {
         }
         drop(mapped);
         staging.unmap();
+        if let Some(t0) = t0 {
+            let mut p = self.pstats.lock().unwrap();
+            p.readbacks += 1;
+            p.readback_ns += t0.elapsed().as_nanos();
+        }
         Ok(out)
     }
 
@@ -520,18 +572,60 @@ impl Device {
 
 impl Drop for DeviceInner {
     fn drop(&mut self) {
-        if self.profile {
-            let pool = self.pool.lock().unwrap();
-            let total = pool.hits + pool.misses;
-            if total > 0 {
-                eprintln!(
-                    "\n=== xn webgpu: {} ===\nbuffer pool: {} hits / {} allocs ({:.1}% reuse)",
-                    self.device_name,
-                    pool.hits,
-                    total,
-                    100.0 * pool.hits as f64 / total as f64,
-                );
-            }
+        if !self.profile {
+            return;
+        }
+        let p = self.pstats.lock().unwrap();
+        let ms = |ns: u128| ns as f64 / 1e6;
+        let record = ms(p.record_ns);
+        let wait = ms(p.submit_wait_ns);
+        let readback = ms(p.readback_ns);
+        let total = record + wait + readback;
+        eprintln!("\n=== xn webgpu profile: {} ===", self.device_name);
+        eprintln!(
+            "{:>10} dispatches, {:>6} copies, {:>5} submits, {:>5} readbacks",
+            p.dispatches, p.copies, p.submits, p.readbacks
+        );
+        if total > 0.0 {
+            eprintln!("CPU wall-clock split across the three phases (serial):");
+            eprintln!(
+                "  record   (build cmds, GPU idle) : {:>9.1} ms  ({:>4.1}%)",
+                record,
+                100.0 * record / total
+            );
+            eprintln!(
+                "  submit+wait (blocked on GPU)     : {:>9.1} ms  ({:>4.1}%)",
+                wait,
+                100.0 * wait / total
+            );
+            eprintln!(
+                "  readback (staging copy + map)    : {:>9.1} ms  ({:>4.1}%)",
+                readback,
+                100.0 * readback / total
+            );
+        }
+        if p.submits > 0 {
+            eprintln!(
+                "per submit: {:.1} dispatches, {:.3} ms wait",
+                p.dispatches as f64 / p.submits as f64,
+                wait / p.submits as f64
+            );
+        }
+        let mut rows: Vec<_> = p.per_kernel.iter().collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(*r.1));
+        let kernels: Vec<String> = rows.iter().take(8).map(|(k, c)| format!("{k}:{c}")).collect();
+        if !kernels.is_empty() {
+            eprintln!("top kernels (count): {}", kernels.join(", "));
+        }
+        let pool = self.pool.lock().unwrap();
+        let allocs = pool.hits + pool.misses;
+        if allocs > 0 {
+            eprintln!(
+                "buffer pool: {} hits / {} allocs ({:.1}% reuse)",
+                pool.hits,
+                allocs,
+                100.0 * pool.hits as f64 / allocs as f64,
+            );
         }
     }
 }
