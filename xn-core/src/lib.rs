@@ -63,6 +63,10 @@ pub fn with_neon() -> bool {
     cfg!(target_feature = "neon")
 }
 
+pub fn with_dotprod() -> bool {
+    cfg!(target_feature = "dotprod")
+}
+
 pub fn with_simd128() -> bool {
     cfg!(target_feature = "simd128")
 }
