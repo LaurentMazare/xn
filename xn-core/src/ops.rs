@@ -444,17 +444,18 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         dims.sort_by(|a, b| b.cmp(a));
         dims.dedup();
 
-        let mut result = self.copy()?;
+        let mut result: Option<Self> = None;
         for &dim in &dims {
-            if dim >= result.rank() {
+            let src = result.as_ref().unwrap_or(self);
+            if dim >= src.rank() {
                 crate::bail!(
                     "sum_keepdim: dimension {} out of range for tensor of rank {}",
                     dim,
-                    result.rank()
+                    src.rank()
                 );
             }
             // Reduce along dim, then reshape to keep the dimension with size 1
-            let current_dims = result.dims().to_vec();
+            let current_dims = src.dims().to_vec();
 
             // Output shape has dim reduced (removed)
             let mut reduced_dims: Vec<usize> = current_dims.clone();
@@ -463,16 +464,19 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
                 reduced_dims.push(1);
             }
 
-            let reduced = unsafe { Tensor::alloc_uninit(reduced_dims, result.device()) }?;
-            reduced.reduce_sum_(&result, dim)?;
+            let reduced = unsafe { Tensor::alloc_uninit(reduced_dims, src.device()) }?;
+            reduced.reduce_sum_(src, dim)?;
 
             // Reshape to keep the dimension with size 1
             let mut keepdim_shape: Vec<usize> = current_dims;
             keepdim_shape[dim] = 1;
-            result = reduced.reshape(keepdim_shape)?;
+            result = Some(reduced.reshape(keepdim_shape)?);
         }
 
-        Ok(result)
+        match result {
+            Some(result) => Ok(result),
+            None => self.copy(),
+        }
     }
 
     /// Maximum value along dimension.

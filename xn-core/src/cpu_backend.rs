@@ -19,13 +19,10 @@ fn copy_strided_2d<T: WithDType>(
     d1: usize,
     s0: usize,
 ) {
-    let mut src_idx = src_offset;
-    let mut dst_off = 0;
-    for _ in 0..d0 {
-        dst[dst_off..dst_off + d1].copy_from_slice(&src[src_idx..src_idx + d1]);
-        src_idx += s0;
-        dst_off += d1;
-    }
+    dst[..d0 * d1].par_chunks_mut(d1).with_min_len(4).enumerate().for_each(|(i0, dst)| {
+        let src_idx = src_offset + i0 * s0;
+        dst.copy_from_slice(&src[src_idx..src_idx + d1]);
+    });
 }
 
 fn copy_strided_3d<T: WithDType>(
@@ -37,15 +34,15 @@ fn copy_strided_3d<T: WithDType>(
 ) {
     let [d0, d1, d2] = dims;
     let [s0, s1] = strides;
-    let mut dst_off = 0;
-    for i0 in 0..d0 {
+    dst[..d0 * d1 * d2].par_chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| {
         let base = src_offset + i0 * s0;
+        let mut dst_off = 0;
         for i1 in 0..d1 {
             let src_idx = base + i1 * s1;
             dst[dst_off..dst_off + d2].copy_from_slice(&src[src_idx..src_idx + d2]);
             dst_off += d2;
         }
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -325,31 +322,46 @@ impl crate::Backend for crate::CpuDevice {
             dst.copy_from_slice(src);
         } else {
             let (dim1, dim2) = (usize::min(dim1, dim2), usize::max(dim1, dim2));
-            let d_i = dims[..dim1].iter().product::<usize>();
             let d_j = dims[dim1 + 1..dim2].iter().product::<usize>();
             let d_k = dims[(dim2 + 1)..].iter().product::<usize>();
             let d1 = dims[dim1];
             let d2 = dims[dim2];
-            // Inefficient, we should blit the data where possible.
-            // i: pre
-            for i in 0..d_i {
-                for a1 in 0..d1 {
-                    // j: mid
+            if d_k == 1 {
+                // The transposed dimension is the innermost one: use a tiled 2d transpose so
+                // that both reads and writes stay within cached lines for a whole tile.
+                const TILE: usize = 32;
+                dst.par_chunks_mut(d2 * d_j * d1).enumerate().for_each(|(i, dst)| {
+                    let src = &src[i * d1 * d_j * d2..(i + 1) * d1 * d_j * d2];
                     for j in 0..d_j {
-                        for a2 in 0..d2 {
-                            let src_idx = i * d1 * d_j * d2 * d_k
-                                + a1 * d_j * d2 * d_k
-                                + j * d2 * d_k
-                                + a2 * d_k;
-                            let dst_idx = i * d2 * d_j * d1 * d_k
-                                + a2 * d_j * d1 * d_k
-                                + j * d1 * d_k
-                                + a1 * d_k;
-                            dst[dst_idx..dst_idx + d_k]
-                                .copy_from_slice(&src[src_idx..src_idx + d_k]);
+                        for a1_t in (0..d1).step_by(TILE) {
+                            let a1_end = usize::min(a1_t + TILE, d1);
+                            for a2_t in (0..d2).step_by(TILE) {
+                                let a2_end = usize::min(a2_t + TILE, d2);
+                                for a1 in a1_t..a1_end {
+                                    let src_base = a1 * d_j * d2 + j * d2;
+                                    let dst_base = j * d1 + a1;
+                                    for a2 in a2_t..a2_end {
+                                        dst[a2 * d_j * d1 + dst_base] = src[src_base + a2];
+                                    }
+                                }
+                            }
                         }
                     }
-                }
+                });
+            } else {
+                dst.par_chunks_mut(d2 * d_j * d1 * d_k).enumerate().for_each(|(i, dst)| {
+                    let src = &src[i * d1 * d_j * d2 * d_k..];
+                    for a1 in 0..d1 {
+                        for j in 0..d_j {
+                            for a2 in 0..d2 {
+                                let src_idx = a1 * d_j * d2 * d_k + j * d2 * d_k + a2 * d_k;
+                                let dst_idx = a2 * d_j * d1 * d_k + j * d1 * d_k + a1 * d_k;
+                                dst[dst_idx..dst_idx + d_k]
+                                    .copy_from_slice(&src[src_idx..src_idx + d_k]);
+                            }
+                        }
+                    }
+                });
             }
         }
         Ok(())
@@ -690,19 +702,63 @@ impl crate::Backend for crate::CpuDevice {
             );
             return Ok(());
         }
-        let mut index = vec![0usize; rank];
-        for dst_elem in dst.iter_mut().take(total) {
-            let mut src_idx = src_offset;
-            for d in 0..rank {
-                src_idx += index[d] * src_strides[d];
+        if rank == 1 {
+            let s0 = src_strides[0];
+            for (i, dst_elem) in dst.iter_mut().enumerate().take(total) {
+                *dst_elem = src[src_offset + i * s0];
             }
-            *dst_elem = src[src_idx];
-            for d in (0..rank).rev() {
-                index[d] += 1;
-                if index[d] < dims[d] {
-                    break;
+            return Ok(());
+        }
+        // General fallback: the innermost stride is not 1 (e.g. a transposed view). Process
+        // the last two dims as a tiled 2d gather so reads and writes both get cache-line
+        // reuse within a tile, and parallelize over the outer dims.
+        let d_a = dims[rank - 2];
+        let d_b = dims[rank - 1];
+        let s_a = src_strides[rank - 2];
+        let s_b = src_strides[rank - 1];
+        let outer_dims = &dims[..rank - 2];
+        let outer_strides = &src_strides[..rank - 2];
+        const TILE: usize = 32;
+        let tiled_2d_gather = |dst: &mut [T], off: usize| {
+            // dst is a chunk of consecutive `a` rows starting at row `a_t`; `off` already
+            // includes the `a_t * s_a` component.
+            let a_cnt = dst.len() / d_b;
+            for b_t in (0..d_b).step_by(TILE) {
+                let b_end = usize::min(b_t + TILE, d_b);
+                for a in 0..a_cnt {
+                    let src_base = off + a * s_a;
+                    let dst_base = a * d_b;
+                    for b in b_t..b_end {
+                        dst[dst_base + b] = src[src_base + b * s_b];
+                    }
                 }
-                index[d] = 0;
+            }
+        };
+        let n_outer = total / (d_a * d_b);
+        if n_outer >= crate::get_num_threads() {
+            dst[..total].par_chunks_mut(d_a * d_b).enumerate().for_each(|(o, dst)| {
+                let mut rem = o;
+                let mut off = src_offset;
+                for d in (0..outer_dims.len()).rev() {
+                    off += (rem % outer_dims[d]) * outer_strides[d];
+                    rem /= outer_dims[d];
+                }
+                tiled_2d_gather(dst, off)
+            });
+        } else {
+            // Few outer blocks (e.g. a plain 2d transpose): parallelize over row tiles
+            // within each block instead.
+            for o in 0..n_outer {
+                let mut rem = o;
+                let mut off = src_offset;
+                for d in (0..outer_dims.len()).rev() {
+                    off += (rem % outer_dims[d]) * outer_strides[d];
+                    rem /= outer_dims[d];
+                }
+                dst[o * d_a * d_b..(o + 1) * d_a * d_b]
+                    .par_chunks_mut(TILE * d_b)
+                    .enumerate()
+                    .for_each(|(a_t, dst)| tiled_2d_gather(dst, off + a_t * TILE * s_a));
             }
         }
         Ok(())
@@ -874,17 +930,9 @@ impl crate::Backend for crate::CpuDevice {
         outer_size: usize,
         inner_size: usize,
     ) -> Result<()> {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut max_val = T::neg_infinity();
-                for d in 0..dim_size {
-                    let src_idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    max_val = T::max(max_val, src[src_idx]);
-                }
-                let dst_idx = outer * inner_size + inner;
-                dst[dst_idx] = max_val;
-            }
-        }
+        reduce_combine(dst, src, dim_size, outer_size, inner_size, T::neg_infinity(), |a, b| {
+            T::max(a, b)
+        });
         Ok(())
     }
 
@@ -895,17 +943,9 @@ impl crate::Backend for crate::CpuDevice {
         outer_size: usize,
         inner_size: usize,
     ) -> Result<()> {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut min_val = T::infinity();
-                for d in 0..dim_size {
-                    let src_idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    min_val = T::min(min_val, src[src_idx]);
-                }
-                let dst_idx = outer * inner_size + inner;
-                dst[dst_idx] = min_val;
-            }
-        }
+        reduce_combine(dst, src, dim_size, outer_size, inner_size, T::infinity(), |a, b| {
+            T::min(a, b)
+        });
         Ok(())
     }
 
@@ -916,21 +956,9 @@ impl crate::Backend for crate::CpuDevice {
         outer_size: usize,
         inner_size: usize,
     ) -> Result<()> {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut min_val = T::infinity();
-                let mut min_idx: usize = 0;
-                for d in 0..dim_size {
-                    let src_idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    if src[src_idx].to_f32() < min_val.to_f32() {
-                        min_val = src[src_idx];
-                        min_idx = d;
-                    }
-                }
-                let dst_idx = outer * inner_size + inner;
-                dst[dst_idx] = min_idx as i64;
-            }
-        }
+        reduce_arg(dst, src, dim_size, outer_size, inner_size, T::infinity(), |v, best| {
+            v.to_f32() < best.to_f32()
+        });
         Ok(())
     }
 
@@ -941,21 +969,9 @@ impl crate::Backend for crate::CpuDevice {
         outer_size: usize,
         inner_size: usize,
     ) -> Result<()> {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut max_val = T::neg_infinity();
-                let mut max_idx: usize = 0;
-                for d in 0..dim_size {
-                    let src_idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    if src[src_idx].to_f32() > max_val.to_f32() {
-                        max_val = src[src_idx];
-                        max_idx = d;
-                    }
-                }
-                let dst_idx = outer * inner_size + inner;
-                dst[dst_idx] = max_idx as i64;
-            }
-        }
+        reduce_arg(dst, src, dim_size, outer_size, inner_size, T::neg_infinity(), |v, best| {
+            v.to_f32() > best.to_f32()
+        });
         Ok(())
     }
 
@@ -966,17 +982,7 @@ impl crate::Backend for crate::CpuDevice {
         outer_size: usize,
         inner_size: usize,
     ) -> Result<()> {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum = T::zero();
-                for d in 0..dim_size {
-                    let src_idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    sum += src[src_idx];
-                }
-                let dst_idx = outer * inner_size + inner;
-                dst[dst_idx] = sum;
-            }
-        }
+        reduce_combine(dst, src, dim_size, outer_size, inner_size, T::zero(), |a, b| a + b);
         Ok(())
     }
 
@@ -1201,6 +1207,110 @@ impl crate::Backend for crate::CpuDevice {
                 groups,
             )
         }
+    }
+}
+
+/// Reduce along a dimension with a binary combine function.
+/// For the innermost dimension (`inner_size == 1`), each output is the reduction of a
+/// contiguous row: rows are processed in parallel and the reduction uses several independent
+/// accumulator lanes so it is not bound by the combine-op latency chain.
+/// For non-innermost dimensions, the reduced slices are combined with contiguous streaming
+/// passes rather than strided per-element loops.
+fn reduce_combine<T: WithDType + Copy>(
+    dst: &mut [T],
+    src: &[T],
+    dim_size: usize,
+    outer_size: usize,
+    inner_size: usize,
+    init: T,
+    combine: impl Fn(T, T) -> T + Sync,
+) {
+    if dim_size == 0 {
+        dst[..outer_size * inner_size].fill(init);
+        return;
+    }
+    if inner_size == 1 {
+        let dst = &mut dst[..outer_size];
+        dst.par_iter_mut().with_min_len(4).enumerate().for_each(|(outer, dst)| {
+            let row = &src[outer * dim_size..(outer + 1) * dim_size];
+            const LANES: usize = 16;
+            let mut acc = [init; LANES];
+            let chunks = row.chunks_exact(LANES);
+            let rem = chunks.remainder();
+            for chunk in chunks {
+                for (a, &v) in acc.iter_mut().zip(chunk) {
+                    *a = combine(*a, v);
+                }
+            }
+            let mut res = init;
+            for a in acc {
+                res = combine(res, a);
+            }
+            for &v in rem {
+                res = combine(res, v);
+            }
+            *dst = res;
+        });
+    } else {
+        let dst = &mut dst[..outer_size * inner_size];
+        dst.par_chunks_mut(inner_size).enumerate().for_each(|(outer, dst)| {
+            let base = outer * dim_size * inner_size;
+            dst.copy_from_slice(&src[base..base + inner_size]);
+            for d in 1..dim_size {
+                let s = &src[base + d * inner_size..base + (d + 1) * inner_size];
+                for (dv, &sv) in dst.iter_mut().zip(s) {
+                    *dv = combine(*dv, sv);
+                }
+            }
+        });
+    }
+}
+
+/// Arg-reduction (argmin/argmax) along a dimension. `better(v, best)` returns true when `v`
+/// should replace the current best value.
+fn reduce_arg<T: WithDType + Copy>(
+    dst: &mut [i64],
+    src: &[T],
+    dim_size: usize,
+    outer_size: usize,
+    inner_size: usize,
+    init: T,
+    better: impl Fn(T, T) -> bool + Sync,
+) {
+    if dim_size == 0 {
+        dst[..outer_size * inner_size].fill(0);
+        return;
+    }
+    if inner_size == 1 {
+        let dst = &mut dst[..outer_size];
+        dst.par_iter_mut().with_min_len(4).enumerate().for_each(|(outer, dst)| {
+            let row = &src[outer * dim_size..(outer + 1) * dim_size];
+            let mut best = init;
+            let mut best_idx = 0usize;
+            for (d, &v) in row.iter().enumerate() {
+                if better(v, best) {
+                    best = v;
+                    best_idx = d;
+                }
+            }
+            *dst = best_idx as i64;
+        });
+    } else {
+        let dst = &mut dst[..outer_size * inner_size];
+        dst.par_chunks_mut(inner_size).enumerate().for_each(|(outer, dst)| {
+            let base = outer * dim_size * inner_size;
+            let mut best = src[base..base + inner_size].to_vec();
+            dst.fill(0);
+            for d in 1..dim_size {
+                let s = &src[base + d * inner_size..base + (d + 1) * inner_size];
+                for ((dv, bv), &sv) in dst.iter_mut().zip(best.iter_mut()).zip(s) {
+                    if better(sv, *bv) {
+                        *bv = sv;
+                        *dv = d as i64;
+                    }
+                }
+            }
+        });
     }
 }
 
