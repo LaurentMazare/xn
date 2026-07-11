@@ -144,7 +144,10 @@ impl Shape {
         }
         let mut acc = 1;
         for (&stride, &dim) in stride.iter().zip(self.0.iter()).rev() {
-            if stride != acc {
+            // The stride of a size-1 dimension never affects addressing, so it does not
+            // matter for contiguity; this notably makes transposes that only move a size-1
+            // dimension (e.g. seq-len 1 in decode attention) zero-copy.
+            if dim != 1 && stride != acc {
                 return false;
             }
             acc *= dim;
