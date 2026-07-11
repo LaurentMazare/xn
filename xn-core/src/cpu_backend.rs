@@ -7,6 +7,14 @@ use std::any::Any;
 const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
 
+/// Whether to use a parallel implementation for this many elements of work. The work must be
+/// large enough to amortize the rayon fork/join overhead, and the global pool must actually
+/// have more than one thread: with a single-thread pool (e.g. RAYON_NUM_THREADS=1) every
+/// parallel call would still pay a cross-thread job handoff for no benefit.
+fn use_parallelism(work: usize) -> bool {
+    work >= ELEMWISE_PAR_THRESHOLD && rayon::current_num_threads() > 1
+}
+
 fn copy_strided_2d<T: WithDType>(
     dst: &mut [T],
     src: &[T],
@@ -15,10 +23,16 @@ fn copy_strided_2d<T: WithDType>(
     d1: usize,
     s0: usize,
 ) {
-    dst[..d0 * d1].par_chunks_mut(d1).with_min_len(4).enumerate().for_each(|(i0, dst)| {
+    let copy_row = |i0: usize, dst: &mut [T]| {
         let src_idx = src_offset + i0 * s0;
         dst.copy_from_slice(&src[src_idx..src_idx + d1]);
-    });
+    };
+    let dst = &mut dst[..d0 * d1];
+    if use_parallelism(d0 * d1) {
+        dst.par_chunks_mut(d1).with_min_len(4).enumerate().for_each(|(i0, dst)| copy_row(i0, dst));
+    } else {
+        dst.chunks_mut(d1).enumerate().for_each(|(i0, dst)| copy_row(i0, dst));
+    }
 }
 
 fn copy_strided_3d<T: WithDType>(
@@ -30,7 +44,7 @@ fn copy_strided_3d<T: WithDType>(
 ) {
     let [d0, d1, d2] = dims;
     let [s0, s1] = strides;
-    dst[..d0 * d1 * d2].par_chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| {
+    let copy_block = |i0: usize, dst: &mut [T]| {
         let base = src_offset + i0 * s0;
         let mut dst_off = 0;
         for i1 in 0..d1 {
@@ -38,7 +52,13 @@ fn copy_strided_3d<T: WithDType>(
             dst[dst_off..dst_off + d2].copy_from_slice(&src[src_idx..src_idx + d2]);
             dst_off += d2;
         }
-    });
+    };
+    let dst = &mut dst[..d0 * d1 * d2];
+    if use_parallelism(d0 * d1 * d2) {
+        dst.par_chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| copy_block(i0, dst));
+    } else {
+        dst.chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| copy_block(i0, dst));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -329,11 +349,12 @@ impl crate::Backend for crate::CpuDevice {
             let d_k = dims[(dim2 + 1)..].iter().product::<usize>();
             let d1 = dims[dim1];
             let d2 = dims[dim2];
+            let parallel = use_parallelism(dst.len());
             if d_k == 1 {
                 // The transposed dimension is the innermost one: use a tiled 2d transpose so
                 // that both reads and writes stay within cached lines for a whole tile.
                 const TILE: usize = 32;
-                dst.par_chunks_mut(d2 * d_j * d1).enumerate().for_each(|(i, dst)| {
+                let transpose_block = |i: usize, dst: &mut [T]| {
                     let src = &src[i * d1 * d_j * d2..(i + 1) * d1 * d_j * d2];
                     for j in 0..d_j {
                         for a1_t in (0..d1).step_by(TILE) {
@@ -350,9 +371,18 @@ impl crate::Backend for crate::CpuDevice {
                             }
                         }
                     }
-                });
+                };
+                if parallel {
+                    dst.par_chunks_mut(d2 * d_j * d1)
+                        .enumerate()
+                        .for_each(|(i, dst)| transpose_block(i, dst));
+                } else {
+                    dst.chunks_mut(d2 * d_j * d1)
+                        .enumerate()
+                        .for_each(|(i, dst)| transpose_block(i, dst));
+                }
             } else {
-                dst.par_chunks_mut(d2 * d_j * d1 * d_k).enumerate().for_each(|(i, dst)| {
+                let transpose_block = |i: usize, dst: &mut [T]| {
                     let src = &src[i * d1 * d_j * d2 * d_k..];
                     for a1 in 0..d1 {
                         for j in 0..d_j {
@@ -364,7 +394,16 @@ impl crate::Backend for crate::CpuDevice {
                             }
                         }
                     }
-                });
+                };
+                if parallel {
+                    dst.par_chunks_mut(d2 * d_j * d1 * d_k)
+                        .enumerate()
+                        .for_each(|(i, dst)| transpose_block(i, dst));
+                } else {
+                    dst.chunks_mut(d2 * d_j * d1 * d_k)
+                        .enumerate()
+                        .for_each(|(i, dst)| transpose_block(i, dst));
+                }
             }
         }
         Ok(())
@@ -375,7 +414,7 @@ impl crate::Backend for crate::CpuDevice {
         src: &Self::Storage<T>,
         l: usize,
     ) -> Result<()> {
-        if l < ELEMWISE_PAR_THRESHOLD {
+        if !use_parallelism(l) {
             dst[..l].copy_from_slice(&src[..l]);
         } else {
             dst[..l]
@@ -446,12 +485,17 @@ impl crate::Backend for crate::CpuDevice {
     fn rand_uniform(dst: &mut Self::Storage<f32>, len: usize, lo: f32, up: f32) -> Result<()> {
         use rand::Rng;
         let range = up - lo;
-        dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(|chunk| {
+        let fill = |chunk: &mut [f32]| {
             let mut rng = rand::rng();
             for v in chunk.iter_mut() {
                 *v = rng.random::<f32>() * range + lo;
             }
-        });
+        };
+        if use_parallelism(len) {
+            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+        } else {
+            fill(&mut dst[..len]);
+        }
         Ok(())
     }
 
@@ -462,17 +506,22 @@ impl crate::Backend for crate::CpuDevice {
             Ok(d) => d,
             Err(e) => crate::bail!("failed to create normal distribution for randn: {e}"),
         };
-        dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(|chunk| {
+        let fill = |chunk: &mut [f32]| {
             let mut rng = rand::rng();
             for v in chunk.iter_mut() {
                 *v = distr.sample(&mut rng);
             }
-        });
+        };
+        if use_parallelism(len) {
+            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+        } else {
+            fill(&mut dst[..len]);
+        }
         Ok(())
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, v: T, l: usize) -> Result<()> {
-        if l < ELEMWISE_PAR_THRESHOLD {
+        if !use_parallelism(l) {
             dst[..l].fill(v);
         } else {
             dst[..l].par_chunks_mut(ELEMWISE_CHUNK).for_each(|d| d.fill(v));
@@ -749,26 +798,39 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         let n_outer = total / (d_a * d_b);
-        if n_outer >= crate::get_num_threads() {
-            dst[..total].par_chunks_mut(d_a * d_b).enumerate().for_each(|(o, dst)| {
-                let mut rem = o;
-                let mut off = src_offset;
-                for d in (0..outer_dims.len()).rev() {
-                    off += (rem % outer_dims[d]) * outer_strides[d];
-                    rem /= outer_dims[d];
+        let outer_offset = |o: usize| {
+            let mut rem = o;
+            let mut off = src_offset;
+            for d in (0..outer_dims.len()).rev() {
+                off += (rem % outer_dims[d]) * outer_strides[d];
+                rem /= outer_dims[d];
+            }
+            off
+        };
+        if !use_parallelism(total) {
+            // Serially, a plain row-major gather beats the tiled one: the strided read lines
+            // for one output row generally stay in L2, and the tile bookkeeping costs more
+            // than it saves. Tiling pays off once several threads share the caches.
+            for o in 0..n_outer {
+                let off = outer_offset(o);
+                let dst = &mut dst[o * d_a * d_b..(o + 1) * d_a * d_b];
+                for a in 0..d_a {
+                    let src_base = off + a * s_a;
+                    for (b, d) in dst[a * d_b..(a + 1) * d_b].iter_mut().enumerate() {
+                        *d = src[src_base + b * s_b];
+                    }
                 }
-                tiled_2d_gather(dst, off)
-            });
+            }
+        } else if n_outer >= crate::get_num_threads() {
+            dst[..total]
+                .par_chunks_mut(d_a * d_b)
+                .enumerate()
+                .for_each(|(o, dst)| tiled_2d_gather(dst, outer_offset(o)));
         } else {
             // Few outer blocks (e.g. a plain 2d transpose): parallelize over row tiles
             // within each block instead.
             for o in 0..n_outer {
-                let mut rem = o;
-                let mut off = src_offset;
-                for d in (0..outer_dims.len()).rev() {
-                    off += (rem % outer_dims[d]) * outer_strides[d];
-                    rem /= outer_dims[d];
-                }
+                let off = outer_offset(o);
                 dst[o * d_a * d_b..(o + 1) * d_a * d_b]
                     .par_chunks_mut(TILE * d_b)
                     .enumerate()
@@ -1223,9 +1285,9 @@ fn reduce_combine<T: WithDType + Copy>(
         dst[..outer_size * inner_size].fill(init);
         return;
     }
+    let parallel = use_parallelism(outer_size * dim_size * inner_size);
     if inner_size == 1 {
-        let dst = &mut dst[..outer_size];
-        dst.par_iter_mut().with_min_len(4).enumerate().for_each(|(outer, dst)| {
+        let reduce_row = |outer: usize, dst: &mut T| {
             let row = &src[outer * dim_size..(outer + 1) * dim_size];
             const LANES: usize = 16;
             let mut acc = [init; LANES];
@@ -1244,10 +1306,18 @@ fn reduce_combine<T: WithDType + Copy>(
                 res = combine(res, v);
             }
             *dst = res;
-        });
+        };
+        let dst = &mut dst[..outer_size];
+        if parallel {
+            dst.par_iter_mut()
+                .with_min_len(4)
+                .enumerate()
+                .for_each(|(outer, dst)| reduce_row(outer, dst));
+        } else {
+            dst.iter_mut().enumerate().for_each(|(outer, dst)| reduce_row(outer, dst));
+        }
     } else {
-        let dst = &mut dst[..outer_size * inner_size];
-        dst.par_chunks_mut(inner_size).enumerate().for_each(|(outer, dst)| {
+        let reduce_block = |outer: usize, dst: &mut [T]| {
             let base = outer * dim_size * inner_size;
             dst.copy_from_slice(&src[base..base + inner_size]);
             for d in 1..dim_size {
@@ -1256,7 +1326,17 @@ fn reduce_combine<T: WithDType + Copy>(
                     *dv = combine(*dv, sv);
                 }
             }
-        });
+        };
+        let dst = &mut dst[..outer_size * inner_size];
+        if parallel {
+            dst.par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, dst)| reduce_block(outer, dst));
+        } else {
+            dst.chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, dst)| reduce_block(outer, dst));
+        }
     }
 }
 
@@ -1275,9 +1355,9 @@ fn reduce_arg<T: WithDType + Copy>(
         dst[..outer_size * inner_size].fill(0);
         return;
     }
+    let parallel = use_parallelism(outer_size * dim_size * inner_size);
     if inner_size == 1 {
-        let dst = &mut dst[..outer_size];
-        dst.par_iter_mut().with_min_len(4).enumerate().for_each(|(outer, dst)| {
+        let arg_row = |outer: usize, dst: &mut i64| {
             let row = &src[outer * dim_size..(outer + 1) * dim_size];
             let mut best = init;
             let mut best_idx = 0usize;
@@ -1288,10 +1368,18 @@ fn reduce_arg<T: WithDType + Copy>(
                 }
             }
             *dst = best_idx as i64;
-        });
+        };
+        let dst = &mut dst[..outer_size];
+        if parallel {
+            dst.par_iter_mut()
+                .with_min_len(4)
+                .enumerate()
+                .for_each(|(outer, dst)| arg_row(outer, dst));
+        } else {
+            dst.iter_mut().enumerate().for_each(|(outer, dst)| arg_row(outer, dst));
+        }
     } else {
-        let dst = &mut dst[..outer_size * inner_size];
-        dst.par_chunks_mut(inner_size).enumerate().for_each(|(outer, dst)| {
+        let arg_block = |outer: usize, dst: &mut [i64]| {
             let base = outer * dim_size * inner_size;
             let mut best = src[base..base + inner_size].to_vec();
             dst.fill(0);
@@ -1304,7 +1392,15 @@ fn reduce_arg<T: WithDType + Copy>(
                     }
                 }
             }
-        });
+        };
+        let dst = &mut dst[..outer_size * inner_size];
+        if parallel {
+            dst.par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, dst)| arg_block(outer, dst));
+        } else {
+            dst.chunks_mut(inner_size).enumerate().for_each(|(outer, dst)| arg_block(outer, dst));
+        }
     }
 }
 
@@ -1321,7 +1417,7 @@ fn apply_bin_assign<T: Copy + Send + Sync, F>(dst: &mut [T], src: &[T], f: F)
 where
     F: Fn(&mut T, T) + Sync,
 {
-    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+    if !use_parallelism(dst.len()) {
         for (d, s) in dst.iter_mut().zip(src) {
             f(d, *s);
         }
@@ -1342,7 +1438,7 @@ fn apply_inplace_unary<T: Copy + Send + Sync, F>(dst: &mut [T], f: F)
 where
     F: Fn(&mut T) + Sync,
 {
-    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+    if !use_parallelism(dst.len()) {
         for d in dst.iter_mut() {
             f(d);
         }
@@ -1361,7 +1457,7 @@ fn apply_unary<T: Copy + Send + Sync, F>(dst: &mut [T], src: &[T], f: F)
 where
     F: Fn(T) -> T + Sync,
 {
-    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+    if !use_parallelism(dst.len()) {
         for (d, s) in dst.iter_mut().zip(src) {
             *d = f(*s);
         }
@@ -1382,7 +1478,7 @@ fn apply_binary<T: Copy + Send + Sync, F>(dst: &mut [T], lhs: &[T], rhs: &[T], f
 where
     F: Fn(T, T) -> T + Sync,
 {
-    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+    if !use_parallelism(dst.len()) {
         for ((d, l), r) in dst.iter_mut().zip(lhs).zip(rhs) {
             *d = f(*l, *r);
         }
@@ -1415,7 +1511,7 @@ fn im2col1d<T: WithDTypeF>(
     let k = in_channels * l_k;
     let mut dst = vec![T::zero(); batch * l_out * k];
 
-    dst.par_chunks_mut(k).enumerate().for_each(|(bl, dst_row)| {
+    let fill_row = |bl: usize, dst_row: &mut [T]| {
         let b_idx = bl / l_out;
         let l_idx = bl % l_out;
         let src_b_offset = b_idx * in_channels * length;
@@ -1437,7 +1533,12 @@ fn im2col1d<T: WithDTypeF>(
                 *dst = src[src_idx];
             }
         }
-    });
+    };
+    if use_parallelism(batch * l_out * k) {
+        dst.par_chunks_mut(k).enumerate().for_each(|(bl, dst_row)| fill_row(bl, dst_row));
+    } else {
+        dst.chunks_mut(k).enumerate().for_each(|(bl, dst_row)| fill_row(bl, dst_row));
+    }
 
     dst
 }
@@ -1546,7 +1647,7 @@ fn col2im1d<T: WithDTypeF>(
 
     // Each (b, c) pair owns a contiguous l_out-sized slice of dst, so the accumulation can
     // run in parallel over those slices with contiguous reads from col.
-    dst.par_chunks_mut(l_out).enumerate().for_each(|(bc, dst)| {
+    let accumulate = |bc: usize, dst: &mut [T]| {
         let b_i = bc / c_out;
         let c_i = bc % c_out;
         dst.fill(T::zero());
@@ -1557,7 +1658,12 @@ fn col2im1d<T: WithDTypeF>(
                 dst[dst_base + k_i] += col[src_base + k_i];
             }
         }
-    });
+    };
+    if use_parallelism(dst.len().max(col.len())) {
+        dst.par_chunks_mut(l_out).enumerate().for_each(|(bc, dst)| accumulate(bc, dst));
+    } else {
+        dst.chunks_mut(l_out).enumerate().for_each(|(bc, dst)| accumulate(bc, dst));
+    }
 }
 
 /// Direct conv_transpose1d implementation (fallback for grouped convolutions or with padding).
