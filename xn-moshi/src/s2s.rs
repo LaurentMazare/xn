@@ -481,10 +481,7 @@ impl<Q: BackendQ> State<Q> {
     }
 
     pub fn last_audio_tokens(&self) -> Option<Vec<Vec<i64>>> {
-        let max_delay = match self.model.audio_delays.iter().max() {
-            Some(d) => *d,
-            None => return None,
-        };
+        let max_delay = *self.model.audio_delays.iter().max()?;
         let mut last_tokens = Vec::with_capacity(self.batch_size());
         let n_slices = self.model.depformer.len();
         for per_batch in self.per_batch.iter() {
