@@ -3605,7 +3605,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xn"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "ash",
@@ -3641,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "xn-moshi"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "clap",
