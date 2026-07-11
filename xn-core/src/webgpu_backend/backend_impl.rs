@@ -423,8 +423,13 @@ impl crate::Backend for Device {
         if m == 1 {
             // Decode path: one workgroup per output column, grid (n, batch, 1).
             // rhs is bound twice: once scalar, once as a vec4 view for the
-            // shader's aligned fast-path loads (see gemv.wgsl).
+            // shader's aligned fast-path loads (see gemv.wgsl). On wasm the
+            // scalar-only gemv variant is used (3 bindings): the browser
+            // rejects aliased storage bindings.
+            #[cfg(not(target_arch = "wasm32"))]
             let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer, &rhs.0.buffer];
+            #[cfg(target_arch = "wasm32")]
+            let buffers = [&dst.buffer, &lhs.0.buffer, &rhs.0.buffer];
             dst.device.dispatch_nd(
                 &format!("gemv_{dt}"),
                 &buffers,

@@ -32,6 +32,14 @@ tracing-subscriber = { workspace = true }
 wgpu = { workspace = true, optional = true }
 yoke = { workspace = true }
 
+# The Backend trait requires Send + Sync, which wgpu's wasm types only provide
+# through this feature. It is sound for single-threaded wasm builds and turns
+# into a compile error if the `atomics` target feature is enabled.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, optional = true, features = [
+  "fragile-send-sync-non-atomic-wasm",
+] }
+
 [dev-dependencies]
 anyhow = { workspace = true }
 paste = { workspace = true }

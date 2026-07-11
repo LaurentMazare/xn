@@ -64,7 +64,12 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
         "scatter_set" => (include_str!("../../webgpu-kernels/scatter_set.wgsl"), 3),
         "gemm_tiled" => (include_str!("../../webgpu-kernels/gemm_tiled.wgsl"), 3),
         // rhs is bound twice: scalar + a vec4 view for the aligned fast path.
+        // The double binding aliases the same buffer, which browser WebGPU
+        // validation rejects, so wasm uses a scalar-only variant.
+        #[cfg(not(target_arch = "wasm32"))]
         "gemv" => (include_str!("../../webgpu-kernels/gemv.wgsl"), 4),
+        #[cfg(target_arch = "wasm32")]
+        "gemv" => (include_str!("../../webgpu-kernels/gemv_scalar.wgsl"), 3),
         "conv1d" => (include_str!("../../webgpu-kernels/conv1d.wgsl"), 3),
         "conv_transpose1d" => (include_str!("../../webgpu-kernels/conv_transpose1d.wgsl"), 3),
         "im2col1d" => (include_str!("../../webgpu-kernels/im2col1d.wgsl"), 2),
@@ -75,6 +80,9 @@ fn kernel_src(name: &str) -> Option<(&'static str, u32)> {
 }
 
 const MAX_BINDINGS: usize = 4;
+// Unused on wasm: the browser API has no push constants (params travel in a
+// uniform buffer) and only exposes a single adapter (no ranking).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const PUSH_CONSTANT_SIZE: u32 = 128;
 const WORKGROUP_SIZE: u32 = 256;
 /// GEMM tile size; must match `TILE` / the `@workgroup_size` in gemm_tiled.wgsl.
@@ -176,6 +184,10 @@ pub struct DeviceInner {
     // bind_group_layouts[n] / pipeline_layouts[n] describe `n` storage bindings.
     bind_group_layouts: Vec<wgpu::BindGroupLayout>,
     pipeline_layouts: Vec<wgpu::PipelineLayout>,
+    /// Uniform-buffer layout for kernel parameters at group(1) binding(0);
+    /// only used on wasm, where the browser API has no push constants.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    params_bgl: wgpu::BindGroupLayout,
     pipelines: Mutex<HashMap<String, CachedPipeline>>,
     pool: Mutex<BufferPool>,
     ctx: Mutex<OpCtx>,
@@ -200,6 +212,7 @@ impl std::fmt::Debug for Device {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn device_type_score(t: wgpu::DeviceType) -> u32 {
     match t {
         wgpu::DeviceType::DiscreteGpu => 4,
@@ -215,51 +228,91 @@ impl Device {
         pollster::block_on(Self::new_async(ordinal))
     }
 
-    async fn new_async(ordinal: usize) -> Result<Self> {
+    /// Async constructor. This is the one to use on wasm in the browser where
+    /// blocking on the adapter/device request futures is not possible.
+    pub async fn new_async(ordinal: usize) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
         // Rank adapters by preference (discrete > integrated > cpu). `ordinal`
         // selects among the ranked list. `XN_WEBGPU_DEVICE` overrides it with a
         // raw enumeration index.
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
-        if adapters.is_empty() {
-            crate::bail!("webgpu: no adapters found (is a GPU driver installed?)");
-        }
-        let mut ranked: Vec<(u32, usize)> = adapters
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (device_type_score(a.get_info().device_type), i))
-            .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        let idx = match std::env::var("XN_WEBGPU_DEVICE").ok().and_then(|v| v.parse::<usize>().ok())
-        {
-            Some(i) if i < adapters.len() => i,
-            _ => ranked.get(ordinal).map(|r| r.1).unwrap_or(ranked[0].1),
+        #[cfg(not(target_arch = "wasm32"))]
+        let adapter = {
+            let mut adapters = instance.enumerate_adapters(wgpu::Backends::all());
+            if adapters.is_empty() {
+                crate::bail!("webgpu: no adapters found (is a GPU driver installed?)");
+            }
+            let mut ranked: Vec<(u32, usize)> = adapters
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (device_type_score(a.get_info().device_type), i))
+                .collect();
+            ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let idx = match std::env::var("XN_WEBGPU_DEVICE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                Some(i) if i < adapters.len() => i,
+                _ => ranked.get(ordinal).map(|r| r.1).unwrap_or(ranked[0].1),
+            };
+            adapters.swap_remove(idx)
         };
-        let adapter = &adapters[idx];
+        // The browser only exposes a single adapter through requestAdapter(),
+        // so `ordinal` / `XN_WEBGPU_DEVICE` do not apply there.
+        #[cfg(target_arch = "wasm32")]
+        let adapter = {
+            let _ = ordinal;
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    ..Default::default()
+                })
+                .await
+                .map_err(wgpuerr("request_adapter (is WebGPU enabled in this browser?)"))?
+        };
         let info = adapter.get_info();
         let device_name = format!("{} ({:?})", info.name, info.backend);
 
         // Push constants (native feature) carry kernel parameters; f32 storage
         // buffers hold tensor data. Request a limit that fits the largest push
-        // block (gemm: 14 u32 = 56 B) with headroom.
-        let limits =
-            wgpu::Limits { max_push_constant_size: PUSH_CONSTANT_SIZE, ..adapter.limits() };
+        // block (gemm: 14 u32 = 56 B) with headroom. The browser's WebGPU has
+        // no push constants at all: there the parameters travel in a small
+        // uniform buffer bound at group(1) binding(0) instead.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (required_features, limits) = (
+            wgpu::Features::PUSH_CONSTANTS,
+            wgpu::Limits { max_push_constant_size: PUSH_CONSTANT_SIZE, ..adapter.limits() },
+        );
+        #[cfg(target_arch = "wasm32")]
+        let (required_features, limits) = (wgpu::Features::empty(), adapter.limits());
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("xn-webgpu"),
-                required_features: wgpu::Features::PUSH_CONSTANTS,
+                required_features,
                 required_limits: limits,
                 memory_hints: wgpu::MemoryHints::Performance,
                 trace: wgpu::Trace::Off,
             })
             .await
-            .map_err(wgpuerr("request_device (push-constant support required)"))?;
+            .map_err(wgpuerr("request_device"))?;
 
         // A storage-buffer bind group layout + pipeline layout for each binding
         // count. Every binding is a read_write storage buffer (info/ids buffers
         // are declared read_write in WGSL too), so a single layout per count
         // serves every kernel with that many bindings.
+        let params_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("xn-params-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
         let mut bind_group_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
         let mut pipeline_layouts = Vec::with_capacity(MAX_BINDINGS + 1);
         for n in 0..=MAX_BINDINGS {
@@ -279,6 +332,7 @@ impl Device {
                 label: Some(&format!("xn-bgl-{n}")),
                 entries: &entries,
             });
+            #[cfg(not(target_arch = "wasm32"))]
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("xn-pl-{n}")),
                 bind_group_layouts: &[&bgl],
@@ -286,6 +340,12 @@ impl Device {
                     stages: wgpu::ShaderStages::COMPUTE,
                     range: 0..PUSH_CONSTANT_SIZE,
                 }],
+            });
+            #[cfg(target_arch = "wasm32")]
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(&format!("xn-pl-{n}")),
+                bind_group_layouts: &[&bgl, &params_bgl],
+                push_constant_ranges: &[],
             });
             bind_group_layouts.push(bgl);
             pipeline_layouts.push(pl);
@@ -298,6 +358,7 @@ impl Device {
             queue,
             bind_group_layouts,
             pipeline_layouts,
+            params_bgl,
             pipelines: Mutex::new(HashMap::new()),
             pool: Mutex::new(BufferPool::default()),
             ctx: Mutex::new(OpCtx { encoder: None, open: false, free_bufs: Vec::new() }),
@@ -349,9 +410,19 @@ impl Device {
         }
         let (src, bindings) = kernel_src(name)
             .ok_or_else(|| crate::Error::msg(format!("webgpu: unknown kernel {name}")))?;
+        // Browser WebGPU has no push constants: rewrite the parameter block
+        // into a uniform buffer at group(1) binding(0). The Params structs are
+        // flat sequences of u32/f32, which have identical layouts in the
+        // push-constant and uniform address spaces.
+        #[cfg(target_arch = "wasm32")]
+        let src = std::borrow::Cow::Owned(
+            src.replace("var<push_constant>", "@group(1) @binding(0) var<uniform>"),
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let src = std::borrow::Cow::Borrowed(src);
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
+            source: wgpu::ShaderSource::Wgsl(src),
         });
         let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
@@ -394,6 +465,29 @@ impl Device {
         let t0 = self.profile.then(std::time::Instant::now);
         let (pipeline, bindings) = self.get_pipeline(kernel)?;
         assert_eq!(bindings as usize, buffers.len(), "kernel {kernel} binding count mismatch");
+        // Browser WebGPU validation rejects two storage bindings aliasing the
+        // same buffer in one dispatch, a pattern the in-place ops rely on
+        // (src == dst). Later duplicates get a temporary copy of the buffer's
+        // current contents: by convention binding 0 is the write target, so
+        // writes still land in place while reads see a pristine snapshot.
+        #[cfg(target_arch = "wasm32")]
+        let resolved: Vec<wgpu::Buffer> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if buffers[..i].iter().any(|p| std::ptr::eq(*p, *b)) {
+                    let size = b.size() as usize;
+                    let copy = self.alloc_buffer(size);
+                    self.record_copy(&copy, b, size);
+                    self.defer_free(PooledBuf { buffer: copy.clone(), class: size_class(size) });
+                    copy
+                } else {
+                    (*b).clone()
+                }
+            })
+            .collect();
+        #[cfg(target_arch = "wasm32")]
+        let buffers: Vec<&wgpu::Buffer> = resolved.iter().collect();
         let entries: Vec<wgpu::BindGroupEntry> = buffers
             .iter()
             .enumerate()
@@ -407,6 +501,26 @@ impl Device {
             layout: &self.bind_group_layouts[bindings as usize],
             entries: &entries,
         });
+        // The browser API has no push constants; ship the parameters in a
+        // fresh small uniform buffer instead. The bind group keeps it alive
+        // for as long as the recorded dispatch needs it.
+        #[cfg(target_arch = "wasm32")]
+        let params_bg = {
+            let size = round4(push.bytes.len().max(4)) as u64;
+            let pbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("xn-params"),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: true,
+            });
+            pbuf.slice(..).get_mapped_range_mut()[..push.bytes.len()].copy_from_slice(&push.bytes);
+            pbuf.unmap();
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("xn-params"),
+                layout: &self.params_bgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: pbuf.as_entire_binding() }],
+            })
+        };
         let mut ctx = self.ctx.lock().unwrap();
         self.begin_if_needed(&mut ctx);
         let enc = ctx.encoder.as_mut().unwrap();
@@ -417,6 +531,9 @@ impl Device {
             });
             cpass.set_pipeline(&pipeline);
             cpass.set_bind_group(0, &bind_group, &[]);
+            #[cfg(target_arch = "wasm32")]
+            cpass.set_bind_group(1, &params_bg, &[]);
+            #[cfg(not(target_arch = "wasm32"))]
             cpass.set_push_constants(0, &push.bytes);
             cpass.dispatch_workgroups(gx, gy, gz);
         }
@@ -500,8 +617,16 @@ impl Device {
     }
 
     /// Read `len` elements of `T` back from a GPU buffer into a host `Vec`.
-    /// Flushes pending work first so the readback observes it.
+    /// Flushes pending work first so the readback observes it. Blocking on the
+    /// GPU is impossible in the browser, so on wasm this errors and callers
+    /// must go through the async path ([`crate::Tensor::to_vec_async`]).
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables, unreachable_code))]
     fn read_buffer<T: WithDType>(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<T>> {
+        #[cfg(target_arch = "wasm32")]
+        crate::bail!(
+            "webgpu: synchronous GPU readback is not available on wasm, use to_vec_async \
+             (hit via to_vec or a host-fallback op)"
+        );
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -540,6 +665,57 @@ impl Device {
             p.readbacks += 1;
             p.readback_ns += t0.elapsed().as_nanos();
         }
+        Ok(out)
+    }
+
+    /// Async variant of `read_buffer`. This is the only readback path that
+    /// works on wasm in the browser, where the buffer-mapping callback fires
+    /// from the JS event loop and can never be blocked on.
+    pub(crate) async fn read_buffer_async<T: WithDType>(
+        &self,
+        buf: &wgpu::Buffer,
+        len: usize,
+    ) -> Result<Vec<T>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        self.flush()?;
+        let bytes = len * T::BYTE_SIZE;
+        let padded = round4(bytes) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("xn-readback"),
+            size: padded,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, padded);
+        self.queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let shared = Arc::new(Mutex::new(MapShared { result: None, waker: None }));
+        let cb_shared = Arc::clone(&shared);
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let mut sh = cb_shared.lock().unwrap();
+            sh.result = Some(r);
+            if let Some(w) = sh.waker.take() {
+                w.wake();
+            }
+        });
+        // Natively the callback only fires when the queue is driven; in the
+        // browser the event loop takes care of it.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::PollType::Wait).map_err(wgpuerr("poll (readback)"))?;
+        MapFuture { shared }.await.map_err(wgpuerr("map_async"))?;
+        let mapped = slice.get_mapped_range();
+        let mut out = Vec::<T>::with_capacity(len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(mapped.as_ptr(), out.as_mut_ptr() as *mut u8, bytes);
+            out.set_len(len);
+        }
+        drop(mapped);
+        staging.unmap();
         Ok(out)
     }
 
@@ -627,6 +803,50 @@ impl Drop for DeviceInner {
                 100.0 * pool.hits as f64 / allocs as f64,
             );
         }
+    }
+}
+
+/// Shared state between a `map_async` callback and the future awaiting it.
+struct MapShared {
+    result: Option<std::result::Result<(), wgpu::BufferAsyncError>>,
+    waker: Option<std::task::Waker>,
+}
+
+/// Future resolving when a `map_async` callback fires. Waiting this way (as
+/// opposed to blocking on a channel) also works in the browser, where the
+/// callback is dispatched from the JS event loop.
+struct MapFuture {
+    shared: Arc<Mutex<MapShared>>,
+}
+
+impl std::future::Future for MapFuture {
+    type Output = std::result::Result<(), wgpu::BufferAsyncError>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut sh = self.shared.lock().unwrap();
+        match sh.result.take() {
+            Some(r) => std::task::Poll::Ready(r),
+            None => {
+                sh.waker = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T: WithDType> crate::Tensor<T, Device> {
+    /// Copy the tensor data back to the host without blocking on the GPU.
+    /// This is the only readback path available on wasm in the browser, where
+    /// the blocking `to_vec` returns an error instead.
+    pub async fn to_vec_async(&self) -> Result<Vec<T>> {
+        let len = self.elem_count();
+        let (device, buffer) = {
+            let storage = self.storage()?;
+            (storage.device.clone(), storage.buffer.clone())
+        };
+        device.read_buffer_async::<T>(&buffer, len).await
     }
 }
 
