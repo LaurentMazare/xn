@@ -7,6 +7,10 @@ use std::any::Any;
 const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
 
+/// Chunk size for the parallel RNG fills: one RNG instance per chunk, large enough that the
+/// per-chunk rayon dispatch and RNG construction costs are negligible.
+const RNG_CHUNK: usize = 64 * 1024;
+
 fn copy_strided_2d<T: WithDType>(
     dst: &mut [T],
     src: &[T],
@@ -418,9 +422,13 @@ impl crate::Backend for crate::CpuDevice {
     }
 
     fn rand_uniform(dst: &mut Self::Storage<f32>, len: usize, lo: f32, up: f32) -> Result<()> {
+        use rand::Rng;
         let range = up - lo;
-        dst.par_iter_mut().take(len).for_each(|v| {
-            *v = rand::random::<f32>() * range + lo;
+        dst[..len].par_chunks_mut(RNG_CHUNK).for_each(|chunk| {
+            let mut rng = rand::rng();
+            for v in chunk.iter_mut() {
+                *v = rng.random::<f32>() * range + lo;
+            }
         });
         Ok(())
     }
@@ -432,9 +440,11 @@ impl crate::Backend for crate::CpuDevice {
             Ok(d) => d,
             Err(e) => crate::bail!("failed to create normal distribution for randn: {e}"),
         };
-        dst.iter_mut().take(len).for_each(|v| {
+        dst[..len].par_chunks_mut(RNG_CHUNK).for_each(|chunk| {
             let mut rng = rand::rng();
-            *v = distr.sample(&mut rng);
+            for v in chunk.iter_mut() {
+                *v = distr.sample(&mut rng);
+            }
         });
         Ok(())
     }
