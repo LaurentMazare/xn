@@ -7,10 +7,6 @@ use std::any::Any;
 const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
 
-/// Chunk size for the parallel RNG fills: one RNG instance per chunk, large enough that the
-/// per-chunk rayon dispatch and RNG construction costs are negligible.
-const RNG_CHUNK: usize = 64 * 1024;
-
 fn copy_strided_2d<T: WithDType>(
     dst: &mut [T],
     src: &[T],
@@ -109,7 +105,14 @@ impl crate::Backend for crate::CpuDevice {
     }
 
     unsafe fn alloc_uninit<T: WithDType>(len: usize, _: &Self) -> Result<Self::Storage<T>> {
-        Ok(vec![T::zero(); len])
+        // All supported dtypes are plain-old-data for which any bit pattern is valid, and the
+        // trait contract requires the caller to initialize the memory before reading it.
+        let mut v = Vec::with_capacity(len);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            v.set_len(len)
+        };
+        Ok(v)
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, _: &Self) -> Result<Self::Storage<T>> {
@@ -372,7 +375,14 @@ impl crate::Backend for crate::CpuDevice {
         src: &Self::Storage<T>,
         l: usize,
     ) -> Result<()> {
-        dst[..l].copy_from_slice(&src[..l]);
+        if l < ELEMWISE_PAR_THRESHOLD {
+            dst[..l].copy_from_slice(&src[..l]);
+        } else {
+            dst[..l]
+                .par_chunks_mut(ELEMWISE_CHUNK)
+                .zip(src[..l].par_chunks(ELEMWISE_CHUNK))
+                .for_each(|(d, s)| d.copy_from_slice(s));
+        }
         Ok(())
     }
 
@@ -436,7 +446,7 @@ impl crate::Backend for crate::CpuDevice {
     fn rand_uniform(dst: &mut Self::Storage<f32>, len: usize, lo: f32, up: f32) -> Result<()> {
         use rand::Rng;
         let range = up - lo;
-        dst[..len].par_chunks_mut(RNG_CHUNK).for_each(|chunk| {
+        dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(|chunk| {
             let mut rng = rand::rng();
             for v in chunk.iter_mut() {
                 *v = rng.random::<f32>() * range + lo;
@@ -452,7 +462,7 @@ impl crate::Backend for crate::CpuDevice {
             Ok(d) => d,
             Err(e) => crate::bail!("failed to create normal distribution for randn: {e}"),
         };
-        dst[..len].par_chunks_mut(RNG_CHUNK).for_each(|chunk| {
+        dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(|chunk| {
             let mut rng = rand::rng();
             for v in chunk.iter_mut() {
                 *v = distr.sample(&mut rng);
@@ -462,7 +472,11 @@ impl crate::Backend for crate::CpuDevice {
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, v: T, l: usize) -> Result<()> {
-        dst[..l].fill(v);
+        if l < ELEMWISE_PAR_THRESHOLD {
+            dst[..l].fill(v);
+        } else {
+            dst[..l].par_chunks_mut(ELEMWISE_CHUNK).for_each(|d| d.fill(v));
+        }
         Ok(())
     }
 
@@ -1088,19 +1102,7 @@ impl crate::Backend for crate::CpuDevice {
             )?;
 
             // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out]
-            for b_idx in 0..batch {
-                for l_idx in 0..out_length {
-                    for c_idx in 0..out_channels {
-                        let src_idx =
-                            b_idx * out_length * out_channels + l_idx * out_channels + c_idx;
-                        let dst_idx =
-                            b_idx * out_channels * out_length + c_idx * out_length + l_idx;
-                        dst[dst_idx] = result[src_idx];
-                    }
-                }
-            }
-
-            Ok(())
+            Self::transpose(dst, &result, 1, 2, &[batch, out_length, out_channels])
         } else {
             // Fallback: original implementation for grouped convolutions
             conv1d_direct(
@@ -1151,15 +1153,7 @@ impl crate::Backend for crate::CpuDevice {
 
             // Step 1: Transpose input to [B, L_in, C_in]
             let mut src_transposed = vec![T::zero(); batch * length * in_channels];
-            for b in 0..batch {
-                for l in 0..length {
-                    for c in 0..in_channels {
-                        let src_idx = b * in_channels * length + c * length + l;
-                        let dst_idx = b * length * in_channels + l * in_channels + c;
-                        src_transposed[dst_idx] = src[src_idx];
-                    }
-                }
-            }
+            Self::transpose(&mut src_transposed, src, 1, 2, &[batch, in_channels, length])?;
 
             // Step 2: Matrix multiplication
             // src_transposed: [B, L_in, C_in]
@@ -1314,47 +1308,92 @@ fn reduce_arg<T: WithDType + Copy>(
     }
 }
 
+/// Below this many elements, elementwise ops run serially: the rayon fork/join overhead
+/// (~10us) dwarfs the work itself.
+const ELEMWISE_PAR_THRESHOLD: usize = 32 * 1024;
+/// Chunk size for parallel elementwise ops; large enough that the per-chunk dispatch cost is
+/// negligible and the inner loop auto-vectorizes.
+const ELEMWISE_CHUNK: usize = 64 * 1024;
+
 /// Apply a binary operation in-place: dst[i] = op(dst[i], src[i])
 #[inline(always)]
-fn apply_bin_assign<T: Copy, F>(dst: &mut [T], src: &[T], f: F)
+fn apply_bin_assign<T: Copy + Send + Sync, F>(dst: &mut [T], src: &[T], f: F)
 where
-    F: Fn(&mut T, T),
+    F: Fn(&mut T, T) + Sync,
 {
-    for (d, s) in dst.iter_mut().zip(src) {
-        f(d, *s);
+    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+        for (d, s) in dst.iter_mut().zip(src) {
+            f(d, *s);
+        }
+    } else {
+        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
+            |(dst, src)| {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    f(d, *s);
+                }
+            },
+        );
     }
 }
 
 /// Apply a unary operation in-place: dst[i] = op(dst[i])
 #[inline(always)]
-fn apply_inplace_unary<T: Copy, F>(dst: &mut [T], f: F)
+fn apply_inplace_unary<T: Copy + Send + Sync, F>(dst: &mut [T], f: F)
 where
-    F: Fn(&mut T),
+    F: Fn(&mut T) + Sync,
 {
-    for d in dst.iter_mut() {
-        f(d);
+    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+        for d in dst.iter_mut() {
+            f(d);
+        }
+    } else {
+        dst.par_chunks_mut(ELEMWISE_CHUNK).for_each(|dst| {
+            for d in dst.iter_mut() {
+                f(d);
+            }
+        });
     }
 }
 
 /// Apply a unary operation: dst[i] = op(src[i])
 #[inline(always)]
-fn apply_unary<T: Copy, F>(dst: &mut [T], src: &[T], f: F)
+fn apply_unary<T: Copy + Send + Sync, F>(dst: &mut [T], src: &[T], f: F)
 where
-    F: Fn(T) -> T,
+    F: Fn(T) -> T + Sync,
 {
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d = f(*s);
+    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+        for (d, s) in dst.iter_mut().zip(src) {
+            *d = f(*s);
+        }
+    } else {
+        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
+            |(dst, src)| {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    *d = f(*s);
+                }
+            },
+        );
     }
 }
 
 /// Apply a binary operation: dst[i] = op(lhs[i], rhs[i])
 #[inline(always)]
-fn apply_binary<T: Copy, F>(dst: &mut [T], lhs: &[T], rhs: &[T], f: F)
+fn apply_binary<T: Copy + Send + Sync, F>(dst: &mut [T], lhs: &[T], rhs: &[T], f: F)
 where
-    F: Fn(T, T) -> T,
+    F: Fn(T, T) -> T + Sync,
 {
-    for ((d, l), r) in dst.iter_mut().zip(lhs).zip(rhs) {
-        *d = f(*l, *r);
+    if dst.len() < ELEMWISE_PAR_THRESHOLD {
+        for ((d, l), r) in dst.iter_mut().zip(lhs).zip(rhs) {
+            *d = f(*l, *r);
+        }
+    } else {
+        dst.par_chunks_mut(ELEMWISE_CHUNK)
+            .zip(lhs.par_chunks(ELEMWISE_CHUNK).zip(rhs.par_chunks(ELEMWISE_CHUNK)))
+            .for_each(|(dst, (lhs, rhs))| {
+                for ((d, l), r) in dst.iter_mut().zip(lhs).zip(rhs) {
+                    *d = f(*l, *r);
+                }
+            });
     }
 }
 
@@ -1376,32 +1415,29 @@ fn im2col1d<T: WithDTypeF>(
     let k = in_channels * l_k;
     let mut dst = vec![T::zero(); batch * l_out * k];
 
-    for b_idx in 0..batch {
+    dst.par_chunks_mut(k).enumerate().for_each(|(bl, dst_row)| {
+        let b_idx = bl / l_out;
+        let l_idx = bl % l_out;
         let src_b_offset = b_idx * in_channels * length;
-        let dst_b_offset = b_idx * l_out * k;
 
-        for l_idx in 0..l_out {
-            let dst_l_offset = dst_b_offset + l_idx * k;
+        for c_idx in 0..in_channels {
+            let src_c_offset = src_b_offset + c_idx * length;
+            let dst_c_offset = c_idx * l_k;
 
-            for c_idx in 0..in_channels {
-                let src_c_offset = src_b_offset + c_idx * length;
-                let dst_c_offset = dst_l_offset + c_idx * l_k;
+            for (l_k_idx, dst) in dst_row[dst_c_offset..dst_c_offset + l_k].iter_mut().enumerate() {
+                let src_l = l_idx * stride + l_k_idx * dilation;
 
-                for (l_k_idx, dst) in dst[dst_c_offset..dst_c_offset + l_k].iter_mut().enumerate() {
-                    let src_l = l_idx * stride + l_k_idx * dilation;
-
-                    // Handle padding
-                    if src_l < padding || src_l >= length + padding {
-                        // Zero padding - already initialized to zero
-                        continue;
-                    }
-                    let src_l = src_l - padding;
-                    let src_idx = src_c_offset + src_l;
-                    *dst = src[src_idx];
+                // Handle padding
+                if src_l < padding || src_l >= length + padding {
+                    // Zero padding - already initialized to zero
+                    continue;
                 }
+                let src_l = src_l - padding;
+                let src_idx = src_c_offset + src_l;
+                *dst = src[src_idx];
             }
         }
-    }
+    });
 
     dst
 }
@@ -1497,7 +1533,7 @@ fn conv1d_direct<T: WithDTypeF>(
 fn col2im1d<T: WithDTypeF>(
     dst: &mut [T],
     col: &[T],
-    b_size: usize,
+    _b_size: usize,
     l_in: usize,
     c_out: usize,
     k_size: usize,
@@ -1505,26 +1541,23 @@ fn col2im1d<T: WithDTypeF>(
 ) {
     let l_out = (l_in - 1) * stride + k_size;
 
-    dst.fill(T::zero());
-
-    // Strides for destination [B, C_out, L_out]
-    let (dst_s0, dst_s1) = (c_out * l_out, l_out);
-
     // Strides for source [B, L_in, C_out, K] stored as [B, L_in, C_out * K]
     let (src_s0, src_s1, src_s2) = (c_out * k_size * l_in, c_out * k_size, k_size);
 
-    for l_in_i in 0..l_in {
-        for k_i in 0..k_size {
-            let l_out_i = l_in_i * stride + k_i;
-            for b_i in 0..b_size {
-                for c_i in 0..c_out {
-                    let dst_idx = b_i * dst_s0 + c_i * dst_s1 + l_out_i;
-                    let src_idx = b_i * src_s0 + l_in_i * src_s1 + c_i * src_s2 + k_i;
-                    dst[dst_idx] += col[src_idx];
-                }
+    // Each (b, c) pair owns a contiguous l_out-sized slice of dst, so the accumulation can
+    // run in parallel over those slices with contiguous reads from col.
+    dst.par_chunks_mut(l_out).enumerate().for_each(|(bc, dst)| {
+        let b_i = bc / c_out;
+        let c_i = bc % c_out;
+        dst.fill(T::zero());
+        for l_in_i in 0..l_in {
+            let src_base = b_i * src_s0 + l_in_i * src_s1 + c_i * src_s2;
+            let dst_base = l_in_i * stride;
+            for k_i in 0..k_size {
+                dst[dst_base + k_i] += col[src_base + k_i];
             }
         }
-    }
+    });
 }
 
 /// Direct conv_transpose1d implementation (fallback for grouped convolutions or with padding).
@@ -1620,7 +1653,7 @@ fn broadcast_binary_op<T: WithDType>(
     dst_shape: &[usize],
     lhs_strides: &[usize],
     rhs_strides: &[usize],
-    op: impl Fn(T, T) -> T,
+    op: impl Fn(T, T) -> T + Sync,
 ) -> Result<()> {
     let lhs_no_zero = lhs_strides.iter().all(|&s| s > 0);
     let rhs_no_zero = rhs_strides.iter().all(|&s| s > 0);
