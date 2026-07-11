@@ -283,7 +283,7 @@ impl<T: xn::WithDTypeF, B: xn::Backend> Conditioners<T, B> {
                 None => emb,
             });
         }
-        for (_name, source_level) in self.source_level.iter() {
+        for source_level in self.source_level.values() {
             result = Some(match result {
                 Some(acc) => acc.add(&source_level.learnt_padding)?,
                 None => source_level.learnt_padding.clone(),
