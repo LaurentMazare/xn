@@ -310,12 +310,24 @@ impl<T: WithDType, B: Backend> TensorView<T, B> {
     #[tracing::instrument(skip_all)]
     pub fn contiguous(&self) -> Result<Tensor<T, B>> {
         if self.is_contiguous() && self.start_offset == 0 {
-            return Ok(Tensor {
-                data: self.data.clone(),
-                shape: self.shape.clone(),
-                device: self.device.clone(),
-                _marker: std::marker::PhantomData,
-            });
+            // Only alias the underlying storage when the view spans it entirely: a
+            // zero-offset contiguous view can still be a strict prefix of the storage
+            // (e.g. `narrow` at offset 0 with leading size-1 dims), and tensors are
+            // expected to have their storage length match their element count.
+            let storage_len = {
+                let data = self.data.read().map_err(|e| {
+                    crate::Error::msg(format!("failed to borrow tensor storage immutably: {}", e))
+                })?;
+                B::storage_len(&*data)
+            };
+            if storage_len == self.shape.elem_count() {
+                return Ok(Tensor {
+                    data: self.data.clone(),
+                    shape: self.shape.clone(),
+                    device: self.device.clone(),
+                    _marker: std::marker::PhantomData,
+                });
+            }
         }
         self.contiguous_always_copy()
     }
