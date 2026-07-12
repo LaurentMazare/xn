@@ -1730,3 +1730,25 @@ fn test_log_neg_roundtrip_impl<B: Backend>(dev: &B) -> Result<()> {
     Ok(())
 }
 test_all_backends!(test_log_neg_roundtrip, test_log_neg_roundtrip_impl);
+
+fn test_narrow_prefix_contiguous_impl<B: Backend>(dev: &B) -> Result<()> {
+    // A zero-offset narrow with leading size-1 dims is a contiguous *prefix* of its
+    // storage; contiguous() must not return a tensor aliasing the longer storage.
+    // Regression test: q/k/v projections narrow a (1, 1, 3*d) qkv tensor and the q slice
+    // starts at offset 0, which used to break ops validating storage length (e.g. rope_i).
+    let (h, d) = (2, 4);
+    let dm = h * d;
+    let qkv_data: Vec<f32> = (0..3 * dm).map(|v| v as f32).collect();
+    let qkv: Tensor<f32, B> = Tensor::from_vec(qkv_data, (1, 1, 3 * dm), dev)?;
+    let q = qkv.narrow(2, ..dm)?.reshape((1, 1, h, d))?.transpose(1, 2)?.contiguous()?;
+    assert_eq!(q.dims(), [1, h, 1, d]);
+    let expected: Vec<f32> = (0..dm).map(|v| v as f32).collect();
+    assert_eq!(q.to_vec()?, expected);
+    // rope_i validates that the storage length matches the shape.
+    let cos: Tensor<f32, B> = Tensor::full(1.0, (8, d / 2), dev)?;
+    let sin: Tensor<f32, B> = Tensor::full(0.0, (8, d / 2), dev)?;
+    let roped = q.rope_i(&cos, &sin, 0)?;
+    assert_eq!(roped.to_vec()?, expected);
+    Ok(())
+}
+test_all_backends!(test_narrow_prefix_contiguous, test_narrow_prefix_contiguous_impl);
