@@ -83,6 +83,43 @@ macro_rules! binary_op {
     };
 }
 
+/// Uniform stride covering a row-major flat iteration of the batch dims (all but the
+/// last two), when the layout admits one; size-1 dims never contribute to an offset
+/// and are ignored. Contiguous tensors always admit one; strided views may not, e.g.
+/// the (b, h) batch dims of a transpose(1, 2) view of a (b, t, h, d) tensor have
+/// strides (t*h*d, d) which cannot be walked with a single stride when b > 1.
+fn flat_batch_stride(dims: &[usize], strides: &[usize]) -> Option<usize> {
+    let nb = dims.len().saturating_sub(2);
+    let mut step = None;
+    let mut suffix = 1usize;
+    for j in (0..nb).rev() {
+        if dims[j] == 1 {
+            continue;
+        }
+        match step {
+            None => step = Some(strides[j]),
+            Some(s) => {
+                if strides[j] != s * suffix {
+                    return None;
+                }
+            }
+        }
+        suffix *= dims[j];
+    }
+    Some(step.unwrap_or(0))
+}
+
+/// Materialize a contiguous copy of an arbitrarily strided operand.
+fn contiguous_copy<T: WithDType, B: Backend>(src: &dyn TensorOrView<T, B>) -> Result<Tensor<T, B>> {
+    let dst: Tensor<T, B> = unsafe { Tensor::alloc_uninit(src.shape().clone(), src.device()) }?;
+    {
+        let (src_data, src_o) = src.storage_and_offset()?;
+        let mut dst_data = dst.storage_mut()?;
+        B::copy_strided(&mut dst_data, &*src_data, src_o, src.dims(), &src.strides())?;
+    }
+    Ok(dst)
+}
+
 impl<T: WithDType, B: Backend> Tensor<T, B> {
     fn check_not_same_storage(&self, other: &Self, op: &str) -> Result<()> {
         if Arc::ptr_eq(&self.data, &other.data) {
@@ -443,6 +480,28 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
             );
         }
 
+        // The backend gemm walks the flattened batch space with a single uniform stride
+        // per operand. When the batch dims of a strided view do not collapse to such a
+        // stride (e.g. a transpose(1, 2) view of a (b, t, h, d) tensor with b > 1),
+        // materialize a contiguous copy of the operand first — otherwise every batch
+        // entry past the first would read from wrong offsets.
+        let lhs_contiguous;
+        let lhs: &dyn TensorOrView<T, B> = if flat_batch_stride(lhs_dims, &lhs.strides()).is_some()
+        {
+            lhs
+        } else {
+            lhs_contiguous = contiguous_copy(lhs)?;
+            &lhs_contiguous
+        };
+        let rhs_contiguous;
+        let rhs: &dyn TensorOrView<T, B> =
+            if rhs_batch == 1 || flat_batch_stride(rhs_dims, &rhs.strides()).is_some() {
+                rhs
+            } else {
+                rhs_contiguous = contiguous_copy(rhs)?;
+                &rhs_contiguous
+            };
+
         // Use actual strides from the TensorOrView to support non-contiguous inputs
         // (e.g. transposed views passed directly to matmul).
         let lhs_s = lhs.strides();
@@ -459,13 +518,17 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
             (rhs_s[rhs_s.len() - 1], rhs_s[rhs_s.len() - 2])
         };
 
-        let lhs_b_stride = if lhs_s.len() >= 3 { lhs_s[lhs_s.len() - 3] } else { m * k };
+        let lhs_b_stride = match flat_batch_stride(lhs_dims, &lhs_s) {
+            Some(s) if lhs_s.len() >= 3 => s,
+            _ => m * k,
+        };
         let rhs_b_stride = if rhs_batch == 1 {
             0
-        } else if rhs_s.len() >= 3 {
-            rhs_s[rhs_s.len() - 3]
         } else {
-            rhs_dims[rhs_dims.len() - 2] * rhs_dims[rhs_dims.len() - 1]
+            match flat_batch_stride(rhs_dims, &rhs_s) {
+                Some(s) if rhs_s.len() >= 3 => s,
+                _ => rhs_dims[rhs_dims.len() - 2] * rhs_dims[rhs_dims.len() - 1],
+            }
         };
 
         let mut dst = self.storage_mut()?;
