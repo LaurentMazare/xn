@@ -1752,3 +1752,38 @@ fn test_narrow_prefix_contiguous_impl<B: Backend>(dev: &B) -> Result<()> {
     Ok(())
 }
 test_all_backends!(test_narrow_prefix_contiguous, test_narrow_prefix_contiguous_impl);
+
+fn test_matmul_batched_strided_impl<B: Backend>(dev: &B) -> Result<()> {
+    // Batched matmuls where an operand is a transpose(1, 2) view of a (b, t, h, d)
+    // tensor: the batch dims (b, h) of the view have strides (t*h*d, d), which do not
+    // collapse to a single uniform batch stride when b > 1. Regression test: batch
+    // entries past the first used to read from wrong offsets (the attention pattern of
+    // a batched transformer, where only batch row 0 came out right).
+    let (b, t, h, d) = (3, 5, 2, 4);
+    let q_data: Vec<f32> = (0..b * t * h * d).map(|i| ((i * 7 % 23) as f32) - 11.0).collect();
+    let k_data: Vec<f32> = (0..b * t * h * d).map(|i| ((i * 5 % 19) as f32) - 9.0).collect();
+    let q: Tensor<f32, B> = Tensor::from_vec(q_data, (b, t, h, d), dev)?;
+    let k: Tensor<f32, B> = Tensor::from_vec(k_data, (b, t, h, d), dev)?;
+
+    // (b, t, h, d) -> (b, h, t, d) views with non-collapsible batch strides.
+    let q_view = q.transpose(1, 2)?;
+    let k_view = k.transpose(1, 2)?;
+    let q_c = q.transpose(1, 2)?.contiguous()?;
+    let k_c = k.transpose(1, 2)?.contiguous()?;
+
+    // matmul_t: (b, h, t, d) x (b, h, t, d)^T -> (b, h, t, t)
+    let expected = q_c.matmul_t(&k_c)?.to_vec()?;
+    assert_approx_eq(&q_view.matmul_t(&k_c)?.to_vec()?, &expected, 1e-5);
+    assert_approx_eq(&q_c.matmul_t(&k_view)?.to_vec()?, &expected, 1e-5);
+    assert_approx_eq(&q_view.matmul_t(&k_view)?.to_vec()?, &expected, 1e-5);
+
+    // matmul: (b, h, t, d) x (b, h, d, t) -> (b, h, t, t)
+    let k_tt_view = k.transpose(1, 2)?.transpose(2, 3)?;
+    let k_tt_c = k.transpose(1, 2)?.transpose(2, 3)?.contiguous()?;
+    let expected = q_c.matmul(&k_tt_c)?.to_vec()?;
+    assert_approx_eq(&q_view.matmul(&k_tt_c)?.to_vec()?, &expected, 1e-5);
+    assert_approx_eq(&q_c.matmul(&k_tt_view)?.to_vec()?, &expected, 1e-5);
+    assert_approx_eq(&q_view.matmul(&k_tt_view)?.to_vec()?, &expected, 1e-5);
+    Ok(())
+}
+test_all_backends!(test_matmul_batched_strided, test_matmul_batched_strided_impl);
