@@ -213,6 +213,7 @@ struct AsrQ {
 }
 
 impl xn::WithQ for AsrQ {
+    type Output = ();
     fn run<Q: xn::BackendQ>(self, dev: Q::B) -> xn::Result<()> {
         match run_asr::<Q>(
             self.input,
@@ -239,6 +240,7 @@ struct S2s {
 }
 
 impl xn::WithQ for S2s {
+    type Output = ();
     fn run<Q: xn::BackendQ>(self, dev: Q::B) -> xn::Result<()> {
         match run_s2s::<Q>(
             self.input,

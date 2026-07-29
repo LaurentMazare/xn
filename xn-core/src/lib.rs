@@ -138,54 +138,45 @@ impl<T: WithDTypeF, B: Backend> BackendQ for Unquantized<T, B> {
 }
 
 pub trait WithQ {
-    fn run<Q: BackendQ>(self, dev: Q::B) -> Result<()>;
+    type Output;
+    fn run<Q: BackendQ>(self, dev: Q::B) -> Result<Self::Output>;
 }
 
-pub fn run_with_device<W: WithQ>(w: W, _cpu_only: bool, _device_id: usize) -> Result<()> {
+pub fn run_with_device<W: WithQ>(w: W, _cpu_only: bool, _device_id: usize) -> Result<W::Output> {
     #[cfg(feature = "cuda")]
-    {
-        if _cpu_only {
-            w.run::<Unquantized<f32, _>>(CpuDevice)?;
-        } else {
-            let dev = cuda_backend::Device::new(_device_id)?;
-            w.run::<Unquantized<half::bf16, _>>(dev)?;
-        }
-    }
+    let res = if _cpu_only {
+        w.run::<Unquantized<f32, _>>(CpuDevice)
+    } else {
+        let dev = cuda_backend::Device::new(_device_id)?;
+        w.run::<Unquantized<half::bf16, _>>(dev)
+    };
     #[cfg(all(feature = "vulkan", not(feature = "cuda")))]
-    {
-        if _cpu_only {
-            w.run::<Unquantized<f32, _>>(CpuDevice)?;
-        } else {
-            let dev = vulkan_backend::Device::new(_device_id)?;
-            w.run::<Unquantized<f32, _>>(dev)?;
-        }
-    }
+    let res = if _cpu_only {
+        w.run::<Unquantized<f32, _>>(CpuDevice)
+    } else {
+        let dev = vulkan_backend::Device::new(_device_id)?;
+        w.run::<Unquantized<f32, _>>(dev)
+    };
     #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "vulkan"))))]
-    {
-        if _cpu_only {
-            w.run::<Unquantized<f32, _>>(CpuDevice)?;
-        } else {
-            let dev = metal_backend::Device::new(_device_id)?;
-            w.run::<Unquantized<f32, _>>(dev)?;
-        }
-    }
+    let res = if _cpu_only {
+        w.run::<Unquantized<f32, _>>(CpuDevice)
+    } else {
+        let dev = metal_backend::Device::new(_device_id)?;
+        w.run::<Unquantized<f32, _>>(dev)
+    };
     #[cfg(all(
         feature = "webgpu",
         not(any(feature = "cuda", feature = "vulkan", feature = "metal"))
     ))]
-    {
-        if _cpu_only {
-            w.run::<Unquantized<f32, _>>(CpuDevice)?;
-        } else {
-            let dev = webgpu_backend::Device::new(_device_id)?;
-            w.run::<Unquantized<f32, _>>(dev)?;
-        }
-    }
+    let res = if _cpu_only {
+        w.run::<Unquantized<f32, _>>(CpuDevice)
+    } else {
+        let dev = webgpu_backend::Device::new(_device_id)?;
+        w.run::<Unquantized<f32, _>>(dev)
+    };
     #[cfg(not(any(feature = "cuda", feature = "vulkan", feature = "metal", feature = "webgpu")))]
-    {
-        w.run::<Unquantized<f32, _>>(CpuDevice)?;
-    }
-    Ok(())
+    let res = w.run::<Unquantized<f32, _>>(CpuDevice);
+    res
 }
 
 pub struct Runner {
@@ -208,137 +199,133 @@ impl Runner {
         self
     }
 
-    pub fn run<W: WithQ>(self, w: W, _device_id: usize) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        {
-            if self.cpu_only {
-                w.run::<Unquantized<f32, _>>(CpuDevice)?;
-            } else {
-                let dev = cuda_backend::Device::new(_device_id)?;
-                match self.dtype {
-                    DTypeQ::Fp8 => w.run::<cuda_backend::quantization::Fp8ScalePerTensor>(dev)?,
-                    DTypeQ::Fp8PerToken => {
-                        w.run::<cuda_backend::quantization::Fp8ScalePerToken>(dev)?
-                    }
-                    DTypeQ::F16 => w.run::<Unquantized<half::f16, _>>(dev)?,
-                    DTypeQ::BF16 => w.run::<Unquantized<half::bf16, _>>(dev)?,
-                    DTypeQ::F32 => w.run::<Unquantized<f32, _>>(dev)?,
-                    DTypeQ::Q4_0
-                    | DTypeQ::Q4_1
-                    | DTypeQ::Q5_0
-                    | DTypeQ::Q5_1
-                    | DTypeQ::Q8_0
-                    | DTypeQ::Q8_1
-                    | DTypeQ::Q2K
-                    | DTypeQ::Q3K
-                    | DTypeQ::Q4K
-                    | DTypeQ::Q5K
-                    | DTypeQ::Q6K
-                    | DTypeQ::Q8K => {
-                        return Err(Error::msg(format!(
-                            "{:?} quantization is only supported on CPU",
-                            self.dtype
-                        )));
-                    }
-                }
+    /// Run on the CPU backend, using the quantized kernels when the dtype
+    /// calls for them.
+    #[cfg(not(feature = "cuda"))]
+    fn run_cpu<W: WithQ>(&self, w: W) -> Result<W::Output> {
+        match self.dtype {
+            DTypeQ::Fp8 | DTypeQ::Fp8PerToken => {
+                Err(Error::msg("FP8 quantization is not supported on CPU"))
+            }
+            DTypeQ::F32 => w.run::<Unquantized<f32, _>>(CpuDevice),
+            DTypeQ::Q4_0 => w.run::<crate::quantized::Q40F32>(CpuDevice),
+            DTypeQ::Q4_1 => w.run::<crate::quantized::Q41F32>(CpuDevice),
+            DTypeQ::Q5_0 => w.run::<crate::quantized::Q50F32>(CpuDevice),
+            DTypeQ::Q5_1 => w.run::<crate::quantized::Q51F32>(CpuDevice),
+            DTypeQ::Q8_0 => w.run::<crate::quantized::Q80F32>(CpuDevice),
+            DTypeQ::Q8_1 => w.run::<crate::quantized::Q81F32>(CpuDevice),
+            DTypeQ::Q2K => w.run::<crate::quantized::Q2kF32>(CpuDevice),
+            DTypeQ::Q3K => w.run::<crate::quantized::Q3kF32>(CpuDevice),
+            DTypeQ::Q4K => w.run::<crate::quantized::Q4kF32>(CpuDevice),
+            DTypeQ::Q5K => w.run::<crate::quantized::Q5kF32>(CpuDevice),
+            DTypeQ::Q6K => w.run::<crate::quantized::Q6kF32>(CpuDevice),
+            DTypeQ::Q8K => w.run::<crate::quantized::Q8kF32>(CpuDevice),
+            DTypeQ::F16 | DTypeQ::BF16 => {
+                Err(Error::msg(format!("{:?} is not yet supported on CPU", self.dtype)))
             }
         }
+    }
+
+    pub fn run<W: WithQ>(self, w: W, _device_id: usize) -> Result<W::Output> {
+        #[cfg(feature = "cuda")]
+        let res = if self.cpu_only {
+            w.run::<Unquantized<f32, _>>(CpuDevice)
+        } else {
+            let dev = cuda_backend::Device::new(_device_id)?;
+            match self.dtype {
+                DTypeQ::Fp8 => w.run::<cuda_backend::quantization::Fp8ScalePerTensor>(dev),
+                DTypeQ::Fp8PerToken => w.run::<cuda_backend::quantization::Fp8ScalePerToken>(dev),
+                DTypeQ::F16 => w.run::<Unquantized<half::f16, _>>(dev),
+                DTypeQ::BF16 => w.run::<Unquantized<half::bf16, _>>(dev),
+                DTypeQ::F32 => w.run::<Unquantized<f32, _>>(dev),
+                DTypeQ::Q4_0
+                | DTypeQ::Q4_1
+                | DTypeQ::Q5_0
+                | DTypeQ::Q5_1
+                | DTypeQ::Q8_0
+                | DTypeQ::Q8_1
+                | DTypeQ::Q2K
+                | DTypeQ::Q3K
+                | DTypeQ::Q4K
+                | DTypeQ::Q5K
+                | DTypeQ::Q6K
+                | DTypeQ::Q8K => Err(Error::msg(format!(
+                    "{:?} quantization is only supported on CPU",
+                    self.dtype
+                ))),
+            }
+        };
         #[cfg(all(feature = "vulkan", not(feature = "cuda")))]
-        {
+        let res = if self.cpu_only {
+            self.run_cpu(w)
+        } else {
             // The Vulkan backend computes in f32, f16 or bf16 (device
             // permitting). Quantized formats stay on CPU.
-            if !self.cpu_only {
-                match self.dtype {
-                    DTypeQ::F32 => {
-                        let dev = vulkan_backend::Device::new(_device_id)?;
-                        w.run::<Unquantized<f32, _>>(dev)?;
-                        return Ok(());
-                    }
-                    DTypeQ::F16 => {
-                        let dev = vulkan_backend::Device::new(_device_id)?;
-                        if !dev.supports_f16() {
-                            return Err(Error::msg("vulkan device does not support f16"));
-                        }
-                        w.run::<Unquantized<half::f16, _>>(dev)?;
-                        return Ok(());
-                    }
-                    DTypeQ::BF16 => {
-                        let dev = vulkan_backend::Device::new(_device_id)?;
-                        if !dev.supports_bf16() {
-                            return Err(Error::msg("vulkan device does not support bf16"));
-                        }
-                        w.run::<Unquantized<half::bf16, _>>(dev)?;
-                        return Ok(());
-                    }
-                    _ => {}
+            match self.dtype {
+                DTypeQ::F32 => {
+                    let dev = vulkan_backend::Device::new(_device_id)?;
+                    w.run::<Unquantized<f32, _>>(dev)
                 }
+                DTypeQ::F16 => {
+                    let dev = vulkan_backend::Device::new(_device_id)?;
+                    if !dev.supports_f16() {
+                        Err(Error::msg("vulkan device does not support f16"))
+                    } else {
+                        w.run::<Unquantized<half::f16, _>>(dev)
+                    }
+                }
+                DTypeQ::BF16 => {
+                    let dev = vulkan_backend::Device::new(_device_id)?;
+                    if !dev.supports_bf16() {
+                        Err(Error::msg("vulkan device does not support bf16"))
+                    } else {
+                        w.run::<Unquantized<half::bf16, _>>(dev)
+                    }
+                }
+                _ => self.run_cpu(w),
             }
-        }
+        };
         #[cfg(all(feature = "metal", not(any(feature = "cuda", feature = "vulkan"))))]
-        {
+        let res = if self.cpu_only {
+            self.run_cpu(w)
+        } else {
             // The Metal backend computes in f32 with f16 or bf16 storage also
             // supported. Quantized formats stay on CPU.
-            if !self.cpu_only {
-                match self.dtype {
-                    DTypeQ::F32 => {
-                        let dev = metal_backend::Device::new(_device_id)?;
-                        w.run::<Unquantized<f32, _>>(dev)?;
-                        return Ok(());
-                    }
-                    DTypeQ::F16 => {
-                        let dev = metal_backend::Device::new(_device_id)?;
-                        w.run::<Unquantized<half::f16, _>>(dev)?;
-                        return Ok(());
-                    }
-                    DTypeQ::BF16 => {
-                        let dev = metal_backend::Device::new(_device_id)?;
-                        w.run::<Unquantized<half::bf16, _>>(dev)?;
-                        return Ok(());
-                    }
-                    _ => {}
+            match self.dtype {
+                DTypeQ::F32 => {
+                    let dev = metal_backend::Device::new(_device_id)?;
+                    w.run::<Unquantized<f32, _>>(dev)
                 }
+                DTypeQ::F16 => {
+                    let dev = metal_backend::Device::new(_device_id)?;
+                    w.run::<Unquantized<half::f16, _>>(dev)
+                }
+                DTypeQ::BF16 => {
+                    let dev = metal_backend::Device::new(_device_id)?;
+                    w.run::<Unquantized<half::bf16, _>>(dev)
+                }
+                _ => self.run_cpu(w),
             }
-        }
+        };
         #[cfg(all(
             feature = "webgpu",
             not(any(feature = "cuda", feature = "vulkan", feature = "metal"))
         ))]
-        {
+        let res = if !self.cpu_only && self.dtype == DTypeQ::F32 {
             // The WebGPU backend computes in f32; other formats stay on CPU.
-            if !self.cpu_only && self.dtype == DTypeQ::F32 {
-                let dev = webgpu_backend::Device::new(_device_id)?;
-                w.run::<Unquantized<f32, _>>(dev)?;
-                return Ok(());
-            }
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            match self.dtype {
-                DTypeQ::Fp8 | DTypeQ::Fp8PerToken => {
-                    return Err(Error::msg("FP8 quantization is not supported on CPU"));
-                }
-                DTypeQ::F32 => w.run::<Unquantized<f32, _>>(CpuDevice)?,
-                DTypeQ::Q4_0 => w.run::<crate::quantized::Q40F32>(CpuDevice)?,
-                DTypeQ::Q4_1 => w.run::<crate::quantized::Q41F32>(CpuDevice)?,
-                DTypeQ::Q5_0 => w.run::<crate::quantized::Q50F32>(CpuDevice)?,
-                DTypeQ::Q5_1 => w.run::<crate::quantized::Q51F32>(CpuDevice)?,
-                DTypeQ::Q8_0 => w.run::<crate::quantized::Q80F32>(CpuDevice)?,
-                DTypeQ::Q8_1 => w.run::<crate::quantized::Q81F32>(CpuDevice)?,
-                DTypeQ::Q2K => w.run::<crate::quantized::Q2kF32>(CpuDevice)?,
-                DTypeQ::Q3K => w.run::<crate::quantized::Q3kF32>(CpuDevice)?,
-                DTypeQ::Q4K => w.run::<crate::quantized::Q4kF32>(CpuDevice)?,
-                DTypeQ::Q5K => w.run::<crate::quantized::Q5kF32>(CpuDevice)?,
-                DTypeQ::Q6K => w.run::<crate::quantized::Q6kF32>(CpuDevice)?,
-                DTypeQ::Q8K => w.run::<crate::quantized::Q8kF32>(CpuDevice)?,
-                DTypeQ::F16 | DTypeQ::BF16 => {
-                    return Err(Error::msg(format!(
-                        "{:?} is not yet supported on CPU",
-                        self.dtype
-                    )));
-                }
-            };
-        }
-        Ok(())
+            let dev = webgpu_backend::Device::new(_device_id)?;
+            w.run::<Unquantized<f32, _>>(dev)
+        } else {
+            self.run_cpu(w)
+        };
+        #[cfg(not(any(
+            feature = "cuda",
+            feature = "vulkan",
+            feature = "metal",
+            feature = "webgpu"
+        )))]
+        let res = self.run_cpu(w);
+        res
     }
 }
 
