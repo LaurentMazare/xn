@@ -42,6 +42,18 @@ struct ModuleCache {
     rope: Option<Arc<cudarc::driver::CudaModule>>,
 }
 
+/// Host-to-device upload mode, see [`Device::capture_record_begin`].
+mod htod_mode {
+    pub const PASSTHROUGH: u8 = 0;
+    pub const RECORD: u8 = 1;
+    pub const REPLAY: u8 = 2;
+}
+
+/// Device buffers holding recorded host uploads, keyed by element type name
+/// and content bytes. Values are `CudaSlice<T>` boxed as `Any`.
+type HtodCache =
+    Mutex<std::collections::HashMap<(&'static str, Vec<u8>), Box<dyn std::any::Any + Send>>>;
+
 pub struct DeviceInner {
     cuda: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -50,6 +62,14 @@ pub struct DeviceInner {
     curand: Mutex<CudaRng>,
     /// Cache for loaded PTX modules
     modules: Mutex<ModuleCache>,
+    /// Host-to-device upload mode used by CUDA-graph capture, one of the
+    /// [`htod_mode`] constants.
+    htod_mode: std::sync::atomic::AtomicU8,
+    /// Device-side copies of host uploads recorded in [`htod_mode::RECORD`].
+    /// In [`htod_mode::REPLAY`] (i.e. while capturing) uploads are served
+    /// from these buffers through device-to-device copies, which are legal
+    /// inside a capture while a pageable host copy is not.
+    htod_cache: HtodCache,
 }
 
 pub struct CudaEvent {
@@ -78,6 +98,28 @@ impl CudaEvent {
     }
 }
 
+/// An instantiated CUDA graph, see [`Device::capture_begin`]. Replaying it
+/// re-runs the captured kernels against the buffer addresses they were
+/// captured with: refresh the input buffers in place, [`CaptureGraph::launch`],
+/// then read the output buffers.
+pub struct CaptureGraph(cudarc::driver::CudaGraph);
+
+// SAFETY: `CudaGraph` is not auto-Send because it holds raw
+// `CUgraph`/`CUgraphExec` handles, but those are plain context-scoped driver
+// handles with no thread affinity; cudarc re-binds the CUDA context on every
+// call. `CaptureGraph` is deliberately not `Sync`: `launch` must not be
+// called concurrently from two threads.
+unsafe impl Send for CaptureGraph {}
+
+impl CaptureGraph {
+    /// Enqueue a replay of the captured work on the stream it was captured
+    /// from. Like any kernel launch this is asynchronous.
+    pub fn launch(&self) -> Result<()> {
+        self.0.launch()?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct Device(Arc<DeviceInner>);
 
@@ -97,7 +139,17 @@ impl std::fmt::Debug for Device {
 impl Device {
     pub fn new(ordinal: usize) -> Result<Self> {
         let cuda = cudarc::driver::CudaContext::new(ordinal)?;
-        let stream = cuda.default_stream();
+        // A proper (non-legacy) stream: the NULL default stream cannot be
+        // captured into a CUDA graph. All work goes through this one stream,
+        // so the synchronization semantics are unchanged.
+        let stream = cuda.new_stream()?;
+        // Creating a stream flips cudarc into multi-stream mode, which turns
+        // on per-slice event waits; on our single stream they are pure
+        // overhead, and events recorded before a CUDA-graph capture would
+        // make the capture fail with CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
+        // SAFETY: all work runs on the single stream created above, so
+        // stream-order already synchronizes every use.
+        unsafe { cuda.disable_event_tracking() };
         let blas = cudarc::cublas::CudaBlas::new(stream.clone())?;
         let blas_lt = cublaslt::CudaBlasLT::new(stream.clone())?;
         let curand = cudarc::curand::CudaRng::new(299792458, stream.clone())?;
@@ -108,11 +160,144 @@ impl Device {
             blas_lt,
             modules: Mutex::new(Default::default()),
             curand: Mutex::new(CudaRng(curand)),
+            htod_mode: std::sync::atomic::AtomicU8::new(0),
+            htod_cache: Mutex::new(std::collections::HashMap::new()),
         })))
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Host-to-device upload that stays legal inside a CUDA-graph capture.
+    ///
+    /// In passthrough mode this is a plain [`CudaStream::clone_htod`]. In
+    /// record mode (between [`Device::capture_record_begin`] and
+    /// [`Device::capture_record_end`]) every upload also stores a persistent
+    /// device-side copy keyed by its content. In replay mode (between
+    /// [`Device::capture_begin`] and [`Device::capture_end`], i.e. while the
+    /// stream is capturing) the upload is served without touching host
+    /// memory: an in-capture allocation filled by a device-to-device copy
+    /// from the recorded buffer; content that was not recorded beforehand is
+    /// an error. This is only correct for uploads whose content is identical
+    /// between the record pass and every replay of the captured graph
+    /// (kernel shape/stride descriptors, position tables, masks, ...).
+    pub(crate) fn cached_htod<T: cudarc::driver::DeviceRepr + Copy + Send + 'static>(
+        &self,
+        v: &[T],
+    ) -> Result<CudaSlice<T>> {
+        use std::sync::atomic::Ordering;
+        let mode = self.htod_mode.load(Ordering::Relaxed);
+        if mode == htod_mode::PASSTHROUGH {
+            return Ok(self.stream.clone_htod(v)?);
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
+        };
+        let key = (std::any::type_name::<T>(), bytes.to_vec());
+        let mut cache = self.htod_cache.lock().unwrap();
+        if mode == htod_mode::RECORD && !cache.contains_key(&key) {
+            let staged = self.stream.clone_htod(v)?;
+            cache.insert(key.clone(), Box::new(staged));
+        }
+        let staged = match cache.get(&key) {
+            None => crate::bail!(
+                "htod upload of unrecorded content during CUDA graph capture ({} x{})",
+                std::any::type_name::<T>(),
+                v.len()
+            ),
+            Some(staged) => match staged.downcast_ref::<CudaSlice<T>>() {
+                None => crate::bail!("htod cache type confusion"),
+                Some(staged) => staged,
+            },
+        };
+        // Both record and replay take this path so that the record pass
+        // exercises exactly what the graph will capture.
+        let mut out = unsafe { self.stream.alloc::<T>(v.len()) }?;
+        self.stream.memcpy_dtod(staged, &mut out)?;
+        Ok(out)
+    }
+
+    fn set_htod_mode(&self, from: u8, to: u8, op: &str) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        match self.htod_mode.compare_exchange(from, to, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => Ok(()),
+            Err(cur) => {
+                crate::bail!("{op}: unexpected htod mode {cur} (record/capture calls unbalanced?)")
+            }
+        }
+    }
+
+    /// Start recording host uploads in the device-side cache, see
+    /// [`Device::cached_htod`]. Run the exact workload to be captured once
+    /// under record mode before capturing it with [`Device::capture_begin`];
+    /// the recorded work executes normally.
+    pub fn capture_record_begin(&self) -> Result<()> {
+        self.set_htod_mode(htod_mode::PASSTHROUGH, htod_mode::RECORD, "capture_record_begin")
+    }
+
+    /// Stop recording host uploads.
+    pub fn capture_record_end(&self) -> Result<()> {
+        self.set_htod_mode(htod_mode::RECORD, htod_mode::PASSTHROUGH, "capture_record_end")
+    }
+
+    /// Begin capturing the device stream into a CUDA graph. The captured work
+    /// is recorded, not executed. Requires a prior record pass over the same
+    /// workload so that host uploads can be served from device buffers (see
+    /// [`Device::cached_htod`]); an upload of unrecorded content fails, in
+    /// which case the capture should be discarded with
+    /// [`Device::capture_abort`].
+    ///
+    /// The usual pattern, with all graph inputs and outputs living in
+    /// long-lived tensors that are refreshed in place:
+    /// 1. `capture_record_begin()`; run the workload; `capture_record_end()`.
+    /// 2. `capture_begin()`; run the workload again; `graph = capture_end()`.
+    /// 3. Per step: refresh the inputs, `graph.launch()`, read the outputs.
+    ///
+    /// Tensors created before the capture must not be dropped inside it (a
+    /// free of non-captured memory is invalid during capture), and tensors
+    /// created inside must not escape it.
+    pub fn capture_begin(&self) -> Result<()> {
+        self.set_htod_mode(htod_mode::PASSTHROUGH, htod_mode::REPLAY, "capture_begin")?;
+        let mode = cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED;
+        if let Err(err) = self.stream.begin_capture(mode) {
+            self.htod_mode.store(htod_mode::PASSTHROUGH, std::sync::atomic::Ordering::Relaxed);
+            Err(err)?
+        }
+        Ok(())
+    }
+
+    /// End the capture and instantiate the graph.
+    pub fn capture_end(&self) -> Result<CaptureGraph> {
+        self.htod_mode.store(htod_mode::PASSTHROUGH, std::sync::atomic::Ordering::Relaxed);
+        let flags =
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+        match self.stream.end_capture(flags)? {
+            None => crate::bail!("CUDA graph capture ended without a graph"),
+            Some(graph) => Ok(CaptureGraph(graph)),
+        }
+    }
+
+    /// Abort an in-progress capture, discarding the partially captured graph.
+    /// Errors from the discarded capture are ignored.
+    pub fn capture_abort(&self) {
+        self.htod_mode.store(htod_mode::PASSTHROUGH, std::sync::atomic::Ordering::Relaxed);
+        let flags =
+            cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+        let _ = self.stream.end_capture(flags);
+    }
+
+    /// Number of distinct host uploads recorded for capture replay.
+    pub fn capture_cache_len(&self) -> usize {
+        self.htod_cache.lock().unwrap().len()
+    }
+
+    /// Drop every recorded host upload. The device-to-device copies baked
+    /// into a captured graph read from these buffers on every replay, so this
+    /// must only be called once no [`CaptureGraph`] captured from this cache
+    /// will be launched again.
+    pub fn capture_cache_clear(&self) {
+        self.htod_cache.lock().unwrap().clear();
     }
 
     pub fn event(&self) -> Result<CudaEvent> {
@@ -577,7 +762,7 @@ impl crate::Backend for Device {
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, dev: &Self) -> Result<Self::Storage<T>> {
-        let data = dev.stream.clone_htod(&v)?;
+        let data = dev.cached_htod(&v)?;
         Ok(Storage { data, device: dev.clone() })
     }
 
@@ -1096,7 +1281,7 @@ impl crate::Backend for Device {
 
         let num_dims = n;
         let info: Vec<usize> = dims.iter().chain(src_strides.iter()).copied().collect();
-        let info_dev = dst.device.stream.clone_htod(&info)?;
+        let info_dev = dst.device.cached_htod(&info)?;
 
         let kname = kernel_name::<T>("copy_strided");
         let func = dst.device.get_func(&kname, PTXModule::Layout)?;
@@ -1340,7 +1525,7 @@ impl crate::Backend for Device {
         let dims: [usize; 3] = [outer_size, inner_size, dim_size];
         let strides: [usize; 3] = [dim_size * inner_size, 1, inner_size];
         let info: Vec<usize> = dims.iter().chain(strides.iter()).copied().collect();
-        let info_dev = dst.device.stream.clone_htod(&info)?;
+        let info_dev = dst.device.cached_htod(&info)?;
 
         let kname = kernel_name::<T>("fast_max");
         let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
@@ -1379,7 +1564,7 @@ impl crate::Backend for Device {
         let dims: [usize; 3] = [outer_size, inner_size, dim_size];
         let strides: [usize; 3] = [dim_size * inner_size, 1, inner_size];
         let info: Vec<usize> = dims.iter().chain(strides.iter()).copied().collect();
-        let info_dev = dst.device.stream.clone_htod(&info)?;
+        let info_dev = dst.device.cached_htod(&info)?;
 
         let kname = kernel_name::<T>("fast_min");
         let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
@@ -1418,7 +1603,7 @@ impl crate::Backend for Device {
         let dims: [usize; 3] = [outer_size, inner_size, dim_size];
         let strides: [usize; 3] = [dim_size * inner_size, 1, inner_size];
         let info: Vec<usize> = dims.iter().chain(strides.iter()).copied().collect();
-        let info_dev = dst.device.stream.clone_htod(&info)?;
+        let info_dev = dst.device.cached_htod(&info)?;
 
         let kname = kernel_name::<T>("fast_argmin");
         let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
@@ -1454,7 +1639,7 @@ impl crate::Backend for Device {
         let dims: [usize; 3] = [outer_size, inner_size, dim_size];
         let strides: [usize; 3] = [dim_size * inner_size, 1, inner_size];
         let info: Vec<usize> = dims.iter().chain(strides.iter()).copied().collect();
-        let info_dev = dst.device.stream.clone_htod(&info)?;
+        let info_dev = dst.device.cached_htod(&info)?;
 
         let kname = kernel_name::<T>("fast_argmax");
         let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
@@ -1493,7 +1678,7 @@ impl crate::Backend for Device {
         let dims: [usize; 3] = [outer_size, inner_size, dim_size];
         let strides: [usize; 3] = [dim_size * inner_size, 1, inner_size];
         let info: Vec<usize> = dims.iter().chain(strides.iter()).copied().collect();
-        let info_dev = dst.device.stream.clone_htod(&info)?;
+        let info_dev = dst.device.cached_htod(&info)?;
 
         let kname = kernel_name::<T>("fast_sum");
         let func = dst.device.get_func(&kname, PTXModule::Reduce)?;
@@ -1649,7 +1834,7 @@ impl crate::Backend for Device {
                 .chain(rhs_strides.iter())
                 .copied()
                 .collect();
-            let info_dev = dst.device.stream.clone_htod(&info)?;
+            let info_dev = dst.device.cached_htod(&info)?;
 
             let kname = format!("broadcast_{}_strided_{}", op_name, T::DTYPE.cuda_name());
             let func = dst.device.get_func(&kname, PTXModule::Broadcast)?;
