@@ -30,7 +30,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wgpu = { workspace = true, optional = true }
-xla = { git = "https://github.com/LaurentMazare/xla-rs", branch = "pjrt-send-sync", optional = true }
+xla = { git = "https://github.com/LaurentMazare/xla-rs", optional = true }
 yoke = { workspace = true }
 
 [dev-dependencies]

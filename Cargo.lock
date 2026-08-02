@@ -3871,7 +3871,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 [[package]]
 name = "xla"
 version = "0.3.2"
-source = "git+https://github.com/LaurentMazare/xla-rs?branch=pjrt-send-sync#090153969e12bd913be76410f18c99564cbdda1d"
+source = "git+https://github.com/LaurentMazare/xla-rs#8cd9f3e1c4ffc3c52df9185005611320c7594fd5"
 dependencies = [
  "bindgen",
  "cc",
