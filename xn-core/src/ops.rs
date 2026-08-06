@@ -248,6 +248,15 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         Ok(result)
     }
 
+    /// Fused snake activation: y = x + beta_scale[c] * sin(alpha[c] * x)^2
+    /// self has shape (b, c, l); alpha and beta_scale have c elements each.
+    #[tracing::instrument(skip_all)]
+    pub fn snake(&self, alpha: &Self, beta_scale: &Self) -> Result<Self> {
+        let result = unsafe { Tensor::alloc_uninit(self.shape.clone(), self.device()) }?;
+        result.snake_(self, alpha, beta_scale)?;
+        Ok(result)
+    }
+
     #[tracing::instrument(skip_all)]
     pub fn layer_norm(&self, weight: &Self, bias: &Self, eps: f32) -> Result<Self> {
         self.layer_norm_rm(weight, bias, eps, true)

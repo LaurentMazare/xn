@@ -569,6 +569,18 @@ impl crate::Backend for Device {
         dst.device.dispatch(&format!("softmax_{dt}"), &[src.buffer, dst.buffer], &push, d as u32)
     }
 
+    fn snake<T: WithDTypeF>(
+        _dst: &mut Self::Storage<T>,
+        _src: &Self::Storage<T>,
+        _alpha: &Self::Storage<T>,
+        _beta_scale: &Self::Storage<T>,
+        _channels: usize,
+        _row_len: usize,
+        _numel: usize,
+    ) -> Result<()> {
+        crate::bail!("snake is not implemented for this backend")
+    }
+
     fn rms_norm<T: WithDTypeF>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,

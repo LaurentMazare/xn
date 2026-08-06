@@ -184,6 +184,19 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         eps: f32,
     ) -> Result<()>;
 
+    /// Fused snake activation: dst = x + beta_scale[c] * sin(alpha[c] * x)^2
+    /// src/dst are contiguous with `row_len` elements per channel row and
+    /// `channels` channels; alpha and beta_scale hold one value per channel.
+    fn snake<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        alpha: &Self::Storage<T>,
+        beta_scale: &Self::Storage<T>,
+        channels: usize,
+        row_len: usize,
+        numel: usize,
+    ) -> Result<()>;
+
     /// Layer normalization.
     /// Normalizes over the last dimension using mean and variance.
     /// When `remove_mean` is true: y = (x - mean) / sqrt(variance + eps) * weight + bias
