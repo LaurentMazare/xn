@@ -1507,6 +1507,30 @@ impl crate::Backend for Device {
         Ok(())
     }
 
+    fn snake<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        alpha: &Self::Storage<T>,
+        beta_scale: &Self::Storage<T>,
+        channels: usize,
+        row_len: usize,
+        numel: usize,
+    ) -> Result<()> {
+        let kname = kernel_name::<T>("snake");
+        let func = dst.device.get_func(&kname, PTXModule::Broadcast)?;
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        let mut launch_args = dst.device.stream.launch_builder(&func);
+        launch_args.arg(&numel);
+        launch_args.arg(&channels);
+        launch_args.arg(&row_len);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&*alpha.data);
+        launch_args.arg(&*beta_scale.data);
+        launch_args.arg(&mut *dst.data);
+        unsafe { launch_args.launch(cfg) }?;
+        Ok(())
+    }
+
     fn layer_norm<T: WithDTypeF>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,

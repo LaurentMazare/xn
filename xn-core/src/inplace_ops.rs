@@ -376,6 +376,41 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         Ok(())
     }
 
+    /// Fused snake activation: self = src + beta_scale[c] * sin(alpha[c] * src)^2
+    /// src has shape (b, c, l); alpha and beta_scale have c elements each
+    /// (trailing singleton dims are accepted, e.g. (1, c, 1)).
+    pub fn snake_(&self, src: &Self, alpha: &Self, beta_scale: &Self) -> Result<()> {
+        self.check_not_same_storage(src, "snake_")?;
+        self.check_not_same_storage(alpha, "snake_")?;
+        self.check_not_same_storage(beta_scale, "snake_")?;
+        check_same_shape(&self.shape, &src.shape, "snake_ src")?;
+        let (_b, channels, row_len) = match *self.shape.dims() {
+            [b, c, l] => (b, c, l),
+            _ => crate::bail!("snake_ expects a 3D tensor, got shape {:?}", self.shape()),
+        };
+        if alpha.elem_count() != channels || beta_scale.elem_count() != channels {
+            crate::bail!(
+                "snake_ expects alpha/beta_scale with {channels} elements, got {:?} and {:?}",
+                alpha.shape(),
+                beta_scale.shape()
+            );
+        }
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let alpha_data = alpha.storage()?;
+        let beta_scale_data = beta_scale.storage()?;
+        B::snake(
+            &mut *dst,
+            &*src_data,
+            &*alpha_data,
+            &*beta_scale_data,
+            channels,
+            row_len,
+            self.elem_count(),
+        )?;
+        Ok(())
+    }
+
     pub fn layer_norm_(
         &self,
         src: &Self,

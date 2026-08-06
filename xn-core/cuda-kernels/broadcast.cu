@@ -369,3 +369,49 @@ BROADCAST_ALL_OPS(__half, f16)
 BROADCAST_ALL_OPS(float, f32)
 BROADCAST_ALL_OPS(int64_t, i64)
 BROADCAST_ALL_OPS(uint8_t, u8)
+
+// ============================================================================
+// Fused snake activation: dst = x + beta_scale[c] * sin(alpha[c] * x)^2
+// Operates on contiguous (b, c, l) tensors with per-channel alpha/beta_scale.
+// ============================================================================
+
+template<typename T>
+__device__ void snake(
+    const size_t numel,
+    const size_t channels,
+    const size_t row_len,
+    const T *src,
+    const T *alpha,
+    const T *beta_scale,
+    T *dst
+) {
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    const size_t c = (idx / row_len) % channels;
+    const float x = to_float(src[idx]);
+    const float s = sinf(to_float(alpha[c]) * x);
+    dst[idx] = from_float<T>(x + to_float(beta_scale[c]) * s * s);
+}
+
+#define SNAKE_KERNEL(TYPENAME, RUST_NAME) \
+extern "C" __global__ void snake_##RUST_NAME( \
+    const size_t numel, \
+    const size_t channels, \
+    const size_t row_len, \
+    const TYPENAME *src, \
+    const TYPENAME *alpha, \
+    const TYPENAME *beta_scale, \
+    TYPENAME *dst \
+) { \
+    snake<TYPENAME>(numel, channels, row_len, src, alpha, beta_scale, dst); \
+}
+
+#if __CUDA_ARCH__ >= 800
+SNAKE_KERNEL(__nv_bfloat16, bf16)
+#endif
+
+#if __CUDA_ARCH__ >= 530
+SNAKE_KERNEL(__half, f16)
+#endif
+
+SNAKE_KERNEL(float, f32)

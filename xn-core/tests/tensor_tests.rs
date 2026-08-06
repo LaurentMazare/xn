@@ -1787,3 +1787,47 @@ fn test_matmul_batched_strided_impl<B: Backend>(dev: &B) -> Result<()> {
     Ok(())
 }
 test_all_backends!(test_matmul_batched_strided, test_matmul_batched_strided_impl);
+
+// Fused snake activation: check against the composed op sequence it replaces
+// (broadcast_mul -> sin -> sqr -> broadcast_mul -> add) and a host reference.
+fn test_snake_impl<B: Backend>(device: &B) -> Result<()> {
+    let (b, c, l) = (2, 3, 17);
+    let xs: Vec<f32> = (0..b * c * l)
+        .map(|i| ((i as f32) * 0.37 - 10.0) * ((i % 7) as f32 * 0.21 + 0.1))
+        .collect();
+    let alpha: Vec<f32> = (0..c).map(|i| 0.5 + i as f32 * 0.8).collect();
+    let beta_scale: Vec<f32> = (0..c).map(|i| 1.7 - i as f32 * 0.4).collect();
+
+    let xs_t: Tensor<f32, B> = Tensor::from_vec(xs.clone(), vec![b, c, l], device)?;
+    let alpha_t: Tensor<f32, B> = Tensor::from_vec(alpha.clone(), vec![1, c, 1], device)?;
+    let beta_t: Tensor<f32, B> = Tensor::from_vec(beta_scale.clone(), vec![1, c, 1], device)?;
+
+    let fused = xs_t.snake(&alpha_t, &beta_t)?.to_vec()?;
+    let sin2 = xs_t.broadcast_mul(&alpha_t)?.sin()?.sqr()?;
+    let composed = xs_t.add(&sin2.broadcast_mul(&beta_t)?)?.to_vec()?;
+
+    for (i, (f, cm)) in fused.iter().zip(composed.iter()).enumerate() {
+        assert!((f - cm).abs() <= 1e-5 * cm.abs().max(1.0), "idx {i}: fused {f} composed {cm}");
+        let ch = (i / l) % c;
+        let x = xs[i];
+        let s = (alpha[ch] * x).sin();
+        let reference = x + beta_scale[ch] * s * s;
+        assert!(
+            (f - reference).abs() <= 1e-5 * reference.abs().max(1.0),
+            "idx {i}: fused {f} reference {reference}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_snake_cpu() -> Result<()> {
+    test_snake_impl(&xn::CPU)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_snake_cuda() -> Result<()> {
+    let device = xn::cuda_backend::Device::new(0)?;
+    test_snake_impl(&device)
+}
