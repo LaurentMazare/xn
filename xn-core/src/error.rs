@@ -83,6 +83,10 @@ pub enum Error {
     #[cfg(feature = "cuda")]
     #[error(transparent)]
     CublasLt(cudarc::cublaslt::result::CublasError),
+
+    #[cfg(feature = "cuda")]
+    #[error(transparent)]
+    Cudnn(cudarc::cudnn::CudnnError),
 }
 
 #[cfg(feature = "cuda")]
@@ -103,6 +107,13 @@ impl From<cudarc::curand::result::CurandError> for Error {
 impl From<cudarc::cublas::result::CublasError> for Error {
     fn from(value: cudarc::cublas::result::CublasError) -> Self {
         Self::Cublas(value).bt()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl From<cudarc::cudnn::CudnnError> for Error {
+    fn from(value: cudarc::cudnn::CudnnError) -> Self {
+        Self::Cudnn(value).bt()
     }
 }
 

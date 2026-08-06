@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 mod cublaslt;
+mod cudnn_conv;
 mod kernels;
 pub mod quantization;
 
@@ -59,6 +60,8 @@ pub struct DeviceInner {
     stream: Arc<CudaStream>,
     blas: cudarc::cublas::CudaBlas,
     pub(crate) blas_lt: cublaslt::CudaBlasLT,
+    /// Lazily-initialized cuDNN handle used by the XN_CUDNN=1 conv path.
+    cudnn: cudnn_conv::CudnnCtx,
     curand: Mutex<CudaRng>,
     /// Cache for loaded PTX modules
     modules: Mutex<ModuleCache>,
@@ -158,6 +161,7 @@ impl Device {
             stream,
             blas,
             blas_lt,
+            cudnn: cudnn_conv::CudnnCtx::new(),
             modules: Mutex::new(Default::default()),
             curand: Mutex::new(CudaRng(curand)),
             htod_mode: std::sync::atomic::AtomicU8::new(0),
@@ -2038,6 +2042,29 @@ impl crate::Backend for Device {
         dilation: usize,
         groups: usize,
     ) -> Result<bool> {
+        if cudnn_conv::enabled() && groups == 1 && T::DTYPE == DType::F32 {
+            let dst = unsafe { &mut *(dst as *mut Storage<T> as *mut Storage<f32>) };
+            let src = unsafe { &*(src as *const Storage<T> as *const Storage<f32>) };
+            let kernel = unsafe { &*(kernel as *const Storage<T> as *const Storage<f32>) };
+            let bias = bias
+                .map(|b| unsafe { &*(&*b.data as *const CudaSlice<T> as *const CudaSlice<f32>) });
+            cudnn_conv::conv1d_f32(
+                dst,
+                src,
+                kernel,
+                bias,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            )?;
+            return Ok(bias.is_some());
+        }
         if groups == 1 {
             conv1d_im2col(
                 dst,
@@ -2091,6 +2118,31 @@ impl crate::Backend for Device {
         output_padding: usize,
         groups: usize,
     ) -> Result<bool> {
+        if cudnn_conv::enabled()
+            && groups == 1
+            && padding == 0
+            && output_padding == 0
+            && T::DTYPE == DType::F32
+        {
+            let dst = unsafe { &mut *(dst as *mut Storage<T> as *mut Storage<f32>) };
+            let src = unsafe { &*(src as *const Storage<T> as *const Storage<f32>) };
+            let kernel = unsafe { &*(kernel as *const Storage<T> as *const Storage<f32>) };
+            cudnn_conv::conv_transpose1d_f32(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+            )?;
+            // The backward-data path has no fused bias epilogue; let the
+            // caller apply it.
+            return Ok(false);
+        }
         let can_use_col2im = groups == 1 && padding == 0 && output_padding == 0;
         if can_use_col2im {
             conv_transpose1d_col2im(
