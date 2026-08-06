@@ -1935,6 +1935,7 @@ impl crate::Backend for Device {
                 dst,
                 src,
                 kernel,
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -1992,6 +1993,7 @@ impl crate::Backend for Device {
                 dst,
                 src,
                 kernel,
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -2019,6 +2021,111 @@ impl crate::Backend for Device {
             )
         }
     }
+
+    fn conv1d_with_bias<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        if groups == 1 {
+            conv1d_im2col(
+                dst,
+                src,
+                kernel,
+                bias.map(|b| &*b.data),
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            )?;
+            Ok(bias.is_some())
+        } else {
+            conv1d_direct(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            )?;
+            Ok(false)
+        }
+    }
+
+    fn conv_transpose1d_with_bias<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        let can_use_col2im = groups == 1 && padding == 0 && output_padding == 0;
+        if can_use_col2im {
+            conv_transpose1d_col2im(
+                dst,
+                src,
+                kernel,
+                bias.map(|b| &*b.data),
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+            )?;
+            Ok(bias.is_some())
+        } else {
+            conv_transpose1d_direct(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                output_padding,
+                groups,
+            )?;
+            Ok(false)
+        }
+    }
 }
 
 // ============================================================================
@@ -2029,6 +2136,7 @@ fn conv1d_im2col<T: WithDTypeF>(
     dst: &mut Storage<T>,
     src: &Storage<T>,
     kernel: &Storage<T>,
+    bias: Option<&CudaSlice<T>>,
     batch: usize,
     in_channels: usize,
     out_channels: usize,
@@ -2085,8 +2193,12 @@ fn conv1d_im2col<T: WithDTypeF>(
     // Which gives us result in row-major as [L_out, out_channels]
     conv1d_gemm(&dst.device, &col, &*kernel.data, &mut result, batch, out_length, out_channels, k)?;
 
-    // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out]
-    let kname = format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name());
+    // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out],
+    // fusing the per-channel bias into the store when provided.
+    let kname = match bias {
+        Some(_) => format!("transpose_blc_bcl_bias_{}", T::DTYPE.cuda_name()),
+        None => format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name()),
+    };
     let func = dst.device.get_func(&kname, PTXModule::Conv)?;
     let cfg = LaunchConfig {
         grid_dim: (
@@ -2102,6 +2214,9 @@ fn conv1d_im2col<T: WithDTypeF>(
     launch_args.arg(&out_length);
     launch_args.arg(&out_channels);
     launch_args.arg(&result);
+    if let Some(bias) = bias {
+        launch_args.arg(bias);
+    }
     launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
@@ -2349,6 +2464,7 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     dst: &mut Storage<T>,
     src: &Storage<T>,
     kernel: &Storage<T>,
+    bias: Option<&CudaSlice<T>>,
     batch: usize,
     in_channels: usize,
     out_channels: usize,
@@ -2407,10 +2523,13 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
         in_channels,
     )?;
 
-    // Step 3: Col2Im transformation
+    // Step 3: Col2Im transformation, fusing the per-channel bias when provided
     // col: [B, L_in, C_out * K] = [B, L_in, C_out, K]
     // output: [B, C_out, L_out]
-    let kname = format!("col2im1d_{}", T::DTYPE.cuda_name());
+    let kname = match bias {
+        Some(_) => format!("col2im1d_bias_{}", T::DTYPE.cuda_name()),
+        None => format!("col2im1d_{}", T::DTYPE.cuda_name()),
+    };
     let func = dst.device.get_func(&kname, PTXModule::Conv)?;
     let cfg = LaunchConfig {
         grid_dim: (
@@ -2429,6 +2548,9 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     launch_args.arg(&kernel_size);
     launch_args.arg(&stride);
     launch_args.arg(&col);
+    if let Some(bias) = bias {
+        launch_args.arg(bias);
+    }
     launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
