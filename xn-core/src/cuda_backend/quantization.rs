@@ -372,11 +372,22 @@ impl Fp8Linear {
         let batch_dims = &dims[..rank - 1];
         // Flatten batch dims into M for 2D matmul.
         let xs = xs.reshape(((), k))?;
-        let xs_fp8 = match self.weight.scale_mode {
-            Fp8ScaleMode::PerTensor => Fp8Tensor::quantize(&xs)?,
-            Fp8ScaleMode::PerToken => Fp8Tensor::quantize_per_token(&xs)?,
+        let (m, _) = xs.dims2()?;
+        let n = self.weight.shape.dim(0)?;
+        let wk = self.weight.shape.dim(1)?;
+        // cublasLt fp8 matmuls need 16-aligned dims; unaligned shapes (the
+        // [text_card + 1, d] prefix-table fold at load, tiny head
+        // projections) fall back to a dequantized bf16 matmul.
+        let out = if m % 16 != 0 || n % 16 != 0 || wk % 16 != 0 {
+            let w: Tensor<bf16, Device> = self.weight.dequantize()?;
+            xs.matmul_t(&w)?
+        } else {
+            let xs_fp8 = match self.weight.scale_mode {
+                Fp8ScaleMode::PerTensor => Fp8Tensor::quantize(&xs)?,
+                Fp8ScaleMode::PerToken => Fp8Tensor::quantize_per_token(&xs)?,
+            };
+            xs_fp8.matmul_t(&self.weight)?
         };
-        let out = xs_fp8.matmul_t(&self.weight)?;
 
         // Restore batch dims: [...batch, N].
         let (_m, n) = out.dims2()?;
