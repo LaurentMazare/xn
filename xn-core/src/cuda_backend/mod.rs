@@ -2072,7 +2072,11 @@ impl crate::Backend for Device {
         dilation: usize,
         groups: usize,
     ) -> Result<bool> {
-        if cudnn_conv::enabled() && groups == 1 && T::DTYPE == DType::F32 {
+        if cudnn_conv::enabled()
+            && groups == 1
+            && T::DTYPE == DType::F32
+            && kernel_size >= cudnn_conv::min_kernel_size()
+        {
             let dst = unsafe { &mut *(dst as *mut Storage<T> as *mut Storage<f32>) };
             let src = unsafe { &*(src as *const Storage<T> as *const Storage<f32>) };
             let kernel = unsafe { &*(kernel as *const Storage<T> as *const Storage<f32>) };
@@ -2153,7 +2157,8 @@ impl crate::Backend for Device {
     ) -> Result<crate::backend::ConvFused> {
         // Only the im2col path owns its store epilogue, so it is the only one
         // that can fold anything in; cuDNN and the direct kernel own theirs.
-        let fusable = groups == 1 && !cudnn_conv::enabled() && bias.is_some();
+        let cudnn_takes_it = cudnn_conv::enabled() && kernel_size >= cudnn_conv::min_kernel_size();
+        let fusable = groups == 1 && !cudnn_takes_it && bias.is_some();
         let want = snake.is_some() || residual.is_some();
         if fusable && want {
             conv1d_im2col(
@@ -2215,6 +2220,7 @@ impl crate::Backend for Device {
         groups: usize,
     ) -> Result<bool> {
         if cudnn_conv::enabled()
+            && !cudnn_conv::fwd_only()
             && groups == 1
             && padding == 0
             && output_padding == 0

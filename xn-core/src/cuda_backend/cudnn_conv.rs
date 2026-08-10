@@ -153,6 +153,24 @@ fn nofuse_bias() -> bool {
     *ON.get_or_init(|| std::env::var("XN_CUDNN_NOFUSE").is_ok_and(|v| v == "1"))
 }
 
+/// XN_CUDNN_FWD_ONLY=1 keeps conv_transpose1d on xn's col2im path. cuDNN
+/// reaches the transposed convolution through ConvolutionBackwardData, whose
+/// legacy-API engines are far slower here than col2im+gemm.
+pub(crate) fn fwd_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XN_CUDNN_FWD_ONLY").is_ok_and(|v| v == "1"))
+}
+
+/// XN_CUDNN_MIN_K: smallest kernel size routed to cuDNN (default 1, i.e. all).
+/// Kernel-size-1 convolutions gain little from implicit gemm — their im2col is a
+/// cheap transpose — and routing them to cuDNN forfeits the fused epilogue.
+pub(crate) fn min_kernel_size() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("XN_CUDNN_MIN_K").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
+    })
+}
+
 fn math_type() -> sys::cudnnMathType_t {
     if tf32() {
         sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH
