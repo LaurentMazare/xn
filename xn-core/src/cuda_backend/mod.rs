@@ -665,6 +665,22 @@ static MM_BF16_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
 static MM_F32_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+static CONV_F32_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether f32 convolutions may use tf32 tensor cores. Defaults to true,
+/// matching PyTorch: convolutions tolerate the tf32 mantissa well and it is
+/// what cuDNN-based stacks (including torch itself) run by default, while
+/// f32 matmuls stay full precision unless
+/// [`set_gemm_reduced_precision_f32`] is called.
+pub fn conv_reduced_precision_f32() -> bool {
+    CONV_F32_REDUCED_PRECISION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_conv_reduced_precision_f32(b: bool) {
+    CONV_F32_REDUCED_PRECISION.store(b, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn gemm_reduced_precision_f32() -> bool {
     MM_F32_REDUCED_PRECISION.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2083,6 +2099,53 @@ fn conv1d_gemm<T: WithDTypeF>(
     }
 }
 
+/// f32 gemm for the convolution paths, through `cublasGemmEx` so the compute
+/// type can honor [`conv_reduced_precision_f32`] (the plain `cublasSgemm`
+/// wrapper has no compute-type parameter).
+unsafe fn conv_gemm_ex_f32(
+    device: &Device,
+    cfg: cudarc::cublas::GemmConfig<f32>,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    c: &mut CudaSlice<f32>,
+) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
+    use cudarc::cublas::sys;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    let compute_type = if conv_reduced_precision_f32() {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+    } else {
+        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+    };
+    let stream = device.stream.clone();
+    let (a, _guard_a) = a.device_ptr(&stream);
+    let (b, _guard_b) = b.device_ptr(&stream);
+    let (c, _guard_c) = c.device_ptr_mut(&stream);
+    unsafe {
+        cudarc::cublas::result::gemm_ex(
+            *device.blas.handle(),
+            cfg.transa,
+            cfg.transb,
+            cfg.m,
+            cfg.n,
+            cfg.k,
+            &cfg.alpha as *const f32 as *const _,
+            a as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.lda,
+            b as *const _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.ldb,
+            &cfg.beta as *const f32 as *const _,
+            c as *mut _,
+            sys::cudaDataType_t::CUDA_R_32F,
+            cfg.ldc,
+            compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    }
+}
+
 fn conv1d_gemm_f32(
     device: &Device,
     col: &CudaSlice<f32>,
@@ -2124,7 +2187,7 @@ fn conv1d_gemm_f32(
         transb: cublasOperation_t::CUBLAS_OP_N,
     };
     unsafe {
-        device.blas.gemm(gemm, kernel, col, result)?;
+        conv_gemm_ex_f32(device, gemm, kernel, col, result)?;
     }
     Ok(())
 }
@@ -2406,7 +2469,7 @@ fn conv_transpose1d_gemm_f32(
         transb: cublasOperation_t::CUBLAS_OP_N,
     };
     unsafe {
-        device.blas.gemm(gemm, kernel, src, result)?;
+        conv_gemm_ex_f32(device, gemm, kernel, src, result)?;
     }
     Ok(())
 }
