@@ -312,7 +312,14 @@ impl CudaBlasLT {
                 c_layout.handle,
                 c_layout.handle,
                 matmul_pref.handle,
-            )?
+            )
+            .map_err(|e| {
+                crate::Error::msg(format!(
+                    "cublasLt fp8 heuristic failed: {e:?} \
+                     (m={m} n={n} k={k} outer_vec={use_outer_vec} batch={:?})",
+                    batch.map(|b| b.count)
+                ))
+            })?
         };
 
         // Launch matmul.
