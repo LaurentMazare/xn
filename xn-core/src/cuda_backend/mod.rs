@@ -228,6 +228,12 @@ impl Device {
         }
     }
 
+    /// Whether the device stream is currently being captured into a CUDA
+    /// graph (between [`Device::capture_begin`] and [`Device::capture_end`]).
+    pub fn is_capturing(&self) -> bool {
+        self.htod_mode.load(std::sync::atomic::Ordering::Relaxed) == htod_mode::REPLAY
+    }
+
     /// Start recording host uploads in the device-side cache, see
     /// [`Device::cached_htod`]. Run the exact workload to be captured once
     /// under record mode before capturing it with [`Device::capture_begin`];
@@ -438,8 +444,22 @@ impl Device {
 
 /// CUDA storage that holds both the device data and a reference to the device.
 pub struct Storage<T: WithDType> {
-    pub data: CudaSlice<T>,
+    pub data: std::mem::ManuallyDrop<CudaSlice<T>>,
     pub device: Device,
+}
+
+impl<T: WithDType> Drop for Storage<T> {
+    fn drop(&mut self) {
+        if self.device.is_capturing() {
+            // A stream-ordered free of memory allocated outside the capture
+            // is invalid while the stream is capturing a CUDA graph
+            // (CUDA_ERROR_INVALID_VALUE at capture time). Leak the buffer
+            // instead: captures are short one-step windows, so the leak is
+            // bounded by one step of state churn.
+        } else {
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.data) }
+        }
+    }
 }
 
 impl<T: WithDType> Storage<T> {
@@ -587,7 +607,7 @@ fn gemm_f32(
 
     let lhs = lhs.0.data.slice(lhs.1..);
     let rhs = rhs.0.data.slice(rhs.1..);
-    unsafe { gemm_strided_batched_f32(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
+    unsafe { gemm_strided_batched_f32(&dst.device.blas, cfg, &rhs, &lhs, &mut *dst.data)? }
 
     Ok(())
 }
@@ -620,7 +640,7 @@ fn gemm_f16(
     )?;
     let lhs = lhs.0.data.slice(lhs.1..);
     let rhs = rhs.0.data.slice(rhs.1..);
-    unsafe { gemm_strided_batched_f16(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
+    unsafe { gemm_strided_batched_f16(&dst.device.blas, cfg, &rhs, &lhs, &mut *dst.data)? }
 
     Ok(())
 }
@@ -653,7 +673,7 @@ fn gemm_bf16(
     )?;
     let lhs = lhs.0.data.slice(lhs.1..);
     let rhs = rhs.0.data.slice(rhs.1..);
-    unsafe { gemm_strided_batched_bf16(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
+    unsafe { gemm_strided_batched_bf16(&dst.device.blas, cfg, &rhs, &lhs, &mut *dst.data)? }
     Ok(())
 }
 
@@ -744,10 +764,10 @@ pub fn flash_attn<T: WithDType>(
     let len_kv = len_kv as i32;
     let head_dim = head_dim as i32;
     let mut launch_args = dst.device.stream.launch_builder(&func);
-    launch_args.arg(&q.data);
-    launch_args.arg(&k.data);
-    launch_args.arg(&v.data);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&*q.data);
+    launch_args.arg(&*k.data);
+    launch_args.arg(&*v.data);
+    launch_args.arg(&mut *dst.data);
     launch_args.arg(&bs);
     launch_args.arg(&len_q);
     launch_args.arg(&len_kv);
@@ -774,12 +794,12 @@ impl crate::Backend for Device {
 
     unsafe fn alloc_uninit<T: WithDType>(len: usize, dev: &Self) -> Result<Self::Storage<T>> {
         let data = unsafe { dev.stream.alloc::<T>(len) }?;
-        Ok(Storage { data, device: dev.clone() })
+        Ok(Storage { data: std::mem::ManuallyDrop::new(data), device: dev.clone() })
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, dev: &Self) -> Result<Self::Storage<T>> {
         let data = dev.cached_htod(&v)?;
-        Ok(Storage { data, device: dev.clone() })
+        Ok(Storage { data: std::mem::ManuallyDrop::new(data), device: dev.clone() })
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, elem: T, len: usize) -> Result<()> {
@@ -790,7 +810,7 @@ impl crate::Backend for Device {
         let func = dst.device.get_func(&kname, PTXModule::Fill)?;
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&elem);
         launch_args.arg(&len);
         unsafe { launch_args.launch(cfg) }?;
@@ -810,7 +830,7 @@ impl crate::Backend for Device {
             let cfg = LaunchConfig::for_num_elems(len as u32);
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&len);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&mut *dst.data);
             launch_args.arg(&range);
             launch_args.arg(&lo);
             unsafe { launch_args.launch(cfg) }?;
@@ -846,8 +866,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -883,7 +903,7 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&mut *dst.data);
         if let Some(ref alpha) = alpha {
             launch_args.arg(alpha);
         }
@@ -909,8 +929,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&s.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*s.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -942,8 +962,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         if let Some(ref alpha) = alpha {
             launch_args.arg(alpha);
         }
@@ -970,9 +990,9 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&lhs.data);
-        launch_args.arg(&rhs.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*lhs.data);
+        launch_args.arg(&*rhs.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -994,8 +1014,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&scale);
         launch_args.arg(&add);
         unsafe { launch_args.launch(cfg) }?;
@@ -1036,8 +1056,8 @@ impl crate::Backend for Device {
             launch_args.arg(&d_i);
             launch_args.arg(&d_j);
             launch_args.arg(&d_k);
-            launch_args.arg(&src.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*src.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         }
         Ok(())
@@ -1111,8 +1131,8 @@ impl crate::Backend for Device {
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&cos_slice);
         launch_args.arg(&sin_slice);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&td);
         launch_args.arg(&d_u32);
@@ -1153,8 +1173,8 @@ impl crate::Backend for Device {
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&cos_slice);
         launch_args.arg(&sin_slice);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&td);
         launch_args.arg(&h_u32);
@@ -1289,8 +1309,8 @@ impl crate::Backend for Device {
             launch_args.arg(&cols);
             launch_args.arg(&src_stride);
             launch_args.arg(&src_offset_u32);
-            launch_args.arg(&src.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*src.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
             return Ok(());
         }
@@ -1309,8 +1329,8 @@ impl crate::Backend for Device {
         launch_args.arg(&num_dims_u32);
         launch_args.arg(&info_dev);
         launch_args.arg(&src_offset_u32);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1338,9 +1358,9 @@ impl crate::Backend for Device {
         let dst_dim_size_i32 = dst_dim_size as i32;
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&mut dst.data);
-        launch_args.arg(&src.data);
-        launch_args.arg(&ids.data);
+        launch_args.arg(&mut *dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&*ids.data);
         launch_args.arg(&numel_i32);
         launch_args.arg(&right_size_i32);
         launch_args.arg(&src_dim_size_i32);
@@ -1393,7 +1413,7 @@ impl crate::Backend for Device {
             launch_args.arg(&num_ids_i32);
             launch_args.arg(&right_size_i32);
             launch_args.arg(&src_dim_size_i32);
-            launch_args.arg(&ids.data);
+            launch_args.arg(&*ids.data);
             launch_args.arg(&src_slice);
             launch_args.arg(&mut dst_slice);
             unsafe { launch_args.launch(cfg) }?;
@@ -1419,7 +1439,7 @@ impl crate::Backend for Device {
         let offset = offset as u32;
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&t1);
         launch_args.arg(&t2);
@@ -1448,8 +1468,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig { block_dim, grid_dim, shared_mem_bytes: 0 };
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&ncols);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
@@ -1477,9 +1497,9 @@ impl crate::Backend for Device {
         };
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
-        launch_args.arg(&alpha.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
+        launch_args.arg(&*alpha.data);
         launch_args.arg(&ncols);
         launch_args.arg(&block_size);
         launch_args.arg(&eps);
@@ -1512,10 +1532,10 @@ impl crate::Backend for Device {
         };
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
-        launch_args.arg(&weight.data);
-        launch_args.arg(&bias.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
+        launch_args.arg(&*weight.data);
+        launch_args.arg(&*bias.data);
         launch_args.arg(&ncols);
         launch_args.arg(&block_size);
         launch_args.arg(&eps);
@@ -1557,8 +1577,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1596,8 +1616,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1635,8 +1655,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1671,8 +1691,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1710,8 +1730,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1751,9 +1771,9 @@ impl crate::Backend for Device {
             let func = dst.device.get_func(&kname, PTXModule::Broadcast)?;
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if lhs_no_zero && dst_shape.len() == 2 && rhs_strides == [0, 1] {
             // rhs broadcasts along first dim
@@ -1763,9 +1783,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if lhs_no_zero && dst_shape.len() == 2 && rhs_strides == [1, 0] {
             // rhs broadcasts along second dim
@@ -1775,9 +1795,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if rhs_no_zero && dst_shape.len() == 2 && lhs_strides == [0, 1] {
             // lhs broadcasts along first dim
@@ -1787,9 +1807,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if rhs_no_zero && dst_shape.len() == 2 && lhs_strides == [1, 0] {
             // lhs broadcasts along second dim
@@ -1799,9 +1819,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if lhs_no_zero
             && dst_shape.len() == 3
@@ -1818,9 +1838,9 @@ impl crate::Backend for Device {
             launch_args.arg(&numel);
             launch_args.arg(&dim12);
             launch_args.arg(&dim2);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if rhs_no_zero
             && dst_shape.len() == 3
@@ -1837,9 +1857,9 @@ impl crate::Backend for Device {
             launch_args.arg(&numel);
             launch_args.arg(&dim12);
             launch_args.arg(&dim2);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else {
             // General strided case
@@ -1859,9 +1879,9 @@ impl crate::Backend for Device {
             launch_args.arg(&numel);
             launch_args.arg(&num_dims_u32);
             launch_args.arg(&info_dev);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         }
         Ok(())
@@ -2020,7 +2040,7 @@ fn conv1d_im2col<T: WithDTypeF>(
     launch_args.arg(&stride);
     launch_args.arg(&padding);
     launch_args.arg(&dilation);
-    launch_args.arg(&src.data);
+    launch_args.arg(&*src.data);
     launch_args.arg(&mut col);
     unsafe { launch_args.launch(cfg) }?;
 
@@ -2039,7 +2059,7 @@ fn conv1d_im2col<T: WithDTypeF>(
     // We want: result = col @ kernel^T
     // cuBLAS uses column-major, so we compute: result^T = kernel @ col^T
     // Which gives us result in row-major as [L_out, out_channels]
-    conv1d_gemm(&dst.device, &col, &kernel.data, &mut result, batch, out_length, out_channels, k)?;
+    conv1d_gemm(&dst.device, &col, &*kernel.data, &mut result, batch, out_length, out_channels, k)?;
 
     // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out]
     let kname = format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name());
@@ -2058,7 +2078,7 @@ fn conv1d_im2col<T: WithDTypeF>(
     launch_args.arg(&out_length);
     launch_args.arg(&out_channels);
     launch_args.arg(&result);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
@@ -2289,9 +2309,9 @@ fn conv1d_direct<T: WithDTypeF>(
     launch_args.arg(&padding);
     launch_args.arg(&dilation);
     launch_args.arg(&groups);
-    launch_args.arg(&src.data);
-    launch_args.arg(&kernel.data);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&*src.data);
+    launch_args.arg(&*kernel.data);
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
@@ -2342,7 +2362,7 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     let mut launch_args = dst.device.stream.launch_builder(&func);
     launch_args.arg(&in_channels);
     launch_args.arg(&length);
-    launch_args.arg(&src.data);
+    launch_args.arg(&*src.data);
     launch_args.arg(&mut src_transposed);
     unsafe { launch_args.launch(cfg) }?;
 
@@ -2355,7 +2375,7 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     conv_transpose1d_gemm(
         &dst.device,
         &src_transposed,
-        &kernel.data,
+        &*kernel.data,
         &mut col,
         batch,
         length,
@@ -2385,7 +2405,7 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     launch_args.arg(&kernel_size);
     launch_args.arg(&stride);
     launch_args.arg(&col);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
@@ -2578,9 +2598,9 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
     launch_args.arg(&output_padding);
     launch_args.arg(&dilation);
     launch_args.arg(&groups);
-    launch_args.arg(&src.data);
-    launch_args.arg(&kernel.data);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&*src.data);
+    launch_args.arg(&*kernel.data);
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
