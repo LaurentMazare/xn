@@ -852,6 +852,98 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
             groups,
         )
     }
+
+    /// Conv1d with the bias-fusion contract of [`crate::Backend::conv1d_with_bias`]:
+    /// returns whether the backend applied the bias.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_with_bias_(
+        &self,
+        src: &Self,
+        kernel: &Self,
+        bias: Option<&Self>,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        self.check_not_same_storage(src, "conv1d_")?;
+        self.check_not_same_storage(kernel, "conv1d_")?;
+        let src_dims = src.dims();
+        let kernel_dims = kernel.dims();
+        let batch = src_dims[0];
+        let in_channels = src_dims[1];
+        let length = src_dims[2];
+        let out_channels = kernel_dims[0];
+        let kernel_size = kernel_dims[2];
+        let out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let kernel_data = kernel.storage()?;
+        let bias_data = bias.map(|b| b.storage()).transpose()?;
+        B::conv1d_with_bias(
+            &mut *dst,
+            &*src_data,
+            &*kernel_data,
+            bias_data.as_deref(),
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )
+    }
+
+    /// ConvTranspose1d with the bias-fusion contract of
+    /// [`crate::Backend::conv_transpose1d_with_bias`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d_with_bias_(
+        &self,
+        src: &Self,
+        kernel: &Self,
+        bias: Option<&Self>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        self.check_not_same_storage(src, "conv_transpose1d_")?;
+        self.check_not_same_storage(kernel, "conv_transpose1d_")?;
+        let src_dims = src.dims();
+        let kernel_dims = kernel.dims();
+        let batch = src_dims[0];
+        let in_channels = src_dims[1];
+        let length = src_dims[2];
+        let out_channels = kernel_dims[1] * groups;
+        let kernel_size = kernel_dims[2];
+        let out_length = (length - 1) * stride + kernel_size + output_padding - 2 * padding;
+
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let kernel_data = kernel.storage()?;
+        let bias_data = bias.map(|b| b.storage()).transpose()?;
+        B::conv_transpose1d_with_bias(
+            &mut *dst,
+            &*src_data,
+            &*kernel_data,
+            bias_data.as_deref(),
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            groups,
+        )
+    }
 }
 
 /// Compute broadcast strides for lhs and rhs given the output shape.
