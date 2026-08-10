@@ -1969,6 +1969,7 @@ impl crate::Backend for Device {
                 kernel,
                 None,
                 None,
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -2100,6 +2101,7 @@ impl crate::Backend for Device {
                 kernel,
                 bias.map(|b| &*b.data),
                 None,
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -2131,12 +2133,13 @@ impl crate::Backend for Device {
         }
     }
 
-    fn conv1d_with_bias_snake<T: WithDTypeF>(
+    fn conv1d_fused<T: WithDTypeF>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,
         kernel: &Self::Storage<T>,
         bias: Option<&Self::Storage<T>>,
         snake: Option<(&Self::Storage<T>, &Self::Storage<T>)>,
+        residual: Option<&Self::Storage<T>>,
         batch: usize,
         in_channels: usize,
         out_channels: usize,
@@ -2147,51 +2150,52 @@ impl crate::Backend for Device {
         padding: usize,
         dilation: usize,
         groups: usize,
-    ) -> Result<(bool, bool)> {
-        // Only the im2col path owns its store epilogue, so that is the only one
-        // that can fold the activation in. cuDNN and the direct kernel fall
-        // back to the plain contract.
-        let fusable = groups == 1 && !cudnn_conv::enabled();
-        match (snake, fusable) {
-            (Some((alpha, beta)), true) if bias.is_some() => {
-                conv1d_im2col(
-                    dst,
-                    src,
-                    kernel,
-                    bias.map(|b| &*b.data),
-                    Some((&alpha.data, &beta.data)),
-                    batch,
-                    in_channels,
-                    out_channels,
-                    length,
-                    out_length,
-                    kernel_size,
-                    stride,
-                    padding,
-                    dilation,
-                )?;
-                Ok((true, true))
-            }
-            _ => {
-                let bias_applied = Self::conv1d_with_bias(
-                    dst,
-                    src,
-                    kernel,
-                    bias,
-                    batch,
-                    in_channels,
-                    out_channels,
-                    length,
-                    out_length,
-                    kernel_size,
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                )?;
-                Ok((bias_applied, false))
-            }
+    ) -> Result<crate::backend::ConvFused> {
+        // Only the im2col path owns its store epilogue, so it is the only one
+        // that can fold anything in; cuDNN and the direct kernel own theirs.
+        let fusable = groups == 1 && !cudnn_conv::enabled() && bias.is_some();
+        let want = snake.is_some() || residual.is_some();
+        if fusable && want {
+            conv1d_im2col(
+                dst,
+                src,
+                kernel,
+                bias.map(|b| &*b.data),
+                snake.map(|(a, b)| (&*a.data, &*b.data)),
+                residual.map(|r| &*r.data),
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            )?;
+            return Ok(crate::backend::ConvFused {
+                bias: true,
+                snake: snake.is_some(),
+                residual: residual.is_some(),
+            });
         }
+        let bias_applied = Self::conv1d_with_bias(
+            dst,
+            src,
+            kernel,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
+        Ok(crate::backend::ConvFused { bias: bias_applied, snake: false, residual: false })
     }
 
     fn conv_transpose1d_with_bias<T: WithDTypeF>(
@@ -2283,6 +2287,7 @@ fn conv1d_im2col<T: WithDTypeF>(
     kernel: &Storage<T>,
     bias: Option<&CudaSlice<T>>,
     snake: Option<(&CudaSlice<T>, &CudaSlice<T>)>,
+    residual: Option<&CudaSlice<T>>,
     batch: usize,
     in_channels: usize,
     out_channels: usize,
@@ -2345,9 +2350,11 @@ fn conv1d_im2col<T: WithDTypeF>(
     // the seanet decoder always uses; a bias-less snake falls back to a
     // separate activation pass (see `Tensor::conv1d_snake`).
     let snake = snake.filter(|_| bias.is_some());
-    let kname = match (bias, snake) {
-        (Some(_), Some(_)) => format!("transpose_blc_bcl_bias_snake_{}", T::DTYPE.cuda_name()),
-        (Some(_), None) => format!("transpose_blc_bcl_bias_{}", T::DTYPE.cuda_name()),
+    let residual = residual.filter(|_| bias.is_some());
+    let fused = snake.is_some() || residual.is_some();
+    let kname = match (bias, fused) {
+        (Some(_), true) => format!("transpose_blc_bcl_fused_{}", T::DTYPE.cuda_name()),
+        (Some(_), false) => format!("transpose_blc_bcl_bias_{}", T::DTYPE.cuda_name()),
         (None, _) => format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name()),
     };
     let func = dst.device.get_func(&kname, PTXModule::Conv)?;
@@ -2364,27 +2371,30 @@ fn conv1d_im2col<T: WithDTypeF>(
     let mut launch_args = dst.device.stream.launch_builder(&func);
     launch_args.arg(&out_length);
     launch_args.arg(&out_channels);
-    launch_args.arg(&result);
-    match snake {
-        None => {
-            if let Some(bias) = bias {
-                launch_args.arg(bias);
-            }
-        }
-        Some((alpha, beta)) => {
-            // `snake` was filtered to the bias case above, so bias is Some here.
-            let bias = match bias {
-                Some(bias) => bias,
-                None => crate::bail!("fused snake epilogue requires a bias"),
-            };
+    if !fused {
+        launch_args.arg(&result);
+        if let Some(bias) = bias {
             launch_args.arg(bias);
-            launch_args.arg(alpha);
-            launch_args.arg(beta);
-            launch_args.arg(&mut *dst.data);
-            unsafe { launch_args.launch(cfg) }?;
-            return Ok(());
         }
+        launch_args.arg(&mut *dst.data);
+        unsafe { launch_args.launch(cfg) }?;
+        return Ok(());
     }
+    // Flag-driven fused epilogue: unused pointers are passed as the bias, which
+    // is always present on this path, so no null pointer ever reaches a kernel.
+    let bias = match bias {
+        Some(bias) => bias,
+        None => crate::bail!("fused conv epilogue requires a bias"),
+    };
+    let flags: usize = usize::from(snake.is_some()) | (usize::from(residual.is_some()) << 1);
+    let (alpha, beta) = snake.unwrap_or((bias, bias));
+    let residual = residual.unwrap_or(bias);
+    launch_args.arg(&flags);
+    launch_args.arg(&result);
+    launch_args.arg(bias);
+    launch_args.arg(alpha);
+    launch_args.arg(beta);
+    launch_args.arg(residual);
     launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 

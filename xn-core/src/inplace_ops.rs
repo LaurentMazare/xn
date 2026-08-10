@@ -910,22 +910,23 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     /// returns whether the backend applied the bias.
     #[allow(clippy::too_many_arguments)]
     /// Like [`Tensor::conv1d_with_bias_`] but also asks the backend to fold a
-    /// per-channel snake activation into the epilogue. Returns
-    /// `(bias_applied, snake_applied)`.
+    /// per-channel snake activation and/or a residual add into the epilogue.
+    /// Reports what was fused so the caller can apply the rest.
     #[allow(clippy::too_many_arguments)]
-    pub fn conv1d_with_bias_snake_(
+    pub fn conv1d_fused_(
         &self,
         src: &Self,
         kernel: &Self,
         bias: Option<&Self>,
         snake: Option<(&Self, &Self)>,
+        residual: Option<&Self>,
         stride: usize,
         padding: usize,
         dilation: usize,
         groups: usize,
-    ) -> Result<(bool, bool)> {
-        self.check_not_same_storage(src, "conv1d_snake")?;
-        self.check_not_same_storage(kernel, "conv1d_snake")?;
+    ) -> Result<crate::backend::ConvFused> {
+        self.check_not_same_storage(src, "conv1d_fused")?;
+        self.check_not_same_storage(kernel, "conv1d_fused")?;
         let src_dims = src.dims();
         let kernel_dims = kernel.dims();
         let batch = src_dims[0];
@@ -934,12 +935,22 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let out_channels = kernel_dims[0];
         let kernel_size = kernel_dims[2];
         let out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
-        if let Some((alpha, beta)) = snake {
-            if alpha.elem_count() != out_channels || beta.elem_count() != out_channels {
+        if let Some((alpha, beta)) = snake
+            && (alpha.elem_count() != out_channels || beta.elem_count() != out_channels)
+        {
+            crate::bail!(
+                "conv1d_fused expects alpha/beta with {out_channels} elements, got {:?} and {:?}",
+                alpha.shape(),
+                beta.shape()
+            )
+        }
+        if let Some(residual) = residual {
+            self.check_not_same_storage(residual, "conv1d_fused")?;
+            if residual.dims() != [batch, out_channels, out_length] {
                 crate::bail!(
-                    "conv1d_snake expects alpha/beta with {out_channels} elements, got {:?} and {:?}",
-                    alpha.shape(),
-                    beta.shape()
+                    "conv1d_fused residual shape mismatch: expected [{batch}, {out_channels}, \
+                     {out_length}], got {:?}",
+                    residual.shape()
                 )
             }
         }
@@ -952,12 +963,14 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
             None => None,
             Some((alpha, beta)) => Some((alpha.storage()?, beta.storage()?)),
         };
-        B::conv1d_with_bias_snake(
+        let residual_data = residual.map(|r| r.storage()).transpose()?;
+        B::conv1d_fused(
             &mut *dst,
             &*src_data,
             &*kernel_data,
             bias_data.as_deref(),
             snake_data.as_ref().map(|(a, b)| (&**a, &**b)),
+            residual_data.as_deref(),
             batch,
             in_channels,
             out_channels,

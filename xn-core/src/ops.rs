@@ -294,19 +294,18 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     /// Kernel: (out_channels, in_channels/groups, kernel_size)
     /// Output: (batch, out_channels, out_length)
     #[tracing::instrument(skip_all)]
-    /// `conv1d` immediately followed by a per-channel snake activation
-    /// (`y = x + beta_scale[c] * sin(alpha[c] * x)^2`), asking the backend to
-    /// fold both the bias and the activation into the convolution epilogue.
-    /// Whatever the backend does not fuse is applied here, so the result is the
-    /// same as `conv1d(..).snake(alpha, beta_scale)` either way.
+    /// `conv1d` with an optional residual add and/or per-channel snake
+    /// activation folded into the convolution epilogue where the backend
+    /// supports it. Semantically `snake(conv1d(..) + residual)`; whatever is not
+    /// fused is applied here, so the result matches either way.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all)]
-    pub fn conv1d_snake(
+    pub fn conv1d_fused(
         &self,
         kernel: &Self,
         bias: Option<&Self>,
-        alpha: &Self,
-        beta_scale: &Self,
+        snake: Option<(&Self, &Self)>,
+        residual: Option<&Self>,
         stride: usize,
         padding: usize,
         dilation: usize,
@@ -323,24 +322,24 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
         let mut result =
             unsafe { Tensor::alloc_uninit((batch, out_channels, out_length), self.device()) }?;
-        let (bias_applied, snake_applied) = result.conv1d_with_bias_snake_(
-            self,
-            kernel,
-            bias,
-            Some((alpha, beta_scale)),
-            stride,
-            padding,
-            dilation,
-            groups,
+        let fused = result.conv1d_fused_(
+            self, kernel, bias, snake, residual, stride, padding, dilation, groups,
         )?;
         if let Some(bias) = bias
-            && !bias_applied
+            && !fused.bias
         {
             let bias = bias.reshape((1, out_channels, 1))?;
             result = result.broadcast_add(&bias)?;
         }
-        if !snake_applied {
-            result = result.snake(alpha, beta_scale)?;
+        if let Some(residual) = residual
+            && !fused.residual
+        {
+            result = result.add(residual)?;
+        }
+        if let Some((alpha, beta)) = snake
+            && !fused.snake
+        {
+            result = result.snake(alpha, beta)?;
         }
         Ok(result)
     }

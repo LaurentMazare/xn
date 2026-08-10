@@ -1850,12 +1850,37 @@ fn test_conv_snake_fusion_impl<B: Backend>(device: &B) -> Result<()> {
     let beta_t: Tensor<f32, B> = Tensor::from_vec(beta, vec![1, c_out, 1], device)?;
 
     // The fused epilogue must match conv1d followed by a separate snake.
-    let fused = xs_t.conv1d_snake(&w_t, Some(&bias_t), &alpha_t, &beta_t, 1, 0, 1, 1)?.to_vec()?;
+    let fused = xs_t
+        .conv1d_fused(&w_t, Some(&bias_t), Some((&alpha_t, &beta_t)), None, 1, 0, 1, 1)?
+        .to_vec()?;
     let composed =
         xs_t.conv1d(&w_t, Some(&bias_t), 1, 0, 1, 1)?.snake(&alpha_t, &beta_t)?.to_vec()?;
     assert_eq!(fused.len(), composed.len());
     for (i, (f, c)) in fused.iter().zip(composed.iter()).enumerate() {
         assert!((f - c).abs() <= 1e-5 * c.abs().max(1.0), "idx {i}: fused {f} composed {c}");
+    }
+
+    // The residual add fuses into the same epilogue, alone and with the snake.
+    let out_len = l - k + 1;
+    let res: Vec<f32> =
+        (0..b * c_out * out_len).map(|i| ((i * 17 + 3) % 13) as f32 * 0.31 - 1.1).collect();
+    let res_t: Tensor<f32, B> = Tensor::from_vec(res, vec![b, c_out, out_len], device)?;
+    let fused_res =
+        xs_t.conv1d_fused(&w_t, Some(&bias_t), None, Some(&res_t), 1, 0, 1, 1)?.to_vec()?;
+    let composed_res = xs_t.conv1d(&w_t, Some(&bias_t), 1, 0, 1, 1)?.add(&res_t)?.to_vec()?;
+    for (i, (f, c)) in fused_res.iter().zip(composed_res.iter()).enumerate() {
+        assert!((f - c).abs() <= 1e-5 * c.abs().max(1.0), "res idx {i}: {f} vs {c}");
+    }
+    let fused_both = xs_t
+        .conv1d_fused(&w_t, Some(&bias_t), Some((&alpha_t, &beta_t)), Some(&res_t), 1, 0, 1, 1)?
+        .to_vec()?;
+    let composed_both = xs_t
+        .conv1d(&w_t, Some(&bias_t), 1, 0, 1, 1)?
+        .add(&res_t)?
+        .snake(&alpha_t, &beta_t)?
+        .to_vec()?;
+    for (i, (f, c)) in fused_both.iter().zip(composed_both.iter()).enumerate() {
+        assert!((f - c).abs() <= 1e-5 * c.abs().max(1.0), "both idx {i}: {f} vs {c}");
     }
     Ok(())
 }

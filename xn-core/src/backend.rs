@@ -1,4 +1,13 @@
 use crate::Result;
+
+/// What a backend managed to fold into a convolution epilogue, see
+/// [`Backend::conv1d_fused`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConvFused {
+    pub bias: bool,
+    pub snake: bool,
+    pub residual: bool,
+}
 use crate::{BinaryOp, UnaryOp};
 
 pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
@@ -405,17 +414,18 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
 
     /// Same as [`Backend::conv1d_with_bias`], additionally folding a
     /// per-channel snake activation (`y = x + beta[c] * sin(alpha[c] * x)^2`)
-    /// into the epilogue. Returns `(bias_applied, snake_applied)`; whatever the
-    /// backend did not apply, the caller must do separately. The default
-    /// implementation fuses neither the snake nor anything `conv1d_with_bias`
-    /// would not already fuse.
+    /// and/or a residual add into the epilogue. The residual is added before the
+    /// activation, matching a resnet block whose skip connection feeds the next
+    /// activation. Returns what was actually fused; whatever the backend did not
+    /// apply, the caller must do separately.
     #[allow(clippy::too_many_arguments)]
-    fn conv1d_with_bias_snake<T: crate::WithDTypeF>(
+    fn conv1d_fused<T: crate::WithDTypeF>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,
         kernel: &Self::Storage<T>,
         bias: Option<&Self::Storage<T>>,
         _snake: Option<(&Self::Storage<T>, &Self::Storage<T>)>,
+        _residual: Option<&Self::Storage<T>>,
         batch: usize,
         in_channels: usize,
         out_channels: usize,
@@ -426,7 +436,7 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         padding: usize,
         dilation: usize,
         groups: usize,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<ConvFused> {
         let bias_applied = Self::conv1d_with_bias(
             dst,
             src,
@@ -443,7 +453,7 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
             dilation,
             groups,
         )?;
-        Ok((bias_applied, false))
+        Ok(ConvFused { bias: bias_applied, snake: false, residual: false })
     }
 
     /// Same as [`Backend::conv_transpose1d`], with the bias-fusion contract
