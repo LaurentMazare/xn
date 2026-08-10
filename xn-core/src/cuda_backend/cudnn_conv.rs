@@ -20,26 +20,128 @@ fn tf32() -> bool {
     *ON.get_or_init(|| std::env::var("XN_TF32").is_ok_and(|v| v == "1"))
 }
 
-/// Lazily-created cuDNN handle. `Cudnn` is not Send/Sync because cuDNN
-/// handles require externally serialized access; the mutex is held for the
-/// whole descriptor-setup + launch sequence, which provides that
-/// serialization.
-pub(crate) struct CudnnCtx(Mutex<Option<Arc<Cudnn>>>);
+/// XN_CUDNN_AUTOTUNE=0 disables the measured algorithm search and falls back to
+/// the cuDNN v7 heuristic. Autotuning is what XLA does: its dumped conv configs
+/// carry per-shape engine ids and tuning knobs picked by measurement, not by
+/// `cudnnGetConvolutionForwardAlgorithm_v7`.
+fn autotune() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("XN_CUDNN_AUTOTUNE").is_ok_and(|v| v == "0"))
+}
+
+/// Identifies a conv shape for the algorithm cache. Two calls with the same key
+/// run the same cuDNN problem, so the measured winner carries over.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+struct ConvKey {
+    batch: usize,
+    in_c: usize,
+    out_c: usize,
+    length: usize,
+    out_length: usize,
+    k: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+}
+
+/// Lazily-created cuDNN handle plus the per-shape algorithm caches. `Cudnn` is
+/// not Send/Sync because cuDNN handles require externally serialized access;
+/// the mutex is held for the whole descriptor-setup + launch sequence, which
+/// provides that serialization.
+pub(crate) struct CudnnCtx {
+    handle: Mutex<Option<Arc<Cudnn>>>,
+    fwd: Mutex<std::collections::HashMap<ConvKey, sys::cudnnConvolutionFwdAlgo_t>>,
+    bwd: Mutex<std::collections::HashMap<ConvKey, sys::cudnnConvolutionBwdDataAlgo_t>>,
+}
 unsafe impl Send for CudnnCtx {}
 unsafe impl Sync for CudnnCtx {}
 
 impl CudnnCtx {
     pub(crate) fn new() -> Self {
-        Self(Mutex::new(None))
+        Self {
+            handle: Mutex::new(None),
+            fwd: Mutex::new(Default::default()),
+            bwd: Mutex::new(Default::default()),
+        }
     }
 }
 
 fn with_cudnn<R>(device: &Device, f: impl FnOnce(&Arc<Cudnn>) -> Result<R>) -> Result<R> {
-    let mut guard = device.cudnn.0.lock().unwrap();
+    let mut guard = device.cudnn.handle.lock().unwrap();
     if guard.is_none() {
         *guard = Some(Cudnn::new(device.stream().clone())?);
     }
     f(guard.as_ref().unwrap())
+}
+
+/// Every forward algorithm cuDNN defines, as autotuning candidates. Ones that
+/// do not support the problem fail at the workspace query and are skipped.
+const FWD_ALGOS: [sys::cudnnConvolutionFwdAlgo_t; 8] = {
+    use sys::cudnnConvolutionFwdAlgo_t as A;
+    [
+        A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM,
+        A::CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM,
+        A::CUDNN_CONVOLUTION_FWD_ALGO_GEMM,
+        A::CUDNN_CONVOLUTION_FWD_ALGO_DIRECT,
+        A::CUDNN_CONVOLUTION_FWD_ALGO_FFT,
+        A::CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING,
+        A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD,
+        A::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED,
+    ]
+};
+
+const BWD_ALGOS: [sys::cudnnConvolutionBwdDataAlgo_t; 6] = {
+    use sys::cudnnConvolutionBwdDataAlgo_t as A;
+    [
+        A::CUDNN_CONVOLUTION_BWD_DATA_ALGO_0,
+        A::CUDNN_CONVOLUTION_BWD_DATA_ALGO_1,
+        A::CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT,
+        A::CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING,
+        A::CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD,
+        A::CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED,
+    ]
+};
+
+/// Time `run` for each candidate and return the fastest, mirroring XLA's
+/// autotuner: 2 warmup plus 5 timed reps per candidate, device-synchronized.
+/// Candidates that error (unsupported for this problem, or out of memory) are
+/// skipped; if every one fails the caller's fallback algorithm is returned.
+fn autotune_algo<A: Copy>(
+    device: &Device,
+    candidates: &[A],
+    fallback: A,
+    mut run: impl FnMut(A) -> Result<()>,
+) -> A {
+    let mut best = (f64::INFINITY, fallback);
+    for &algo in candidates {
+        if run(algo).is_err() {
+            continue;
+        }
+        for _ in 0..2 {
+            if run(algo).is_err() {
+                continue;
+            }
+        }
+        if device.stream().synchronize().is_err() {
+            continue;
+        }
+        let t0 = std::time::Instant::now();
+        let mut ok = true;
+        for _ in 0..5 {
+            if run(algo).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if !ok || device.stream().synchronize().is_err() {
+            continue;
+        }
+        let elapsed = t0.elapsed().as_secs_f64();
+        if elapsed < best.0 {
+            best = (elapsed, algo);
+        }
+    }
+    best.1
 }
 
 /// XN_CUDNN_NOFUSE=1: skip the fused bias epilogue so the forward conv can use
@@ -142,7 +244,46 @@ pub(crate) fn conv1d_f32(
                     w: &w_desc,
                     y: &y_desc,
                 };
-                let algo = op.pick_algorithm()?;
+                let key = ConvKey {
+                    batch,
+                    in_c: in_channels,
+                    out_c: out_channels,
+                    length,
+                    out_length,
+                    k: kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                };
+                let cached = device.cudnn.fwd.lock().unwrap().get(&key).copied();
+                let algo = match cached {
+                    Some(algo) => algo,
+                    None => {
+                        let heuristic = op.pick_algorithm()?;
+                        let algo = if autotune() {
+                            autotune_algo(&device, &FWD_ALGOS, heuristic, |algo| {
+                                let ws = op.get_workspace_size(algo)?;
+                                let mut workspace: CudaSlice<u8> =
+                                    unsafe { device.stream().alloc(ws.max(1)) }?;
+                                unsafe {
+                                    op.launch(
+                                        algo,
+                                        Some(&mut workspace),
+                                        (1.0f32, 0.0f32),
+                                        &*src.data,
+                                        &*kernel.data,
+                                        &mut *dst.data,
+                                    )
+                                }?;
+                                Ok(())
+                            })
+                        } else {
+                            heuristic
+                        };
+                        device.cudnn.fwd.lock().unwrap().insert(key, algo);
+                        algo
+                    }
+                };
                 let ws_size = op.get_workspace_size(algo)?;
                 let mut workspace: CudaSlice<u8> =
                     unsafe { device.stream().alloc(ws_size.max(1)) }?;
@@ -205,7 +346,46 @@ pub(crate) fn conv_transpose1d_f32(
             w: &w_desc,
             dy: &dy_desc,
         };
-        let algo = op.pick_algorithm()?;
+        let key = ConvKey {
+            batch,
+            in_c: in_channels,
+            out_c: out_channels,
+            length,
+            out_length,
+            k: kernel_size,
+            stride,
+            padding: 0,
+            dilation: 1,
+        };
+        let cached = device.cudnn.bwd.lock().unwrap().get(&key).copied();
+        let algo = match cached {
+            Some(algo) => algo,
+            None => {
+                let heuristic = op.pick_algorithm()?;
+                let algo = if autotune() {
+                    autotune_algo(&device, &BWD_ALGOS, heuristic, |algo| {
+                        let ws = op.get_workspace_size(algo)?;
+                        let mut workspace: CudaSlice<u8> =
+                            unsafe { device.stream().alloc(ws.max(1)) }?;
+                        unsafe {
+                            op.launch(
+                                algo,
+                                Some(&mut workspace),
+                                (1.0f32, 0.0f32),
+                                &mut *dst.data,
+                                &*kernel.data,
+                                &*src.data,
+                            )
+                        }?;
+                        Ok(())
+                    })
+                } else {
+                    heuristic
+                };
+                device.cudnn.bwd.lock().unwrap().insert(key, algo);
+                algo
+            }
+        };
         let ws_size = op.get_workspace_size(algo)?;
         let mut workspace: CudaSlice<u8> = unsafe { device.stream().alloc(ws_size.max(1)) }?;
         unsafe {

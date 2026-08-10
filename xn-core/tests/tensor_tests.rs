@@ -1834,6 +1834,43 @@ fn test_snake_cuda() -> Result<()> {
 
 // Conv bias fusion: conv with bias must match conv without bias + broadcast
 // add, on every backend (fused epilogue on cuda, fallback path elsewhere).
+fn test_conv_snake_fusion_impl<B: Backend>(device: &B) -> Result<()> {
+    let (b, c_in, c_out, l, k) = (2, 5, 7, 13, 3);
+    let xs: Vec<f32> = (0..b * c_in * l).map(|i| ((i * 31 + 7) % 19) as f32 * 0.21 - 1.7).collect();
+    let w: Vec<f32> =
+        (0..c_out * c_in * k).map(|i| ((i * 13 + 5) % 11) as f32 * 0.09 - 0.4).collect();
+    let bias: Vec<f32> = (0..c_out).map(|i| 0.3 - i as f32 * 0.11).collect();
+    let alpha: Vec<f32> = (0..c_out).map(|i| 0.4 + i as f32 * 0.7).collect();
+    let beta: Vec<f32> = (0..c_out).map(|i| 1.6 - i as f32 * 0.19).collect();
+
+    let xs_t: Tensor<f32, B> = Tensor::from_vec(xs, vec![b, c_in, l], device)?;
+    let w_t: Tensor<f32, B> = Tensor::from_vec(w, vec![c_out, c_in, k], device)?;
+    let bias_t: Tensor<f32, B> = Tensor::from_vec(bias, c_out, device)?;
+    let alpha_t: Tensor<f32, B> = Tensor::from_vec(alpha, vec![1, c_out, 1], device)?;
+    let beta_t: Tensor<f32, B> = Tensor::from_vec(beta, vec![1, c_out, 1], device)?;
+
+    // The fused epilogue must match conv1d followed by a separate snake.
+    let fused = xs_t.conv1d_snake(&w_t, Some(&bias_t), &alpha_t, &beta_t, 1, 0, 1, 1)?.to_vec()?;
+    let composed =
+        xs_t.conv1d(&w_t, Some(&bias_t), 1, 0, 1, 1)?.snake(&alpha_t, &beta_t)?.to_vec()?;
+    assert_eq!(fused.len(), composed.len());
+    for (i, (f, c)) in fused.iter().zip(composed.iter()).enumerate() {
+        assert!((f - c).abs() <= 1e-5 * c.abs().max(1.0), "idx {i}: fused {f} composed {c}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_conv_snake_fusion_cpu() -> Result<()> {
+    test_conv_snake_fusion_impl(&xn::CPU)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_conv_snake_fusion_cuda() -> Result<()> {
+    test_conv_snake_fusion_impl(&xn::cuda_backend::Device::new(0)?)
+}
+
 fn test_conv_bias_fusion_impl<B: Backend>(device: &B) -> Result<()> {
     let (b, c_in, c_out, l, k) = (2, 5, 7, 13, 3);
     let xs: Vec<f32> =

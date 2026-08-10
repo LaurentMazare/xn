@@ -382,6 +382,49 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         Ok(false)
     }
 
+    /// Same as [`Backend::conv1d_with_bias`], additionally folding a
+    /// per-channel snake activation (`y = x + beta[c] * sin(alpha[c] * x)^2`)
+    /// into the epilogue. Returns `(bias_applied, snake_applied)`; whatever the
+    /// backend did not apply, the caller must do separately. The default
+    /// implementation fuses neither the snake nor anything `conv1d_with_bias`
+    /// would not already fuse.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_with_bias_snake<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        _snake: Option<(&Self::Storage<T>, &Self::Storage<T>)>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<(bool, bool)> {
+        let bias_applied = Self::conv1d_with_bias(
+            dst,
+            src,
+            kernel,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
+        Ok((bias_applied, false))
+    }
+
     /// Same as [`Backend::conv_transpose1d`], with the bias-fusion contract
     /// of [`Backend::conv1d_with_bias`].
     #[allow(clippy::too_many_arguments)]

@@ -294,6 +294,57 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     /// Kernel: (out_channels, in_channels/groups, kernel_size)
     /// Output: (batch, out_channels, out_length)
     #[tracing::instrument(skip_all)]
+    /// `conv1d` immediately followed by a per-channel snake activation
+    /// (`y = x + beta_scale[c] * sin(alpha[c] * x)^2`), asking the backend to
+    /// fold both the bias and the activation into the convolution epilogue.
+    /// Whatever the backend does not fuse is applied here, so the result is the
+    /// same as `conv1d(..).snake(alpha, beta_scale)` either way.
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip_all)]
+    pub fn conv1d_snake(
+        &self,
+        kernel: &Self,
+        bias: Option<&Self>,
+        alpha: &Self,
+        beta_scale: &Self,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        let (batch, in_channels, length) = self.dims3()?;
+        let (out_channels, kernel_in_channels, kernel_size) = kernel.dims3()?;
+        if kernel_in_channels != in_channels / groups {
+            crate::bail!(
+                "kernel in_channels/groups mismatch: expected {}, got {kernel_in_channels}",
+                in_channels / groups,
+            );
+        }
+        let out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+        let mut result =
+            unsafe { Tensor::alloc_uninit((batch, out_channels, out_length), self.device()) }?;
+        let (bias_applied, snake_applied) = result.conv1d_with_bias_snake_(
+            self,
+            kernel,
+            bias,
+            Some((alpha, beta_scale)),
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
+        if let Some(bias) = bias
+            && !bias_applied
+        {
+            let bias = bias.reshape((1, out_channels, 1))?;
+            result = result.broadcast_add(&bias)?;
+        }
+        if !snake_applied {
+            result = result.snake(alpha, beta_scale)?;
+        }
+        Ok(result)
+    }
+
     pub fn conv1d(
         &self,
         kernel: &Self,

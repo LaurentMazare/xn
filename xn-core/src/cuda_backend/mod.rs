@@ -1940,6 +1940,7 @@ impl crate::Backend for Device {
                 src,
                 kernel,
                 None,
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -2070,6 +2071,7 @@ impl crate::Backend for Device {
                 src,
                 kernel,
                 bias.map(|b| &*b.data),
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -2098,6 +2100,69 @@ impl crate::Backend for Device {
                 groups,
             )?;
             Ok(false)
+        }
+    }
+
+    fn conv1d_with_bias_snake<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        snake: Option<(&Self::Storage<T>, &Self::Storage<T>)>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<(bool, bool)> {
+        // Only the im2col path owns its store epilogue, so that is the only one
+        // that can fold the activation in. cuDNN and the direct kernel fall
+        // back to the plain contract.
+        let fusable = groups == 1 && !cudnn_conv::enabled();
+        match (snake, fusable) {
+            (Some((alpha, beta)), true) if bias.is_some() => {
+                conv1d_im2col(
+                    dst,
+                    src,
+                    kernel,
+                    bias.map(|b| &*b.data),
+                    Some((&alpha.data, &beta.data)),
+                    batch,
+                    in_channels,
+                    out_channels,
+                    length,
+                    out_length,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                )?;
+                Ok((true, true))
+            }
+            _ => {
+                let bias_applied = Self::conv1d_with_bias(
+                    dst,
+                    src,
+                    kernel,
+                    bias,
+                    batch,
+                    in_channels,
+                    out_channels,
+                    length,
+                    out_length,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                )?;
+                Ok((bias_applied, false))
+            }
         }
     }
 
@@ -2183,11 +2248,13 @@ impl crate::Backend for Device {
 // Conv1d implementation using im2col + cuBLAS gemm
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn conv1d_im2col<T: WithDTypeF>(
     dst: &mut Storage<T>,
     src: &Storage<T>,
     kernel: &Storage<T>,
     bias: Option<&CudaSlice<T>>,
+    snake: Option<(&CudaSlice<T>, &CudaSlice<T>)>,
     batch: usize,
     in_channels: usize,
     out_channels: usize,
@@ -2246,9 +2313,14 @@ fn conv1d_im2col<T: WithDTypeF>(
 
     // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out],
     // fusing the per-channel bias into the store when provided.
-    let kname = match bias {
-        Some(_) => format!("transpose_blc_bcl_bias_{}", T::DTYPE.cuda_name()),
-        None => format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name()),
+    // The fused-snake epilogue is only wired for the bias case, which is what
+    // the seanet decoder always uses; a bias-less snake falls back to a
+    // separate activation pass (see `Tensor::conv1d_snake`).
+    let snake = snake.filter(|_| bias.is_some());
+    let kname = match (bias, snake) {
+        (Some(_), Some(_)) => format!("transpose_blc_bcl_bias_snake_{}", T::DTYPE.cuda_name()),
+        (Some(_), None) => format!("transpose_blc_bcl_bias_{}", T::DTYPE.cuda_name()),
+        (None, _) => format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name()),
     };
     let func = dst.device.get_func(&kname, PTXModule::Conv)?;
     let cfg = LaunchConfig {
@@ -2265,8 +2337,25 @@ fn conv1d_im2col<T: WithDTypeF>(
     launch_args.arg(&out_length);
     launch_args.arg(&out_channels);
     launch_args.arg(&result);
-    if let Some(bias) = bias {
-        launch_args.arg(bias);
+    match snake {
+        None => {
+            if let Some(bias) = bias {
+                launch_args.arg(bias);
+            }
+        }
+        Some((alpha, beta)) => {
+            // `snake` was filtered to the bias case above, so bias is Some here.
+            let bias = match bias {
+                Some(bias) => bias,
+                None => crate::bail!("fused snake epilogue requires a bias"),
+            };
+            launch_args.arg(bias);
+            launch_args.arg(alpha);
+            launch_args.arg(beta);
+            launch_args.arg(&mut *dst.data);
+            unsafe { launch_args.launch(cfg) }?;
+            return Ok(());
+        }
     }
     launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;

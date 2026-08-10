@@ -243,12 +243,30 @@ __device__ void conv_transpose1d_direct_kernel(
 // Grid: (ceil(C/TILE), ceil(L/TILE), B), Block: (TILE, BLOCK_ROWS)
 // ============================================================================
 
+// Snake activation applied per output channel inside a conv epilogue:
+//   y = x + beta_scale[c] * sin(alpha[c] * x)^2
+// The epilogue already has the value in a register and owns the only write to
+// dst, so folding the activation in here removes a whole read+write pass.
+template <typename T>
+__device__ __forceinline__ T snake_apply(
+    T v,
+    const T *alpha,
+    const T *beta_scale,
+    const size_t c
+) {
+    const float x = to_float(v);
+    const float s = sinf(to_float(alpha[c]) * x);
+    return from_float<T>(x + to_float(beta_scale[c]) * s * s);
+}
+
 template <typename T, int TILE_DIM = 32, int BLOCK_ROWS = 8>
 __device__ void transpose_blc_to_bcl(
     const size_t length,
     const size_t channels,
     const T *src,
     const T *bias, // per-channel bias fused into the epilogue, may be nullptr
+    const T *snake_alpha,     // fused snake activation, may be nullptr
+    const T *snake_beta,
     T *dst
 ) {
     __shared__ T tile[TILE_DIM][TILE_DIM + 1];
@@ -275,6 +293,8 @@ __device__ void transpose_blc_to_bcl(
         if (l2 < (int)length && (c2 + j) < (int)channels) {
             T v = tile[threadIdx.x][threadIdx.y + j];
             if (bias != nullptr) v += bias[c2 + j];
+            if (snake_alpha != nullptr)
+                v = snake_apply<T>(v, snake_alpha, snake_beta, c2 + j);
             dst[b * lc + (c2 + j) * length + l2] = v;
         }
     }
@@ -411,7 +431,7 @@ extern "C" __global__ void transpose_blc_bcl_##RUST_NAME( \
     const TYPENAME *src, \
     TYPENAME *dst \
 ) { \
-    transpose_blc_to_bcl<TYPENAME>(length, channels, src, (const TYPENAME*)nullptr, dst); \
+    transpose_blc_to_bcl<TYPENAME>(length, channels, src, (const TYPENAME*)nullptr, (const TYPENAME*)nullptr, (const TYPENAME*)nullptr, dst); \
 } \
 extern "C" __global__ void transpose_blc_bcl_bias_##RUST_NAME( \
     const size_t length, \
@@ -420,7 +440,20 @@ extern "C" __global__ void transpose_blc_bcl_bias_##RUST_NAME( \
     const TYPENAME *bias, \
     TYPENAME *dst \
 ) { \
-    transpose_blc_to_bcl<TYPENAME>(length, channels, src, bias, dst); \
+    transpose_blc_to_bcl<TYPENAME>(length, channels, src, bias, (const TYPENAME*)nullptr, (const TYPENAME*)nullptr, dst); \
+}
+
+#define TRANSPOSE_BLC_BCL_BIAS_SNAKE_OP(TYPENAME, RUST_NAME) \
+extern "C" __global__ void transpose_blc_bcl_bias_snake_##RUST_NAME( \
+    const size_t length, \
+    const size_t channels, \
+    const TYPENAME *src, \
+    const TYPENAME *bias, \
+    const TYPENAME *snake_alpha, \
+    const TYPENAME *snake_beta, \
+    TYPENAME *dst \
+) { \
+    transpose_blc_to_bcl<TYPENAME>(length, channels, src, bias, snake_alpha, snake_beta, dst); \
 }
 
 #define TRANSPOSE_BCL_BLC_OP(TYPENAME, RUST_NAME) \
@@ -439,6 +472,7 @@ extern "C" __global__ void transpose_bcl_blc_##RUST_NAME( \
     CONV1D_DIRECT_OP(TYPENAME, RUST_NAME) \
     CONV_TRANSPOSE1D_DIRECT_OP(TYPENAME, RUST_NAME) \
     TRANSPOSE_BLC_BCL_OP(TYPENAME, RUST_NAME) \
+    TRANSPOSE_BLC_BCL_BIAS_SNAKE_OP(TYPENAME, RUST_NAME) \
     TRANSPOSE_BCL_BLC_OP(TYPENAME, RUST_NAME)
 
 // ============================================================================
