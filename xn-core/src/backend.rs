@@ -197,6 +197,27 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         numel: usize,
     ) -> Result<()>;
 
+    /// Snake activation writing into a window of a longer destination:
+    /// `dst[b, c, dst_offset + l] = snake(src[b, c, l])`, where `dst` rows are
+    /// `dst_len` long and `src` rows `src_len`. Lets the streaming-conv input
+    /// concatenation absorb the activation instead of paying a separate pass.
+    /// Backends that do not implement it must be driven through
+    /// [`Backend::snake`] plus a copy by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn snake_offset<T: crate::WithDTypeF>(
+        _dst: &mut Self::Storage<T>,
+        _src: &Self::Storage<T>,
+        _alpha: &Self::Storage<T>,
+        _beta_scale: &Self::Storage<T>,
+        _channels: usize,
+        _src_len: usize,
+        _dst_len: usize,
+        _dst_offset: usize,
+        _numel: usize,
+    ) -> Result<()> {
+        crate::bail!("snake_offset is not implemented for this backend")
+    }
+
     /// Layer normalization.
     /// Normalizes over the last dimension using mean and variance.
     /// When `remove_mean` is true: y = (x - mean) / sqrt(variance + eps) * weight + bias

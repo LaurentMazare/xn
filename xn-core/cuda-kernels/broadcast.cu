@@ -415,3 +415,59 @@ SNAKE_KERNEL(__half, f16)
 #endif
 
 SNAKE_KERNEL(float, f32)
+
+// ============================================================================
+// Snake activation writing into a window of a longer destination row:
+//   dst[b, c, dst_offset + l] = snake(src[b, c, l])
+// Used to fuse the activation into the streaming-conv input concatenation: the
+// state prefix is copied into dst[.., ..dst_offset] and the new input is
+// activated straight into the remainder, so the activation costs no extra pass.
+// ============================================================================
+
+template<typename T>
+__device__ void snake_offset(
+    const size_t numel,
+    const size_t channels,
+    const size_t src_len,
+    const size_t dst_len,
+    const size_t dst_offset,
+    const T *src,
+    const T *alpha,
+    const T *beta_scale,
+    T *dst
+) {
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    const size_t l = idx % src_len;
+    const size_t c = (idx / src_len) % channels;
+    const size_t b = idx / (src_len * channels);
+    const float x = to_float(src[idx]);
+    const float s = sinf(to_float(alpha[c]) * x);
+    const size_t dst_idx = (b * channels + c) * dst_len + dst_offset + l;
+    dst[dst_idx] = from_float<T>(x + to_float(beta_scale[c]) * s * s);
+}
+
+#define SNAKE_OFFSET_KERNEL(TYPENAME, RUST_NAME) \
+extern "C" __global__ void snake_offset_##RUST_NAME( \
+    const size_t numel, \
+    const size_t channels, \
+    const size_t src_len, \
+    const size_t dst_len, \
+    const size_t dst_offset, \
+    const TYPENAME *src, \
+    const TYPENAME *alpha, \
+    const TYPENAME *beta_scale, \
+    TYPENAME *dst \
+) { \
+    snake_offset<TYPENAME>(numel, channels, src_len, dst_len, dst_offset, src, alpha, beta_scale, dst); \
+}
+
+#if __CUDA_ARCH__ >= 800
+SNAKE_OFFSET_KERNEL(__nv_bfloat16, bf16)
+#endif
+
+#if __CUDA_ARCH__ >= 530
+SNAKE_OFFSET_KERNEL(__half, f16)
+#endif
+
+SNAKE_OFFSET_KERNEL(float, f32)

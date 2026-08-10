@@ -411,6 +411,59 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         Ok(())
     }
 
+    /// Snake activation from `src` into a window of `self`:
+    /// `self[b, c, offset .. offset + src_len] = snake(src)`. `self` and `src`
+    /// must share batch and channel counts; `self` rows may be longer.
+    pub fn snake_offset_(
+        &self,
+        src: &Self,
+        alpha: &Self,
+        beta_scale: &Self,
+        offset: usize,
+    ) -> Result<()> {
+        self.check_not_same_storage(src, "snake_offset_")?;
+        let (db, dc, dst_len) = match *self.shape.dims() {
+            [b, c, l] => (b, c, l),
+            _ => crate::bail!("snake_offset_ expects a 3D dst, got {:?}", self.shape()),
+        };
+        let (sb, sc, src_len) = match *src.shape.dims() {
+            [b, c, l] => (b, c, l),
+            _ => crate::bail!("snake_offset_ expects a 3D src, got {:?}", src.shape()),
+        };
+        if db != sb || dc != sc {
+            crate::bail!(
+                "snake_offset_ batch/channel mismatch: dst {:?} src {:?}",
+                self.shape(),
+                src.shape()
+            )
+        }
+        if offset + src_len > dst_len {
+            crate::bail!("snake_offset_ window {offset}+{src_len} exceeds dst len {dst_len}")
+        }
+        if alpha.elem_count() != dc || beta_scale.elem_count() != dc {
+            crate::bail!(
+                "snake_offset_ expects alpha/beta_scale with {dc} elements, got {:?} and {:?}",
+                alpha.shape(),
+                beta_scale.shape()
+            )
+        }
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let alpha_data = alpha.storage()?;
+        let beta_data = beta_scale.storage()?;
+        B::snake_offset(
+            &mut *dst,
+            &*src_data,
+            &*alpha_data,
+            &*beta_data,
+            dc,
+            src_len,
+            dst_len,
+            offset,
+            src.elem_count(),
+        )
+    }
+
     pub fn layer_norm_(
         &self,
         src: &Self,
