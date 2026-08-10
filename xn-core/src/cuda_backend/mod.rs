@@ -2048,7 +2048,7 @@ impl crate::Backend for Device {
             let kernel = unsafe { &*(kernel as *const Storage<T> as *const Storage<f32>) };
             let bias = bias
                 .map(|b| unsafe { &*(&*b.data as *const CudaSlice<T> as *const CudaSlice<f32>) });
-            cudnn_conv::conv1d_f32(
+            return cudnn_conv::conv1d_f32(
                 dst,
                 src,
                 kernel,
@@ -2062,8 +2062,7 @@ impl crate::Backend for Device {
                 stride,
                 padding,
                 dilation,
-            )?;
-            return Ok(bias.is_some());
+            );
         }
         if groups == 1 {
             conv1d_im2col(

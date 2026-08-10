@@ -42,6 +42,15 @@ fn with_cudnn<R>(device: &Device, f: impl FnOnce(&Arc<Cudnn>) -> Result<R>) -> R
     f(guard.as_ref().unwrap())
 }
 
+/// XN_CUDNN_NOFUSE=1: skip the fused bias epilogue so the forward conv can use
+/// the heuristically-picked algorithm instead of IMPLICIT_PRECOMP_GEMM, which
+/// is the only algorithm the identity activation supports. Bias is then added
+/// by the caller. Experiment gate: fusing bias costs the tensor-core path.
+fn nofuse_bias() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XN_CUDNN_NOFUSE").is_ok_and(|v| v == "1"))
+}
+
 fn math_type() -> sys::cudnnMathType_t {
     if tf32() {
         sys::cudnnMathType_t::CUDNN_TENSOR_OP_MATH
@@ -65,7 +74,7 @@ pub(crate) fn conv1d_f32(
     stride: usize,
     padding: usize,
     dilation: usize,
-) -> Result<()> {
+) -> Result<bool> {
     let device = dst.device.clone();
     with_cudnn(&device, |cudnn| {
         const NCHW: sys::cudnnTensorFormat_t = sys::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW;
@@ -87,7 +96,7 @@ pub(crate) fn conv1d_f32(
         )?;
         conv.set_math_type(math_type())?;
 
-        match bias {
+        match bias.filter(|_| !nofuse_bias()) {
             Some(bias) => {
                 let bias_desc =
                     cudnn.create_4d_tensor::<f32>(NCHW, [1, out_channels as i32, 1, 1])?;
@@ -124,6 +133,7 @@ pub(crate) fn conv1d_f32(
                         &mut *dst.data,
                     )
                 }?;
+                return Ok(true);
             }
             None => {
                 let op = cudarc::cudnn::ConvForward::<f32, f32, f32> {
@@ -148,7 +158,7 @@ pub(crate) fn conv1d_f32(
                 }?;
             }
         }
-        Ok(())
+        Ok(false)
     })
 }
 
