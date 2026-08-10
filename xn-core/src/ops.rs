@@ -248,6 +248,15 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         Ok(result)
     }
 
+    /// Fused snake activation: y = x + beta_scale[c] * sin(alpha[c] * x)^2
+    /// self has shape (b, c, l); alpha and beta_scale have c elements each.
+    #[tracing::instrument(skip_all)]
+    pub fn snake(&self, alpha: &Self, beta_scale: &Self) -> Result<Self> {
+        let result = unsafe { Tensor::alloc_uninit(self.shape.clone(), self.device()) }?;
+        result.snake_(self, alpha, beta_scale)?;
+        Ok(result)
+    }
+
     #[tracing::instrument(skip_all)]
     pub fn layer_norm(&self, weight: &Self, bias: &Self, eps: f32) -> Result<Self> {
         self.layer_norm_rm(weight, bias, eps, true)
@@ -313,11 +322,6 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         // Compute output length
         let out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
 
-        let mut result =
-            unsafe { Tensor::alloc_uninit((batch, out_channels, out_length), self.device()) }?;
-        result.conv1d_(self, kernel, stride, padding, dilation, groups)?;
-
-        // Add bias if provided
         if let Some(bias) = bias {
             let bias_dims = bias.dims();
             if bias_dims != [out_channels] {
@@ -326,6 +330,17 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
                     bias.shape()
                 );
             }
+        }
+
+        let mut result =
+            unsafe { Tensor::alloc_uninit((batch, out_channels, out_length), self.device()) }?;
+        let bias_applied =
+            result.conv1d_with_bias_(self, kernel, bias, stride, padding, dilation, groups)?;
+
+        // Add bias separately if the backend did not fuse it
+        if let Some(bias) = bias
+            && !bias_applied
+        {
             // Reshape bias to (1, out_channels, 1) for broadcasting
             let bias = bias.reshape((1, out_channels, 1))?;
             result = result.broadcast_add(&bias)?;
@@ -366,11 +381,6 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         // out_length = (length - 1) * stride - 2 * padding + kernel_size + output_padding
         let out_length = (length - 1) * stride + kernel_size + output_padding - 2 * padding;
 
-        let mut result =
-            unsafe { Tensor::alloc_uninit((batch, out_channels, out_length), self.device()) }?;
-        result.conv_transpose1d_(self, kernel, stride, padding, output_padding, groups)?;
-
-        // Add bias if provided
         if let Some(bias) = bias {
             let bias_dims = bias.dims();
             if bias_dims != [out_channels] {
@@ -379,6 +389,24 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
                     bias.shape()
                 );
             }
+        }
+
+        let mut result =
+            unsafe { Tensor::alloc_uninit((batch, out_channels, out_length), self.device()) }?;
+        let bias_applied = result.conv_transpose1d_with_bias_(
+            self,
+            kernel,
+            bias,
+            stride,
+            padding,
+            output_padding,
+            groups,
+        )?;
+
+        // Add bias separately if the backend did not fuse it
+        if let Some(bias) = bias
+            && !bias_applied
+        {
             // Reshape bias to (1, out_channels, 1) for broadcasting
             let bias = bias.reshape((1, out_channels, 1))?;
             result = result.broadcast_add(&bias)?;

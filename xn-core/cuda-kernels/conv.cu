@@ -81,6 +81,7 @@ __device__ void col2im1d_kernel(
     const size_t k_size,
     const size_t stride,
     const T *src,
+    const T *bias, // per-channel bias fused into the epilogue, may be nullptr
     T *dst
 ) {
     const size_t b = blockIdx.z;
@@ -112,7 +113,7 @@ __device__ void col2im1d_kernel(
             }
 
             size_t dst_idx = b * c_out * l_out + (size_t)c_idx * l_out + (size_t)l_out_idx;
-            dst[dst_idx] = sum;
+            dst[dst_idx] = (bias == nullptr) ? sum : sum + bias[c_idx];
         }
     }
 }
@@ -247,6 +248,7 @@ __device__ void transpose_blc_to_bcl(
     const size_t length,
     const size_t channels,
     const T *src,
+    const T *bias, // per-channel bias fused into the epilogue, may be nullptr
     T *dst
 ) {
     __shared__ T tile[TILE_DIM][TILE_DIM + 1];
@@ -270,8 +272,11 @@ __device__ void transpose_blc_to_bcl(
     int c2 = blockIdx.x * TILE_DIM + threadIdx.y;
 
     for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
-        if (l2 < (int)length && (c2 + j) < (int)channels)
-            dst[b * lc + (c2 + j) * length + l2] = tile[threadIdx.x][threadIdx.y + j];
+        if (l2 < (int)length && (c2 + j) < (int)channels) {
+            T v = tile[threadIdx.x][threadIdx.y + j];
+            if (bias != nullptr) v += bias[c2 + j];
+            dst[b * lc + (c2 + j) * length + l2] = v;
+        }
     }
 }
 
@@ -343,7 +348,19 @@ extern "C" __global__ void col2im1d_##RUST_NAME( \
     const TYPENAME *src, \
     TYPENAME *dst \
 ) { \
-    col2im1d_kernel<TYPENAME>(l_in, c_out, l_out, k_size, stride, src, dst); \
+    col2im1d_kernel<TYPENAME>(l_in, c_out, l_out, k_size, stride, src, (const TYPENAME*)nullptr, dst); \
+} \
+extern "C" __global__ void col2im1d_bias_##RUST_NAME( \
+    const size_t l_in, \
+    const size_t c_out, \
+    const size_t l_out, \
+    const size_t k_size, \
+    const size_t stride, \
+    const TYPENAME *src, \
+    const TYPENAME *bias, \
+    TYPENAME *dst \
+) { \
+    col2im1d_kernel<TYPENAME>(l_in, c_out, l_out, k_size, stride, src, bias, dst); \
 }
 
 #define CONV1D_DIRECT_OP(TYPENAME, RUST_NAME) \
@@ -394,7 +411,16 @@ extern "C" __global__ void transpose_blc_bcl_##RUST_NAME( \
     const TYPENAME *src, \
     TYPENAME *dst \
 ) { \
-    transpose_blc_to_bcl<TYPENAME>(length, channels, src, dst); \
+    transpose_blc_to_bcl<TYPENAME>(length, channels, src, (const TYPENAME*)nullptr, dst); \
+} \
+extern "C" __global__ void transpose_blc_bcl_bias_##RUST_NAME( \
+    const size_t length, \
+    const size_t channels, \
+    const TYPENAME *src, \
+    const TYPENAME *bias, \
+    TYPENAME *dst \
+) { \
+    transpose_blc_to_bcl<TYPENAME>(length, channels, src, bias, dst); \
 }
 
 #define TRANSPOSE_BCL_BLC_OP(TYPENAME, RUST_NAME) \

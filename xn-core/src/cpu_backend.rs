@@ -958,6 +958,32 @@ impl crate::Backend for crate::CpuDevice {
         Ok(())
     }
 
+    fn snake<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        alpha: &Self::Storage<T>,
+        beta_scale: &Self::Storage<T>,
+        channels: usize,
+        row_len: usize,
+        numel: usize,
+    ) -> Result<()> {
+        let src = &src[..numel];
+        let dst = &mut dst[..numel];
+        src.par_chunks(row_len).zip(dst.par_chunks_mut(row_len)).enumerate().for_each(
+            |(row, (src, dst))| {
+                let c = row % channels;
+                let alpha = alpha[c].to_f32();
+                let beta_scale = beta_scale[c].to_f32();
+                for (d, s) in dst.iter_mut().zip(src.iter()) {
+                    let x = (*s).to_f32();
+                    let sin = (alpha * x).sin();
+                    *d = T::from_f32(x + beta_scale * sin * sin)
+                }
+            },
+        );
+        Ok(())
+    }
+
     fn layer_norm<T: WithDTypeF>(
         dst: &mut Self::Storage<T>,
         src: &Self::Storage<T>,

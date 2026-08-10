@@ -1787,3 +1787,88 @@ fn test_matmul_batched_strided_impl<B: Backend>(dev: &B) -> Result<()> {
     Ok(())
 }
 test_all_backends!(test_matmul_batched_strided, test_matmul_batched_strided_impl);
+
+// Fused snake activation: check against the composed op sequence it replaces
+// (broadcast_mul -> sin -> sqr -> broadcast_mul -> add) and a host reference.
+fn test_snake_impl<B: Backend>(device: &B) -> Result<()> {
+    let (b, c, l) = (2, 3, 17);
+    let xs: Vec<f32> = (0..b * c * l)
+        .map(|i| ((i as f32) * 0.37 - 10.0) * ((i % 7) as f32 * 0.21 + 0.1))
+        .collect();
+    let alpha: Vec<f32> = (0..c).map(|i| 0.5 + i as f32 * 0.8).collect();
+    let beta_scale: Vec<f32> = (0..c).map(|i| 1.7 - i as f32 * 0.4).collect();
+
+    let xs_t: Tensor<f32, B> = Tensor::from_vec(xs.clone(), vec![b, c, l], device)?;
+    let alpha_t: Tensor<f32, B> = Tensor::from_vec(alpha.clone(), vec![1, c, 1], device)?;
+    let beta_t: Tensor<f32, B> = Tensor::from_vec(beta_scale.clone(), vec![1, c, 1], device)?;
+
+    let fused = xs_t.snake(&alpha_t, &beta_t)?.to_vec()?;
+    let sin2 = xs_t.broadcast_mul(&alpha_t)?.sin()?.sqr()?;
+    let composed = xs_t.add(&sin2.broadcast_mul(&beta_t)?)?.to_vec()?;
+
+    for (i, (f, cm)) in fused.iter().zip(composed.iter()).enumerate() {
+        assert!((f - cm).abs() <= 1e-5 * cm.abs().max(1.0), "idx {i}: fused {f} composed {cm}");
+        let ch = (i / l) % c;
+        let x = xs[i];
+        let s = (alpha[ch] * x).sin();
+        let reference = x + beta_scale[ch] * s * s;
+        assert!(
+            (f - reference).abs() <= 1e-5 * reference.abs().max(1.0),
+            "idx {i}: fused {f} reference {reference}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_snake_cpu() -> Result<()> {
+    test_snake_impl(&xn::CPU)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_snake_cuda() -> Result<()> {
+    let device = xn::cuda_backend::Device::new(0)?;
+    test_snake_impl(&device)
+}
+
+// Conv bias fusion: conv with bias must match conv without bias + broadcast
+// add, on every backend (fused epilogue on cuda, fallback path elsewhere).
+fn test_conv_bias_fusion_impl<B: Backend>(device: &B) -> Result<()> {
+    let (b, c_in, c_out, l, k) = (2, 5, 7, 13, 3);
+    let xs: Vec<f32> =
+        (0..b * c_in * l).map(|i| ((i * 37 + 11) % 23) as f32 * 0.17 - 1.9).collect();
+    let w: Vec<f32> =
+        (0..c_out * c_in * k).map(|i| ((i * 29 + 5) % 19) as f32 * 0.11 - 1.0).collect();
+    let bias: Vec<f32> = (0..c_out).map(|i| i as f32 * 0.73 - 2.1).collect();
+
+    let xs: Tensor<f32, B> = Tensor::from_vec(xs, vec![b, c_in, l], device)?;
+    let w_t: Tensor<f32, B> = Tensor::from_vec(w.clone(), vec![c_out, c_in, k], device)?;
+    let bias_t: Tensor<f32, B> = Tensor::from_vec(bias, vec![c_out], device)?;
+
+    let fused = xs.conv1d(&w_t, Some(&bias_t), 1, 1, 1, 1)?;
+    let unfused =
+        xs.conv1d(&w_t, None, 1, 1, 1, 1)?.broadcast_add(&bias_t.reshape((1, c_out, 1))?)?;
+    assert_eq!(fused.to_vec()?, unfused.to_vec()?, "conv1d bias mismatch");
+
+    // conv_transpose1d: kernel layout (c_in, c_out, k), stride 2 upsampling
+    let wt: Tensor<f32, B> = Tensor::from_vec(w, vec![c_in, c_out, k], device)?;
+    let fused = xs.conv_transpose1d(&wt, Some(&bias_t), 2, 0, 0, 1)?;
+    let unfused = xs
+        .conv_transpose1d(&wt, None, 2, 0, 0, 1)?
+        .broadcast_add(&bias_t.reshape((1, c_out, 1))?)?;
+    assert_eq!(fused.to_vec()?, unfused.to_vec()?, "conv_transpose1d bias mismatch");
+    Ok(())
+}
+
+#[test]
+fn test_conv_bias_fusion_cpu() -> Result<()> {
+    test_conv_bias_fusion_impl(&xn::CPU)
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn test_conv_bias_fusion_cuda() -> Result<()> {
+    let device = xn::cuda_backend::Device::new(0)?;
+    test_conv_bias_fusion_impl(&device)
+}

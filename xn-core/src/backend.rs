@@ -184,6 +184,19 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         eps: f32,
     ) -> Result<()>;
 
+    /// Fused snake activation: dst = x + beta_scale[c] * sin(alpha[c] * x)^2
+    /// src/dst are contiguous with `row_len` elements per channel row and
+    /// `channels` channels; alpha and beta_scale hold one value per channel.
+    fn snake<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        alpha: &Self::Storage<T>,
+        beta_scale: &Self::Storage<T>,
+        channels: usize,
+        row_len: usize,
+        numel: usize,
+    ) -> Result<()>;
+
     /// Layer normalization.
     /// Normalizes over the last dimension using mean and variance.
     /// When `remove_mean` is true: y = (x - mean) / sqrt(variance + eps) * weight + bias
@@ -329,4 +342,80 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         output_padding: usize,
         groups: usize,
     ) -> Result<()>;
+
+    /// Same as [`Backend::conv1d`], but backends that can fuse the
+    /// per-channel bias into the convolution epilogue apply it and return
+    /// `Ok(true)`. The default implementation ignores the bias and returns
+    /// `Ok(false)`, in which case the caller must apply it separately.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_with_bias<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        _bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        Self::conv1d(
+            dst,
+            src,
+            kernel,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
+        Ok(false)
+    }
+
+    /// Same as [`Backend::conv_transpose1d`], with the bias-fusion contract
+    /// of [`Backend::conv1d_with_bias`].
+    #[allow(clippy::too_many_arguments)]
+    fn conv_transpose1d_with_bias<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        _bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        Self::conv_transpose1d(
+            dst,
+            src,
+            kernel,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            groups,
+        )?;
+        Ok(false)
+    }
 }
