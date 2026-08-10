@@ -373,8 +373,8 @@ impl Fp8Linear {
         // Flatten batch dims into M for 2D matmul.
         let xs = xs.reshape(((), k))?;
         let (m, _) = xs.dims2()?;
-        let wdims = self.weight.shape.dims();
-        let (n, wk) = (wdims[0], wdims[1]);
+        let n = self.weight.shape.dim(0)?;
+        let wk = self.weight.shape.dim(1)?;
         // cublasLt fp8 matmuls need 16-aligned dims; unaligned shapes (the
         // [text_card + 1, d] prefix-table fold at load, tiny head
         // projections) fall back to a dequantized bf16 matmul.
