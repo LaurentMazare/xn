@@ -53,7 +53,7 @@ impl Fp8Tensor {
         let hidden_size = shape.dim(crate::D::Minus1)?;
         let num_tokens: usize = shape.elem_count() / hidden_size;
         let storage = src.storage()?;
-        quantize_fp8(&storage.device, &storage.data, num_tokens, hidden_size, shape.clone())
+        quantize_fp8(&storage.device, &*storage.data, num_tokens, hidden_size, shape.clone())
     }
 
     /// Quantize a `Tensor<T, Device>` into an `Fp8Tensor` using dynamic per-token scaling.
@@ -64,7 +64,7 @@ impl Fp8Tensor {
         let storage = src.storage()?;
         quantize_fp8_per_token(
             &storage.device,
-            &storage.data,
+            &*storage.data,
             num_tokens,
             hidden_size,
             shape.clone(),
@@ -104,7 +104,8 @@ impl Fp8Tensor {
             }
         }
 
-        let storage = Storage { data: out, device: self.device.clone() };
+        let storage =
+            Storage { data: std::mem::ManuallyDrop::new(out), device: self.device.clone() };
         Ok(Tensor {
             data: Arc::new(RwLock::new(storage)),
             shape: self.shape.clone(),
@@ -172,7 +173,8 @@ impl Fp8Tensor {
         )?;
 
         let out_shape: Shape = (m, n).into();
-        let storage = Storage { data: out, device: self.device.clone() };
+        let storage =
+            Storage { data: std::mem::ManuallyDrop::new(out), device: self.device.clone() };
         Ok(Tensor {
             data: Arc::new(RwLock::new(storage)),
             shape: out_shape,

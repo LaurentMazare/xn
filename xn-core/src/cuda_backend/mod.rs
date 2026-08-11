@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 mod cublaslt;
+mod cudnn_conv;
 mod kernels;
 pub mod quantization;
 
@@ -59,6 +60,8 @@ pub struct DeviceInner {
     stream: Arc<CudaStream>,
     blas: cudarc::cublas::CudaBlas,
     pub(crate) blas_lt: cublaslt::CudaBlasLT,
+    /// Lazily-initialized cuDNN handle used by the XN_CUDNN=1 conv path.
+    cudnn: cudnn_conv::CudnnCtx,
     curand: Mutex<CudaRng>,
     /// Cache for loaded PTX modules
     modules: Mutex<ModuleCache>,
@@ -158,6 +161,7 @@ impl Device {
             stream,
             blas,
             blas_lt,
+            cudnn: cudnn_conv::CudnnCtx::new(),
             modules: Mutex::new(Default::default()),
             curand: Mutex::new(CudaRng(curand)),
             htod_mode: std::sync::atomic::AtomicU8::new(0),
@@ -226,6 +230,12 @@ impl Device {
                 crate::bail!("{op}: unexpected htod mode {cur} (record/capture calls unbalanced?)")
             }
         }
+    }
+
+    /// Whether the device stream is currently being captured into a CUDA
+    /// graph (between [`Device::capture_begin`] and [`Device::capture_end`]).
+    pub fn is_capturing(&self) -> bool {
+        self.htod_mode.load(std::sync::atomic::Ordering::Relaxed) == htod_mode::REPLAY
     }
 
     /// Start recording host uploads in the device-side cache, see
@@ -438,8 +448,22 @@ impl Device {
 
 /// CUDA storage that holds both the device data and a reference to the device.
 pub struct Storage<T: WithDType> {
-    pub data: CudaSlice<T>,
+    pub data: std::mem::ManuallyDrop<CudaSlice<T>>,
     pub device: Device,
+}
+
+impl<T: WithDType> Drop for Storage<T> {
+    fn drop(&mut self) {
+        if self.device.is_capturing() {
+            // A stream-ordered free of memory allocated outside the capture
+            // is invalid while the stream is capturing a CUDA graph
+            // (CUDA_ERROR_INVALID_VALUE at capture time). Leak the buffer
+            // instead: captures are short one-step windows, so the leak is
+            // bounded by one step of state churn.
+        } else {
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.data) }
+        }
+    }
 }
 
 impl<T: WithDType> Storage<T> {
@@ -587,7 +611,7 @@ fn gemm_f32(
 
     let lhs = lhs.0.data.slice(lhs.1..);
     let rhs = rhs.0.data.slice(rhs.1..);
-    unsafe { gemm_strided_batched_f32(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
+    unsafe { gemm_strided_batched_f32(&dst.device.blas, cfg, &rhs, &lhs, &mut *dst.data)? }
 
     Ok(())
 }
@@ -620,7 +644,7 @@ fn gemm_f16(
     )?;
     let lhs = lhs.0.data.slice(lhs.1..);
     let rhs = rhs.0.data.slice(rhs.1..);
-    unsafe { gemm_strided_batched_f16(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
+    unsafe { gemm_strided_batched_f16(&dst.device.blas, cfg, &rhs, &lhs, &mut *dst.data)? }
 
     Ok(())
 }
@@ -653,7 +677,7 @@ fn gemm_bf16(
     )?;
     let lhs = lhs.0.data.slice(lhs.1..);
     let rhs = rhs.0.data.slice(rhs.1..);
-    unsafe { gemm_strided_batched_bf16(&dst.device.blas, cfg, &rhs, &lhs, &mut dst.data)? }
+    unsafe { gemm_strided_batched_bf16(&dst.device.blas, cfg, &rhs, &lhs, &mut *dst.data)? }
     Ok(())
 }
 
@@ -744,10 +768,10 @@ pub fn flash_attn<T: WithDType>(
     let len_kv = len_kv as i32;
     let head_dim = head_dim as i32;
     let mut launch_args = dst.device.stream.launch_builder(&func);
-    launch_args.arg(&q.data);
-    launch_args.arg(&k.data);
-    launch_args.arg(&v.data);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&*q.data);
+    launch_args.arg(&*k.data);
+    launch_args.arg(&*v.data);
+    launch_args.arg(&mut *dst.data);
     launch_args.arg(&bs);
     launch_args.arg(&len_q);
     launch_args.arg(&len_kv);
@@ -774,12 +798,12 @@ impl crate::Backend for Device {
 
     unsafe fn alloc_uninit<T: WithDType>(len: usize, dev: &Self) -> Result<Self::Storage<T>> {
         let data = unsafe { dev.stream.alloc::<T>(len) }?;
-        Ok(Storage { data, device: dev.clone() })
+        Ok(Storage { data: std::mem::ManuallyDrop::new(data), device: dev.clone() })
     }
 
     fn from_vec<T: WithDType>(v: Vec<T>, dev: &Self) -> Result<Self::Storage<T>> {
         let data = dev.cached_htod(&v)?;
-        Ok(Storage { data, device: dev.clone() })
+        Ok(Storage { data: std::mem::ManuallyDrop::new(data), device: dev.clone() })
     }
 
     fn fill<T: WithDType>(dst: &mut Self::Storage<T>, elem: T, len: usize) -> Result<()> {
@@ -790,7 +814,7 @@ impl crate::Backend for Device {
         let func = dst.device.get_func(&kname, PTXModule::Fill)?;
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&elem);
         launch_args.arg(&len);
         unsafe { launch_args.launch(cfg) }?;
@@ -810,7 +834,7 @@ impl crate::Backend for Device {
             let cfg = LaunchConfig::for_num_elems(len as u32);
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&len);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&mut *dst.data);
             launch_args.arg(&range);
             launch_args.arg(&lo);
             unsafe { launch_args.launch(cfg) }?;
@@ -846,8 +870,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -883,7 +907,7 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&mut *dst.data);
         if let Some(ref alpha) = alpha {
             launch_args.arg(alpha);
         }
@@ -909,8 +933,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&s.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*s.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -942,8 +966,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         if let Some(ref alpha) = alpha {
             launch_args.arg(alpha);
         }
@@ -970,9 +994,9 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&lhs.data);
-        launch_args.arg(&rhs.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*lhs.data);
+        launch_args.arg(&*rhs.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -994,8 +1018,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig::for_num_elems(len as u32);
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&len);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&scale);
         launch_args.arg(&add);
         unsafe { launch_args.launch(cfg) }?;
@@ -1036,8 +1060,8 @@ impl crate::Backend for Device {
             launch_args.arg(&d_i);
             launch_args.arg(&d_j);
             launch_args.arg(&d_k);
-            launch_args.arg(&src.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*src.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         }
         Ok(())
@@ -1111,8 +1135,8 @@ impl crate::Backend for Device {
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&cos_slice);
         launch_args.arg(&sin_slice);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&td);
         launch_args.arg(&d_u32);
@@ -1153,8 +1177,8 @@ impl crate::Backend for Device {
         let mut launch_args = dst.device.stream.launch_builder(&func);
         launch_args.arg(&cos_slice);
         launch_args.arg(&sin_slice);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&td);
         launch_args.arg(&h_u32);
@@ -1289,8 +1313,8 @@ impl crate::Backend for Device {
             launch_args.arg(&cols);
             launch_args.arg(&src_stride);
             launch_args.arg(&src_offset_u32);
-            launch_args.arg(&src.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*src.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
             return Ok(());
         }
@@ -1309,8 +1333,8 @@ impl crate::Backend for Device {
         launch_args.arg(&num_dims_u32);
         launch_args.arg(&info_dev);
         launch_args.arg(&src_offset_u32);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1338,9 +1362,9 @@ impl crate::Backend for Device {
         let dst_dim_size_i32 = dst_dim_size as i32;
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&mut dst.data);
-        launch_args.arg(&src.data);
-        launch_args.arg(&ids.data);
+        launch_args.arg(&mut *dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&*ids.data);
         launch_args.arg(&numel_i32);
         launch_args.arg(&right_size_i32);
         launch_args.arg(&src_dim_size_i32);
@@ -1393,7 +1417,7 @@ impl crate::Backend for Device {
             launch_args.arg(&num_ids_i32);
             launch_args.arg(&right_size_i32);
             launch_args.arg(&src_dim_size_i32);
-            launch_args.arg(&ids.data);
+            launch_args.arg(&*ids.data);
             launch_args.arg(&src_slice);
             launch_args.arg(&mut dst_slice);
             unsafe { launch_args.launch(cfg) }?;
@@ -1419,7 +1443,7 @@ impl crate::Backend for Device {
         let offset = offset as u32;
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&bh);
         launch_args.arg(&t1);
         launch_args.arg(&t2);
@@ -1448,8 +1472,8 @@ impl crate::Backend for Device {
         let cfg = LaunchConfig { block_dim, grid_dim, shared_mem_bytes: 0 };
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         launch_args.arg(&ncols);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
@@ -1477,12 +1501,64 @@ impl crate::Backend for Device {
         };
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
-        launch_args.arg(&alpha.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
+        launch_args.arg(&*alpha.data);
         launch_args.arg(&ncols);
         launch_args.arg(&block_size);
         launch_args.arg(&eps);
+        unsafe { launch_args.launch(cfg) }?;
+        Ok(())
+    }
+
+    fn snake_offset<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        alpha: &Self::Storage<T>,
+        beta_scale: &Self::Storage<T>,
+        channels: usize,
+        src_len: usize,
+        dst_len: usize,
+        dst_offset: usize,
+        numel: usize,
+    ) -> Result<()> {
+        let kname = kernel_name::<T>("snake_offset");
+        let func = dst.device.get_func(&kname, PTXModule::Broadcast)?;
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        let mut launch_args = dst.device.stream.launch_builder(&func);
+        launch_args.arg(&numel);
+        launch_args.arg(&channels);
+        launch_args.arg(&src_len);
+        launch_args.arg(&dst_len);
+        launch_args.arg(&dst_offset);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&*alpha.data);
+        launch_args.arg(&*beta_scale.data);
+        launch_args.arg(&mut *dst.data);
+        unsafe { launch_args.launch(cfg) }?;
+        Ok(())
+    }
+
+    fn snake<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        alpha: &Self::Storage<T>,
+        beta_scale: &Self::Storage<T>,
+        channels: usize,
+        row_len: usize,
+        numel: usize,
+    ) -> Result<()> {
+        let kname = kernel_name::<T>("snake");
+        let func = dst.device.get_func(&kname, PTXModule::Broadcast)?;
+        let cfg = LaunchConfig::for_num_elems(numel as u32);
+        let mut launch_args = dst.device.stream.launch_builder(&func);
+        launch_args.arg(&numel);
+        launch_args.arg(&channels);
+        launch_args.arg(&row_len);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&*alpha.data);
+        launch_args.arg(&*beta_scale.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1512,10 +1588,10 @@ impl crate::Backend for Device {
         };
 
         let mut launch_args = dst.device.stream.launch_builder(&func);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
-        launch_args.arg(&weight.data);
-        launch_args.arg(&bias.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
+        launch_args.arg(&*weight.data);
+        launch_args.arg(&*bias.data);
         launch_args.arg(&ncols);
         launch_args.arg(&block_size);
         launch_args.arg(&eps);
@@ -1557,8 +1633,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1596,8 +1672,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1635,8 +1711,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1671,8 +1747,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1710,8 +1786,8 @@ impl crate::Backend for Device {
         launch_args.arg(&el_to_sum_per_block);
         launch_args.arg(&num_dims);
         launch_args.arg(&info_dev);
-        launch_args.arg(&src.data);
-        launch_args.arg(&mut dst.data);
+        launch_args.arg(&*src.data);
+        launch_args.arg(&mut *dst.data);
         unsafe { launch_args.launch(cfg) }?;
         Ok(())
     }
@@ -1751,9 +1827,9 @@ impl crate::Backend for Device {
             let func = dst.device.get_func(&kname, PTXModule::Broadcast)?;
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if lhs_no_zero && dst_shape.len() == 2 && rhs_strides == [0, 1] {
             // rhs broadcasts along first dim
@@ -1763,9 +1839,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if lhs_no_zero && dst_shape.len() == 2 && rhs_strides == [1, 0] {
             // rhs broadcasts along second dim
@@ -1775,9 +1851,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if rhs_no_zero && dst_shape.len() == 2 && lhs_strides == [0, 1] {
             // lhs broadcasts along first dim
@@ -1787,9 +1863,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if rhs_no_zero && dst_shape.len() == 2 && lhs_strides == [1, 0] {
             // lhs broadcasts along second dim
@@ -1799,9 +1875,9 @@ impl crate::Backend for Device {
             let mut launch_args = dst.device.stream.launch_builder(&func);
             launch_args.arg(&numel);
             launch_args.arg(&dim1);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if lhs_no_zero
             && dst_shape.len() == 3
@@ -1818,9 +1894,9 @@ impl crate::Backend for Device {
             launch_args.arg(&numel);
             launch_args.arg(&dim12);
             launch_args.arg(&dim2);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else if rhs_no_zero
             && dst_shape.len() == 3
@@ -1837,9 +1913,9 @@ impl crate::Backend for Device {
             launch_args.arg(&numel);
             launch_args.arg(&dim12);
             launch_args.arg(&dim2);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         } else {
             // General strided case
@@ -1859,9 +1935,9 @@ impl crate::Backend for Device {
             launch_args.arg(&numel);
             launch_args.arg(&num_dims_u32);
             launch_args.arg(&info_dev);
-            launch_args.arg(&lhs.data);
-            launch_args.arg(&rhs.data);
-            launch_args.arg(&mut dst.data);
+            launch_args.arg(&*lhs.data);
+            launch_args.arg(&*rhs.data);
+            launch_args.arg(&mut *dst.data);
             unsafe { launch_args.launch(cfg) }?;
         }
         Ok(())
@@ -1891,6 +1967,9 @@ impl crate::Backend for Device {
                 dst,
                 src,
                 kernel,
+                None,
+                None,
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -1948,6 +2027,7 @@ impl crate::Backend for Device {
                 dst,
                 src,
                 kernel,
+                None,
                 batch,
                 in_channels,
                 out_channels,
@@ -1975,16 +2055,245 @@ impl crate::Backend for Device {
             )
         }
     }
+
+    fn conv1d_with_bias<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        if cudnn_conv::enabled()
+            && groups == 1
+            && T::DTYPE == DType::F32
+            && kernel_size >= cudnn_conv::min_kernel_size()
+        {
+            let dst = unsafe { &mut *(dst as *mut Storage<T> as *mut Storage<f32>) };
+            let src = unsafe { &*(src as *const Storage<T> as *const Storage<f32>) };
+            let kernel = unsafe { &*(kernel as *const Storage<T> as *const Storage<f32>) };
+            let bias = bias
+                .map(|b| unsafe { &*(&*b.data as *const CudaSlice<T> as *const CudaSlice<f32>) });
+            return cudnn_conv::conv1d_f32(
+                dst,
+                src,
+                kernel,
+                bias,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            );
+        }
+        if groups == 1 {
+            conv1d_im2col(
+                dst,
+                src,
+                kernel,
+                bias.map(|b| &*b.data),
+                None,
+                None,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            )?;
+            Ok(bias.is_some())
+        } else {
+            conv1d_direct(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            )?;
+            Ok(false)
+        }
+    }
+
+    fn conv1d_fused<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        snake: Option<(&Self::Storage<T>, &Self::Storage<T>)>,
+        residual: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<crate::backend::ConvFused> {
+        // Only the im2col path owns its store epilogue, so it is the only one
+        // that can fold anything in; cuDNN and the direct kernel own theirs.
+        let cudnn_takes_it = cudnn_conv::enabled() && kernel_size >= cudnn_conv::min_kernel_size();
+        let fusable = groups == 1 && !cudnn_takes_it && bias.is_some();
+        let want = snake.is_some() || residual.is_some();
+        if fusable && want {
+            conv1d_im2col(
+                dst,
+                src,
+                kernel,
+                bias.map(|b| &*b.data),
+                snake.map(|(a, b)| (&*a.data, &*b.data)),
+                residual.map(|r| &*r.data),
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+            )?;
+            return Ok(crate::backend::ConvFused {
+                bias: true,
+                snake: snake.is_some(),
+                residual: residual.is_some(),
+            });
+        }
+        let bias_applied = Self::conv1d_with_bias(
+            dst,
+            src,
+            kernel,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
+        Ok(crate::backend::ConvFused { bias: bias_applied, snake: false, residual: false })
+    }
+
+    fn conv_transpose1d_with_bias<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        if cudnn_conv::enabled()
+            && !cudnn_conv::fwd_only()
+            && groups == 1
+            && padding == 0
+            && output_padding == 0
+            && T::DTYPE == DType::F32
+        {
+            let dst = unsafe { &mut *(dst as *mut Storage<T> as *mut Storage<f32>) };
+            let src = unsafe { &*(src as *const Storage<T> as *const Storage<f32>) };
+            let kernel = unsafe { &*(kernel as *const Storage<T> as *const Storage<f32>) };
+            cudnn_conv::conv_transpose1d_f32(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+            )?;
+            // The backward-data path has no fused bias epilogue; let the
+            // caller apply it.
+            return Ok(false);
+        }
+        let can_use_col2im = groups == 1 && padding == 0 && output_padding == 0;
+        if can_use_col2im {
+            conv_transpose1d_col2im(
+                dst,
+                src,
+                kernel,
+                bias.map(|b| &*b.data),
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+            )?;
+            Ok(bias.is_some())
+        } else {
+            conv_transpose1d_direct(
+                dst,
+                src,
+                kernel,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                output_padding,
+                groups,
+            )?;
+            Ok(false)
+        }
+    }
 }
 
 // ============================================================================
 // Conv1d implementation using im2col + cuBLAS gemm
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn conv1d_im2col<T: WithDTypeF>(
     dst: &mut Storage<T>,
     src: &Storage<T>,
     kernel: &Storage<T>,
+    bias: Option<&CudaSlice<T>>,
+    snake: Option<(&CudaSlice<T>, &CudaSlice<T>)>,
+    residual: Option<&CudaSlice<T>>,
     batch: usize,
     in_channels: usize,
     out_channels: usize,
@@ -2020,7 +2329,7 @@ fn conv1d_im2col<T: WithDTypeF>(
     launch_args.arg(&stride);
     launch_args.arg(&padding);
     launch_args.arg(&dilation);
-    launch_args.arg(&src.data);
+    launch_args.arg(&*src.data);
     launch_args.arg(&mut col);
     unsafe { launch_args.launch(cfg) }?;
 
@@ -2039,10 +2348,21 @@ fn conv1d_im2col<T: WithDTypeF>(
     // We want: result = col @ kernel^T
     // cuBLAS uses column-major, so we compute: result^T = kernel @ col^T
     // Which gives us result in row-major as [L_out, out_channels]
-    conv1d_gemm(&dst.device, &col, &kernel.data, &mut result, batch, out_length, out_channels, k)?;
+    conv1d_gemm(&dst.device, &col, &*kernel.data, &mut result, batch, out_length, out_channels, k)?;
 
-    // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out]
-    let kname = format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name());
+    // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out],
+    // fusing the per-channel bias into the store when provided.
+    // The fused-snake epilogue is only wired for the bias case, which is what
+    // the seanet decoder always uses; a bias-less snake falls back to a
+    // separate activation pass (see `Tensor::conv1d_snake`).
+    let snake = snake.filter(|_| bias.is_some());
+    let residual = residual.filter(|_| bias.is_some());
+    let fused = snake.is_some() || residual.is_some();
+    let kname = match (bias, fused) {
+        (Some(_), true) => format!("transpose_blc_bcl_fused_{}", T::DTYPE.cuda_name()),
+        (Some(_), false) => format!("transpose_blc_bcl_bias_{}", T::DTYPE.cuda_name()),
+        (None, _) => format!("transpose_blc_bcl_{}", T::DTYPE.cuda_name()),
+    };
     let func = dst.device.get_func(&kname, PTXModule::Conv)?;
     let cfg = LaunchConfig {
         grid_dim: (
@@ -2057,8 +2377,31 @@ fn conv1d_im2col<T: WithDTypeF>(
     let mut launch_args = dst.device.stream.launch_builder(&func);
     launch_args.arg(&out_length);
     launch_args.arg(&out_channels);
+    if !fused {
+        launch_args.arg(&result);
+        if let Some(bias) = bias {
+            launch_args.arg(bias);
+        }
+        launch_args.arg(&mut *dst.data);
+        unsafe { launch_args.launch(cfg) }?;
+        return Ok(());
+    }
+    // Flag-driven fused epilogue: unused pointers are passed as the bias, which
+    // is always present on this path, so no null pointer ever reaches a kernel.
+    let bias = match bias {
+        Some(bias) => bias,
+        None => crate::bail!("fused conv epilogue requires a bias"),
+    };
+    let flags: usize = usize::from(snake.is_some()) | (usize::from(residual.is_some()) << 1);
+    let (alpha, beta) = snake.unwrap_or((bias, bias));
+    let residual = residual.unwrap_or(bias);
+    launch_args.arg(&flags);
     launch_args.arg(&result);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(bias);
+    launch_args.arg(alpha);
+    launch_args.arg(beta);
+    launch_args.arg(residual);
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
@@ -2289,9 +2632,9 @@ fn conv1d_direct<T: WithDTypeF>(
     launch_args.arg(&padding);
     launch_args.arg(&dilation);
     launch_args.arg(&groups);
-    launch_args.arg(&src.data);
-    launch_args.arg(&kernel.data);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&*src.data);
+    launch_args.arg(&*kernel.data);
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
@@ -2305,6 +2648,7 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     dst: &mut Storage<T>,
     src: &Storage<T>,
     kernel: &Storage<T>,
+    bias: Option<&CudaSlice<T>>,
     batch: usize,
     in_channels: usize,
     out_channels: usize,
@@ -2342,7 +2686,7 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     let mut launch_args = dst.device.stream.launch_builder(&func);
     launch_args.arg(&in_channels);
     launch_args.arg(&length);
-    launch_args.arg(&src.data);
+    launch_args.arg(&*src.data);
     launch_args.arg(&mut src_transposed);
     unsafe { launch_args.launch(cfg) }?;
 
@@ -2355,7 +2699,7 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     conv_transpose1d_gemm(
         &dst.device,
         &src_transposed,
-        &kernel.data,
+        &*kernel.data,
         &mut col,
         batch,
         length,
@@ -2363,10 +2707,13 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
         in_channels,
     )?;
 
-    // Step 3: Col2Im transformation
+    // Step 3: Col2Im transformation, fusing the per-channel bias when provided
     // col: [B, L_in, C_out * K] = [B, L_in, C_out, K]
     // output: [B, C_out, L_out]
-    let kname = format!("col2im1d_{}", T::DTYPE.cuda_name());
+    let kname = match bias {
+        Some(_) => format!("col2im1d_bias_{}", T::DTYPE.cuda_name()),
+        None => format!("col2im1d_{}", T::DTYPE.cuda_name()),
+    };
     let func = dst.device.get_func(&kname, PTXModule::Conv)?;
     let cfg = LaunchConfig {
         grid_dim: (
@@ -2385,7 +2732,10 @@ fn conv_transpose1d_col2im<T: WithDTypeF>(
     launch_args.arg(&kernel_size);
     launch_args.arg(&stride);
     launch_args.arg(&col);
-    launch_args.arg(&mut dst.data);
+    if let Some(bias) = bias {
+        launch_args.arg(bias);
+    }
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())
@@ -2578,9 +2928,9 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
     launch_args.arg(&output_padding);
     launch_args.arg(&dilation);
     launch_args.arg(&groups);
-    launch_args.arg(&src.data);
-    launch_args.arg(&kernel.data);
-    launch_args.arg(&mut dst.data);
+    launch_args.arg(&*src.data);
+    launch_args.arg(&*kernel.data);
+    launch_args.arg(&mut *dst.data);
     unsafe { launch_args.launch(cfg) }?;
 
     Ok(())

@@ -376,6 +376,94 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         Ok(())
     }
 
+    /// Fused snake activation: self = src + beta_scale[c] * sin(alpha[c] * src)^2
+    /// src has shape (b, c, l); alpha and beta_scale have c elements each
+    /// (trailing singleton dims are accepted, e.g. (1, c, 1)).
+    pub fn snake_(&self, src: &Self, alpha: &Self, beta_scale: &Self) -> Result<()> {
+        self.check_not_same_storage(src, "snake_")?;
+        self.check_not_same_storage(alpha, "snake_")?;
+        self.check_not_same_storage(beta_scale, "snake_")?;
+        check_same_shape(&self.shape, &src.shape, "snake_ src")?;
+        let (_b, channels, row_len) = match *self.shape.dims() {
+            [b, c, l] => (b, c, l),
+            _ => crate::bail!("snake_ expects a 3D tensor, got shape {:?}", self.shape()),
+        };
+        if alpha.elem_count() != channels || beta_scale.elem_count() != channels {
+            crate::bail!(
+                "snake_ expects alpha/beta_scale with {channels} elements, got {:?} and {:?}",
+                alpha.shape(),
+                beta_scale.shape()
+            );
+        }
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let alpha_data = alpha.storage()?;
+        let beta_scale_data = beta_scale.storage()?;
+        B::snake(
+            &mut *dst,
+            &*src_data,
+            &*alpha_data,
+            &*beta_scale_data,
+            channels,
+            row_len,
+            self.elem_count(),
+        )?;
+        Ok(())
+    }
+
+    /// Snake activation from `src` into a window of `self`:
+    /// `self[b, c, offset .. offset + src_len] = snake(src)`. `self` and `src`
+    /// must share batch and channel counts; `self` rows may be longer.
+    pub fn snake_offset_(
+        &self,
+        src: &Self,
+        alpha: &Self,
+        beta_scale: &Self,
+        offset: usize,
+    ) -> Result<()> {
+        self.check_not_same_storage(src, "snake_offset_")?;
+        let (db, dc, dst_len) = match *self.shape.dims() {
+            [b, c, l] => (b, c, l),
+            _ => crate::bail!("snake_offset_ expects a 3D dst, got {:?}", self.shape()),
+        };
+        let (sb, sc, src_len) = match *src.shape.dims() {
+            [b, c, l] => (b, c, l),
+            _ => crate::bail!("snake_offset_ expects a 3D src, got {:?}", src.shape()),
+        };
+        if db != sb || dc != sc {
+            crate::bail!(
+                "snake_offset_ batch/channel mismatch: dst {:?} src {:?}",
+                self.shape(),
+                src.shape()
+            )
+        }
+        if offset + src_len > dst_len {
+            crate::bail!("snake_offset_ window {offset}+{src_len} exceeds dst len {dst_len}")
+        }
+        if alpha.elem_count() != dc || beta_scale.elem_count() != dc {
+            crate::bail!(
+                "snake_offset_ expects alpha/beta_scale with {dc} elements, got {:?} and {:?}",
+                alpha.shape(),
+                beta_scale.shape()
+            )
+        }
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let alpha_data = alpha.storage()?;
+        let beta_data = beta_scale.storage()?;
+        B::snake_offset(
+            &mut *dst,
+            &*src_data,
+            &*alpha_data,
+            &*beta_data,
+            dc,
+            src_len,
+            dst_len,
+            offset,
+            src.elem_count(),
+        )
+    }
+
     pub fn layer_norm_(
         &self,
         src: &Self,
@@ -805,6 +893,173 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
             &mut *dst,
             &*src_data,
             &*kernel_data,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            groups,
+        )
+    }
+
+    /// Conv1d with the bias-fusion contract of [`crate::Backend::conv1d_with_bias`]:
+    /// returns whether the backend applied the bias.
+    #[allow(clippy::too_many_arguments)]
+    /// Like [`Tensor::conv1d_with_bias_`] but also asks the backend to fold a
+    /// per-channel snake activation and/or a residual add into the epilogue.
+    /// Reports what was fused so the caller can apply the rest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_fused_(
+        &self,
+        src: &Self,
+        kernel: &Self,
+        bias: Option<&Self>,
+        snake: Option<(&Self, &Self)>,
+        residual: Option<&Self>,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<crate::backend::ConvFused> {
+        self.check_not_same_storage(src, "conv1d_fused")?;
+        self.check_not_same_storage(kernel, "conv1d_fused")?;
+        let src_dims = src.dims();
+        let kernel_dims = kernel.dims();
+        let batch = src_dims[0];
+        let in_channels = src_dims[1];
+        let length = src_dims[2];
+        let out_channels = kernel_dims[0];
+        let kernel_size = kernel_dims[2];
+        let out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+        if let Some((alpha, beta)) = snake
+            && (alpha.elem_count() != out_channels || beta.elem_count() != out_channels)
+        {
+            crate::bail!(
+                "conv1d_fused expects alpha/beta with {out_channels} elements, got {:?} and {:?}",
+                alpha.shape(),
+                beta.shape()
+            )
+        }
+        if let Some(residual) = residual {
+            self.check_not_same_storage(residual, "conv1d_fused")?;
+            if residual.dims() != [batch, out_channels, out_length] {
+                crate::bail!(
+                    "conv1d_fused residual shape mismatch: expected [{batch}, {out_channels}, \
+                     {out_length}], got {:?}",
+                    residual.shape()
+                )
+            }
+        }
+
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let kernel_data = kernel.storage()?;
+        let bias_data = bias.map(|b| b.storage()).transpose()?;
+        let snake_data = match snake {
+            None => None,
+            Some((alpha, beta)) => Some((alpha.storage()?, beta.storage()?)),
+        };
+        let residual_data = residual.map(|r| r.storage()).transpose()?;
+        B::conv1d_fused(
+            &mut *dst,
+            &*src_data,
+            &*kernel_data,
+            bias_data.as_deref(),
+            snake_data.as_ref().map(|(a, b)| (&**a, &**b)),
+            residual_data.as_deref(),
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )
+    }
+
+    pub fn conv1d_with_bias_(
+        &self,
+        src: &Self,
+        kernel: &Self,
+        bias: Option<&Self>,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        self.check_not_same_storage(src, "conv1d_")?;
+        self.check_not_same_storage(kernel, "conv1d_")?;
+        let src_dims = src.dims();
+        let kernel_dims = kernel.dims();
+        let batch = src_dims[0];
+        let in_channels = src_dims[1];
+        let length = src_dims[2];
+        let out_channels = kernel_dims[0];
+        let kernel_size = kernel_dims[2];
+        let out_length = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let kernel_data = kernel.storage()?;
+        let bias_data = bias.map(|b| b.storage()).transpose()?;
+        B::conv1d_with_bias(
+            &mut *dst,
+            &*src_data,
+            &*kernel_data,
+            bias_data.as_deref(),
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )
+    }
+
+    /// ConvTranspose1d with the bias-fusion contract of
+    /// [`crate::Backend::conv_transpose1d_with_bias`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose1d_with_bias_(
+        &self,
+        src: &Self,
+        kernel: &Self,
+        bias: Option<&Self>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        self.check_not_same_storage(src, "conv_transpose1d_")?;
+        self.check_not_same_storage(kernel, "conv_transpose1d_")?;
+        let src_dims = src.dims();
+        let kernel_dims = kernel.dims();
+        let batch = src_dims[0];
+        let in_channels = src_dims[1];
+        let length = src_dims[2];
+        let out_channels = kernel_dims[1] * groups;
+        let kernel_size = kernel_dims[2];
+        let out_length = (length - 1) * stride + kernel_size + output_padding - 2 * padding;
+
+        let mut dst = self.storage_mut()?;
+        let src_data = src.storage()?;
+        let kernel_data = kernel.storage()?;
+        let bias_data = bias.map(|b| b.storage()).transpose()?;
+        B::conv_transpose1d_with_bias(
+            &mut *dst,
+            &*src_data,
+            &*kernel_data,
+            bias_data.as_deref(),
             batch,
             in_channels,
             out_channels,

@@ -1,4 +1,13 @@
 use crate::Result;
+
+/// What a backend managed to fold into a convolution epilogue, see
+/// [`Backend::conv1d_fused`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConvFused {
+    pub bias: bool,
+    pub snake: bool,
+    pub residual: bool,
+}
 use crate::{BinaryOp, UnaryOp};
 
 pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
@@ -184,6 +193,40 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         eps: f32,
     ) -> Result<()>;
 
+    /// Fused snake activation: dst = x + beta_scale[c] * sin(alpha[c] * x)^2
+    /// src/dst are contiguous with `row_len` elements per channel row and
+    /// `channels` channels; alpha and beta_scale hold one value per channel.
+    fn snake<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        alpha: &Self::Storage<T>,
+        beta_scale: &Self::Storage<T>,
+        channels: usize,
+        row_len: usize,
+        numel: usize,
+    ) -> Result<()>;
+
+    /// Snake activation writing into a window of a longer destination:
+    /// `dst[b, c, dst_offset + l] = snake(src[b, c, l])`, where `dst` rows are
+    /// `dst_len` long and `src` rows `src_len`. Lets the streaming-conv input
+    /// concatenation absorb the activation instead of paying a separate pass.
+    /// Backends that do not implement it must be driven through
+    /// [`Backend::snake`] plus a copy by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn snake_offset<T: crate::WithDTypeF>(
+        _dst: &mut Self::Storage<T>,
+        _src: &Self::Storage<T>,
+        _alpha: &Self::Storage<T>,
+        _beta_scale: &Self::Storage<T>,
+        _channels: usize,
+        _src_len: usize,
+        _dst_len: usize,
+        _dst_offset: usize,
+        _numel: usize,
+    ) -> Result<()> {
+        crate::bail!("snake_offset is not implemented for this backend")
+    }
+
     /// Layer normalization.
     /// Normalizes over the last dimension using mean and variance.
     /// When `remove_mean` is true: y = (x - mean) / sqrt(variance + eps) * weight + bias
@@ -329,4 +372,124 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         output_padding: usize,
         groups: usize,
     ) -> Result<()>;
+
+    /// Same as [`Backend::conv1d`], but backends that can fuse the
+    /// per-channel bias into the convolution epilogue apply it and return
+    /// `Ok(true)`. The default implementation ignores the bias and returns
+    /// `Ok(false)`, in which case the caller must apply it separately.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_with_bias<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        _bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        Self::conv1d(
+            dst,
+            src,
+            kernel,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
+        Ok(false)
+    }
+
+    /// Same as [`Backend::conv1d_with_bias`], additionally folding a
+    /// per-channel snake activation (`y = x + beta[c] * sin(alpha[c] * x)^2`)
+    /// and/or a residual add into the epilogue. The residual is added before the
+    /// activation, matching a resnet block whose skip connection feeds the next
+    /// activation. Returns what was actually fused; whatever the backend did not
+    /// apply, the caller must do separately.
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_fused<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        bias: Option<&Self::Storage<T>>,
+        _snake: Option<(&Self::Storage<T>, &Self::Storage<T>)>,
+        _residual: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<ConvFused> {
+        let bias_applied = Self::conv1d_with_bias(
+            dst,
+            src,
+            kernel,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )?;
+        Ok(ConvFused { bias: bias_applied, snake: false, residual: false })
+    }
+
+    /// Same as [`Backend::conv_transpose1d`], with the bias-fusion contract
+    /// of [`Backend::conv1d_with_bias`].
+    #[allow(clippy::too_many_arguments)]
+    fn conv_transpose1d_with_bias<T: crate::WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        src: &Self::Storage<T>,
+        kernel: &Self::Storage<T>,
+        _bias: Option<&Self::Storage<T>>,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        length: usize,
+        out_length: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<bool> {
+        Self::conv_transpose1d(
+            dst,
+            src,
+            kernel,
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+            groups,
+        )?;
+        Ok(false)
+    }
 }
