@@ -1009,6 +1009,130 @@ test_all_backends!(
     test_conv_transpose1d_batch_with_bias_impl
 );
 
+// -----------------------------------------------------------------------------
+// conv_transpose1d fallback path (cpu)
+//
+// The col2im fast path only applies when groups == 1 && padding == 0 &&
+// output_padding == 0; anything else goes through conv_transpose1d_direct. The tests above
+// all satisfy the fast-path condition, so these cover the fallback by equivalence against
+// the fast path.
+// -----------------------------------------------------------------------------
+
+/// Grouped conv_transpose1d equals per-group conv_transpose1d (groups=1) concatenated along
+/// the channel axis. The reference side takes the well-covered col2im path.
+fn check_grouped_matches_per_group(
+    batch: usize,
+    in_channels: usize,
+    out_c_per_group: usize,
+    length: usize,
+    kernel_size: usize,
+    stride: usize,
+    groups: usize,
+) -> Result<()> {
+    let dev = &xn::CPU;
+    let in_c_per_group = in_channels / groups;
+    let n_in = batch * in_channels * length;
+    let n_k = in_channels * out_c_per_group * kernel_size;
+    // Deterministic, non-symmetric values so channel/offset mix-ups actually show up.
+    let input: Tensor<f32, _> =
+        Tensor::from_vec((0..n_in).map(|i| (i % 7) as f32 - 3.).collect(), (batch, in_channels, length), dev)?;
+    let kernel: Tensor<f32, _> = Tensor::from_vec(
+        (0..n_k).map(|i| ((i % 5) as f32 - 2.) * 0.5).collect(),
+        (in_channels, out_c_per_group, kernel_size),
+        dev,
+    )?;
+
+    let got = input.conv_transpose1d(&kernel, None, stride, 0, 0, groups)?;
+
+    let mut parts = Vec::new();
+    for g in 0..groups {
+        let ic0 = g * in_c_per_group;
+        let sub_in = input.narrow(1, ic0..ic0 + in_c_per_group)?.contiguous()?;
+        let sub_k = kernel.narrow(0, ic0..ic0 + in_c_per_group)?.contiguous()?;
+        parts.push(sub_in.conv_transpose1d(&sub_k, None, stride, 0, 0, 1)?);
+    }
+    let refs: Vec<&Tensor<f32, _>> = parts.iter().collect();
+    let want = Tensor::cat(&refs, 1)?;
+
+    assert_eq!(got.dims(), want.dims(), "shape mismatch");
+    let (g, w) = (got.to_vec()?, want.to_vec()?);
+    for (i, (a, b)) in g.iter().zip(w.iter()).enumerate() {
+        assert!((a - b).abs() < 1e-4, "index {i}: got {a}, want {b}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_conv_transpose1d_depthwise_cpu() -> Result<()> {
+    // groups == in_channels == out_channels: the depthwise branch.
+    check_grouped_matches_per_group(1, 8, 1, 5, 4, 2, 8)?;
+    check_grouped_matches_per_group(2, 6, 1, 4, 6, 3, 6)?;
+    // Shaped like mimi's frame-rate adapter: kernel_size == 2 * stride, depthwise.
+    check_grouped_matches_per_group(1, 16, 1, 3, 8, 4, 16)
+}
+
+#[test]
+fn test_conv_transpose1d_grouped_cpu() -> Result<()> {
+    // 1 < groups < in_channels, so in_c_per_group > 1 (the general fallback branch).
+    check_grouped_matches_per_group(1, 8, 2, 5, 3, 1, 2)?;
+    check_grouped_matches_per_group(2, 12, 3, 4, 4, 2, 4)?;
+    // out_c_per_group > 1 together with in_c_per_group == 1 exercises the depthwise branch's
+    // kernel indexing without groups == out_channels.
+    check_grouped_matches_per_group(1, 4, 3, 4, 3, 2, 4)
+}
+
+#[test]
+fn test_conv_transpose1d_padding_crops_cpu() -> Result<()> {
+    // padding p on a transposed conv drops p elements from each end of the output.
+    let dev = &xn::CPU;
+    let input: Tensor<f32, _> =
+        Tensor::from_vec((0..12).map(|i| (i % 5) as f32 - 2.).collect(), (1, 3, 4), dev)?;
+    let kernel: Tensor<f32, _> =
+        Tensor::from_vec((0..18).map(|i| (i % 4) as f32 - 1.).collect(), (3, 2, 3), dev)?;
+
+    let unpadded = input.conv_transpose1d(&kernel, None, 2, 0, 0, 1)?;
+    let full_len = unpadded.dims()[2];
+    for p in 1..=2 {
+        let padded = input.conv_transpose1d(&kernel, None, 2, p, 0, 1)?;
+        assert_eq!(padded.dims(), &[1, 2, full_len - 2 * p], "padding {p} shape");
+        let want = unpadded.narrow(2, p..full_len - p)?.contiguous()?.to_vec()?;
+        let got = padded.to_vec()?;
+        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "padding {p} index {i}: got {a}, want {b}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_conv_transpose1d_output_padding_appends_zeros_cpu() -> Result<()> {
+    // output_padding only extends the output; the extra tail positions receive no
+    // contributions and stay zero.
+    let dev = &xn::CPU;
+    let input: Tensor<f32, _> =
+        Tensor::from_vec((0..8).map(|i| (i % 3) as f32 - 1.).collect(), (1, 2, 4), dev)?;
+    let kernel: Tensor<f32, _> =
+        Tensor::from_vec((0..8).map(|i| (i % 3) as f32).collect(), (2, 2, 2), dev)?;
+
+    let base = input.conv_transpose1d(&kernel, None, 2, 0, 0, 1)?;
+    let base_len = base.dims()[2];
+    let base_v = base.to_vec()?;
+    let q = 3;
+    let extended = input.conv_transpose1d(&kernel, None, 2, 0, q, 1)?;
+    assert_eq!(extended.dims(), &[1, 2, base_len + q]);
+    let ext_v = extended.to_vec()?;
+    for c in 0..2 {
+        for i in 0..base_len {
+            let (a, b) = (ext_v[c * (base_len + q) + i], base_v[c * base_len + i]);
+            assert!((a - b).abs() < 1e-4, "ch {c} index {i}: got {a}, want {b}");
+        }
+        for i in base_len..base_len + q {
+            assert_eq!(ext_v[c * (base_len + q) + i], 0., "ch {c} tail index {i} not zero");
+        }
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Pad with same tests
 // =============================================================================
