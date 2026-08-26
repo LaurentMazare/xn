@@ -48,6 +48,7 @@ pub struct Fp8Tensor {
 
 impl Fp8Tensor {
     /// Quantize a `Tensor<T, Device>` into an `Fp8Tensor` using dynamic per-tensor scaling.
+    #[tracing::instrument(name = "fp8-quantize", skip_all)]
     pub fn quantize<T: Fp8Quantizable>(src: &Tensor<T, Device>) -> Result<Self> {
         let shape = src.shape();
         let hidden_size = shape.dim(crate::D::Minus1)?;
@@ -57,6 +58,7 @@ impl Fp8Tensor {
     }
 
     /// Quantize a `Tensor<T, Device>` into an `Fp8Tensor` using dynamic per-token scaling.
+    #[tracing::instrument(name = "fp8-quantize-per-token", skip_all)]
     pub fn quantize_per_token<T: Fp8Quantizable>(src: &Tensor<T, Device>) -> Result<Self> {
         let shape = src.shape();
         let hidden_size = shape.dim(crate::D::Minus1)?;
@@ -72,6 +74,7 @@ impl Fp8Tensor {
     }
 
     /// Dequantize this `Fp8Tensor` back to a `Tensor<T, Device>`.
+    #[tracing::instrument(name = "fp8-dequantize", skip_all)]
     pub fn dequantize<T: Fp8Quantizable>(&self) -> Result<Tensor<T, Device>> {
         let numel = self.shape.elem_count();
         let mut out: CudaSlice<T> = unsafe { self.device.stream().alloc::<T>(numel) }?;
@@ -127,6 +130,7 @@ impl Fp8Tensor {
     /// Mixing per-tensor with per-token is not supported because cuBLASLt
     /// requires both A and B scale modes to be set together.
     /// Requires a GPU with compute cap >= 8.9 (Ada Lovelace / Hopper).
+    #[tracing::instrument(name = "fp8-matmul-t", skip_all)]
     pub fn matmul_t(&self, rhs: &Fp8Tensor) -> Result<Tensor<bf16, Device>> {
         let self_dims = self.shape.dims();
         let rhs_dims = rhs.shape.dims();
@@ -365,6 +369,7 @@ impl Fp8Linear {
     ///
     /// Supports batched inputs: `xs` can be `[..batch, M, K]`. Batch dims are
     /// flattened into M for the FP8 matmul and restored on output.
+    #[tracing::instrument(name = "fp8-linear-forward", skip_all)]
     pub fn forward(&self, xs: &Tensor<bf16, Device>) -> Result<Tensor<bf16, Device>> {
         let dims = xs.dims();
         let rank = dims.len();
