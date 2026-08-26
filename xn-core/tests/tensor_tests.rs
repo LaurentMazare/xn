@@ -1034,8 +1034,11 @@ fn check_grouped_matches_per_group(
     let n_in = batch * in_channels * length;
     let n_k = in_channels * out_c_per_group * kernel_size;
     // Deterministic, non-symmetric values so channel/offset mix-ups actually show up.
-    let input: Tensor<f32, _> =
-        Tensor::from_vec((0..n_in).map(|i| (i % 7) as f32 - 3.).collect(), (batch, in_channels, length), dev)?;
+    let input: Tensor<f32, _> = Tensor::from_vec(
+        (0..n_in).map(|i| (i % 7) as f32 - 3.).collect(),
+        (batch, in_channels, length),
+        dev,
+    )?;
     let kernel: Tensor<f32, _> = Tensor::from_vec(
         (0..n_k).map(|i| ((i % 5) as f32 - 2.) * 0.5).collect(),
         (in_channels, out_c_per_group, kernel_size),

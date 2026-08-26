@@ -417,10 +417,9 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].copy_from_slice(&src[..l]);
         } else {
-            let chunk = elemwise_chunk(l);
             dst[..l]
-                .par_chunks_mut(chunk)
-                .zip(src[..l].par_chunks(chunk))
+                .par_chunks_mut(ELEMWISE_CHUNK)
+                .zip(src[..l].par_chunks(ELEMWISE_CHUNK))
                 .for_each(|(d, s)| d.copy_from_slice(s));
         }
         Ok(())
@@ -493,7 +492,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(elemwise_chunk(len)).for_each(fill);
+            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
         } else {
             fill(&mut dst[..len]);
         }
@@ -514,7 +513,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(elemwise_chunk(len)).for_each(fill);
+            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
         } else {
             fill(&mut dst[..len]);
         }
@@ -525,7 +524,7 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].fill(v);
         } else {
-            dst[..l].par_chunks_mut(elemwise_chunk(l)).for_each(|d| d.fill(v));
+            dst[..l].par_chunks_mut(ELEMWISE_CHUNK).for_each(|d| d.fill(v));
         }
         Ok(())
     }
@@ -1418,19 +1417,9 @@ fn reduce_arg<T: WithDType + Copy>(
 /// Below this many elements, elementwise ops run serially: the rayon fork/join overhead
 /// (~10us) dwarfs the work itself.
 const ELEMWISE_PAR_THRESHOLD: usize = 32 * 1024;
-/// Floor on the chunk size for parallel elementwise ops: below this the per-chunk dispatch
-/// cost stops being negligible and the inner loop has too few iterations to auto-vectorize
-/// well.
-const ELEMWISE_MIN_CHUNK: usize = 4 * 1024;
-
-/// Chunk size for parallel elementwise ops. This has to be derived from the work and the pool
-/// size rather than being a fixed constant: a constant larger than ELEMWISE_PAR_THRESHOLD
-/// means every length between the threshold and that constant yields a single chunk, paying
-/// the fork/join cost for no parallelism at all.
-fn elemwise_chunk(len: usize) -> usize {
-    let threads = rayon::current_num_threads().max(1);
-    len.div_ceil(threads).max(ELEMWISE_MIN_CHUNK)
-}
+/// Chunk size for parallel elementwise ops; large enough that the per-chunk dispatch cost is
+/// negligible and the inner loop auto-vectorizes.
+const ELEMWISE_CHUNK: usize = 64 * 1024;
 
 /// Apply a binary operation in-place: dst[i] = op(dst[i], src[i])
 #[inline(always)]
@@ -1443,8 +1432,7 @@ where
             f(d, *s);
         }
     } else {
-        let chunk = elemwise_chunk(dst.len());
-        dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)).for_each(
+        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
             |(dst, src)| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     f(d, *s);
@@ -1465,7 +1453,7 @@ where
             f(d);
         }
     } else {
-        dst.par_chunks_mut(elemwise_chunk(dst.len())).for_each(|dst| {
+        dst.par_chunks_mut(ELEMWISE_CHUNK).for_each(|dst| {
             for d in dst.iter_mut() {
                 f(d);
             }
@@ -1484,8 +1472,7 @@ where
             *d = f(*s);
         }
     } else {
-        let chunk = elemwise_chunk(dst.len());
-        dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)).for_each(
+        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
             |(dst, src)| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d = f(*s);
@@ -1506,9 +1493,8 @@ where
             *d = f(*l, *r);
         }
     } else {
-        let chunk = elemwise_chunk(dst.len());
-        dst.par_chunks_mut(chunk)
-            .zip(lhs.par_chunks(chunk).zip(rhs.par_chunks(chunk)))
+        dst.par_chunks_mut(ELEMWISE_CHUNK)
+            .zip(lhs.par_chunks(ELEMWISE_CHUNK).zip(rhs.par_chunks(ELEMWISE_CHUNK)))
             .for_each(|(dst, (lhs, rhs))| {
                 for ((d, l), r) in dst.iter_mut().zip(lhs).zip(rhs) {
                     *d = f(*l, *r);
@@ -1726,9 +1712,9 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
 
     // Each (b, out_c) pair owns a contiguous `out_length` slice of dst, so the op splits over
     // those slices instead of over channels once per kernel offset. That means one fork/join
-    // for the whole call rather than `kernel_size` of them, safe mutable access instead of raw
-    // pointers, and no per-(channel, offset) weight buffer. Keeping k_offset outermost within
-    // a slice preserves the original accumulation order into dst, so results are unchanged.
+    // for the whole call rather than `kernel_size` of them, and safe mutable access instead of
+    // raw pointers. Keeping k_offset outermost within a slice preserves the original
+    // accumulation order into dst, so results are unchanged.
     let src_reordered = src_reordered.as_slice();
     let accumulate = |bc: usize, dst_row: &mut [T]| {
         let b = bc / out_channels;
@@ -1754,7 +1740,16 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
                 }
             }
         } else {
+            // This channel's taps for a given k_offset sit `out_c_per_group * kernel_size`
+            // apart in `kernel`, so gather them once per offset rather than reading them
+            // strided inside the `il` loop: the dot product below then walks two contiguous
+            // buffers and vectorizes. The gather costs one `in_c_per_group` copy per
+            // (slice, offset), which is `length` times less work than the loop it feeds.
+            let mut k_cont = vec![T::zero(); in_c_per_group];
             for k_offset in 0..kernel_size {
+                for (ic, kc) in k_cont.iter_mut().enumerate() {
+                    *kc = kernel[k_base + ic * out_c_per_group * kernel_size + k_offset];
+                }
                 for il in 0..length {
                     let out_pos_raw = il * stride + k_offset;
                     if out_pos_raw < padding || out_pos_raw >= out_length + padding {
@@ -1762,9 +1757,8 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
                     }
                     let src_base = il * in_channels + in_c_start;
                     let mut acc = T::zero();
-                    for ic in 0..in_c_per_group {
-                        let k_idx = k_base + ic * out_c_per_group * kernel_size + k_offset;
-                        acc += src_row[src_base + ic] * kernel[k_idx];
+                    for (ic, &kc) in k_cont.iter().enumerate() {
+                        acc += src_row[src_base + ic] * kc;
                     }
                     dst_row[out_pos_raw - padding] += acc;
                 }
