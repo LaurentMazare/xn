@@ -417,9 +417,10 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].copy_from_slice(&src[..l]);
         } else {
+            let chunk = elemwise_chunk(l);
             dst[..l]
-                .par_chunks_mut(ELEMWISE_CHUNK)
-                .zip(src[..l].par_chunks(ELEMWISE_CHUNK))
+                .par_chunks_mut(chunk)
+                .zip(src[..l].par_chunks(chunk))
                 .for_each(|(d, s)| d.copy_from_slice(s));
         }
         Ok(())
@@ -492,7 +493,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+            dst[..len].par_chunks_mut(elemwise_chunk(len)).for_each(fill);
         } else {
             fill(&mut dst[..len]);
         }
@@ -513,7 +514,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+            dst[..len].par_chunks_mut(elemwise_chunk(len)).for_each(fill);
         } else {
             fill(&mut dst[..len]);
         }
@@ -524,7 +525,7 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].fill(v);
         } else {
-            dst[..l].par_chunks_mut(ELEMWISE_CHUNK).for_each(|d| d.fill(v));
+            dst[..l].par_chunks_mut(elemwise_chunk(l)).for_each(|d| d.fill(v));
         }
         Ok(())
     }
@@ -1417,9 +1418,19 @@ fn reduce_arg<T: WithDType + Copy>(
 /// Below this many elements, elementwise ops run serially: the rayon fork/join overhead
 /// (~10us) dwarfs the work itself.
 const ELEMWISE_PAR_THRESHOLD: usize = 32 * 1024;
-/// Chunk size for parallel elementwise ops; large enough that the per-chunk dispatch cost is
-/// negligible and the inner loop auto-vectorizes.
-const ELEMWISE_CHUNK: usize = 64 * 1024;
+/// Floor on the chunk size for parallel elementwise ops: below this the per-chunk dispatch
+/// cost stops being negligible and the inner loop has too few iterations to auto-vectorize
+/// well.
+const ELEMWISE_MIN_CHUNK: usize = 4 * 1024;
+
+/// Chunk size for parallel elementwise ops. This has to be derived from the work and the pool
+/// size rather than being a fixed constant: a constant larger than ELEMWISE_PAR_THRESHOLD
+/// means every length between the threshold and that constant yields a single chunk, paying
+/// the fork/join cost for no parallelism at all.
+fn elemwise_chunk(len: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    len.div_ceil(threads).max(ELEMWISE_MIN_CHUNK)
+}
 
 /// Apply a binary operation in-place: dst[i] = op(dst[i], src[i])
 #[inline(always)]
@@ -1432,7 +1443,8 @@ where
             f(d, *s);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
+        let chunk = elemwise_chunk(dst.len());
+        dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)).for_each(
             |(dst, src)| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     f(d, *s);
@@ -1453,7 +1465,7 @@ where
             f(d);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK).for_each(|dst| {
+        dst.par_chunks_mut(elemwise_chunk(dst.len())).for_each(|dst| {
             for d in dst.iter_mut() {
                 f(d);
             }
@@ -1472,7 +1484,8 @@ where
             *d = f(*s);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
+        let chunk = elemwise_chunk(dst.len());
+        dst.par_chunks_mut(chunk).zip(src.par_chunks(chunk)).for_each(
             |(dst, src)| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d = f(*s);
@@ -1493,8 +1506,9 @@ where
             *d = f(*l, *r);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK)
-            .zip(lhs.par_chunks(ELEMWISE_CHUNK).zip(rhs.par_chunks(ELEMWISE_CHUNK)))
+        let chunk = elemwise_chunk(dst.len());
+        dst.par_chunks_mut(chunk)
+            .zip(lhs.par_chunks(chunk).zip(rhs.par_chunks(chunk)))
             .for_each(|(dst, (lhs, rhs))| {
                 for ((d, l), r) in dst.iter_mut().zip(lhs).zip(rhs) {
                     *d = f(*l, *r);
