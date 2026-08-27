@@ -1238,8 +1238,25 @@ impl crate::Backend for crate::CpuDevice {
             for j in 0..kv {
                 let ko = kb + j * hd;
                 let krow = &k[ko..ko + d];
-                let mut s = 0f32;
-                for (qq, kk) in qrow.iter().zip(krow.iter()) {
+                // Independent partial sums, the same shape as `reduce_combine`: a single
+                // `s += q * k` accumulator is a serial dependency chain the compiler cannot
+                // reorder (float addition is not associative), which pins the dot product at
+                // one FMA per latency. Eight lanes -- two 4-wide f32 vectors -- let it both
+                // vectorize and keep several FMAs in flight; eight measured distinctly
+                // better than four here.
+                const LANES: usize = 8;
+                let mut lanes = [0f32; LANES];
+                // Head dims are multiples of 8 in practice, so these tails are normally empty.
+                let (q_chunks, q_rem) = qrow.as_chunks::<LANES>();
+                let (k_chunks, k_rem) = krow.as_chunks::<LANES>();
+                for (qc, kc) in q_chunks.iter().zip(k_chunks.iter()) {
+                    for l in 0..LANES {
+                        lanes[l] +=
+                            <T as WithDTypeF>::to_f32(qc[l]) * <T as WithDTypeF>::to_f32(kc[l]);
+                    }
+                }
+                let mut s: f32 = lanes.iter().sum();
+                for (qq, kk) in q_rem.iter().zip(k_rem.iter()) {
                     s += <T as WithDTypeF>::to_f32(*qq) * <T as WithDTypeF>::to_f32(*kk);
                 }
                 s *= scale;
