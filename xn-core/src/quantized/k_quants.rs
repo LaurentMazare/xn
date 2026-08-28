@@ -50,7 +50,7 @@ pub trait GgmlType: Sized + Clone + Send + Sync {
     }
 }
 
-#[tracing::instrument(name = "q-matmul-by-row", skip_all)]
+#[tracing::instrument(name = "q-matmul-by-row", skip_all, fields(m = m, n = n, k = k))]
 fn matmul_by_row<T: GgmlType>(
     lhs_b: &[T::VecDotType],
     rhs_t: &[T],
@@ -708,7 +708,7 @@ impl GgmlType for BlockQ8_0 {
 // sgemm with `(m', n') = (n, m)` and `ldc = n`. Then sgemm's
 // `c[n * i + j]` lines up with `dst[i * n + j]`.
 #[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128"))]
-#[tracing::instrument(name = "q-matmul-q8-0-sgemm", skip_all)]
+#[tracing::instrument(name = "q-matmul-q8-0-sgemm", skip_all, fields(m = m, n = n, k = k))]
 fn matmul_q8_0_sgemm(
     lhs_b: &[BlockQ8_0],
     rhs_t: &[BlockQ8_0],
@@ -1957,7 +1957,7 @@ impl GgmlType for BlockQ8K {
 }
 
 // https://github.com/ggerganov/llama.cpp/blob/b5ffb2849d23afe73647f68eec7b68187af09be6/ggml.c#L10605
-#[tracing::instrument(name = "q-matmul", skip_all)]
+#[tracing::instrument(name = "q-matmul", skip_all, fields(m = mkn.0, n = mkn.2, k = mkn.1))]
 pub fn matmul<T: GgmlType>(
     mkn: (usize, usize, usize),
     lhs: &[f32],
@@ -1975,7 +1975,7 @@ pub fn matmul<T: GgmlType>(
 }
 
 // Quantize the f32 lhs rows into the rhs type's vec-dot blocks.
-#[tracing::instrument(name = "q-matmul-quantize-lhs", skip_all)]
+#[tracing::instrument(name = "q-matmul-quantize-lhs", skip_all, fields(m = m, k = k))]
 fn quantize_lhs<T: GgmlType>(m: usize, k: usize, lhs: &[f32]) -> Result<Vec<T::VecDotType>> {
     let k_in_lhs_blocks = k.div_ceil(T::BLCK_SIZE);
     // TODO: Do not make this copy if the DotType is f32.
