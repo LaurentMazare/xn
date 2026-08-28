@@ -314,6 +314,7 @@ impl QTensor {
         self.storage.data()
     }
 
+    #[tracing::instrument(name = "qmatmul-t", skip_all)]
     pub fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
         match &self.storage {
             QStorage::Cpu(storage) => storage.matmul_t(mkn, lhs, dst),
@@ -330,6 +331,7 @@ impl crate::ModuleT for QLinear {
     type T = f32;
     type B = crate::CpuDevice;
 
+    #[tracing::instrument(name = "qlinear-forward", skip_all)]
     fn forward(
         &self,
         xs: &crate::Tensor<Self::T, Self::B>,
