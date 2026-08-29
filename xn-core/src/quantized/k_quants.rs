@@ -738,17 +738,11 @@ fn matmul_q8_0_sgemm(
     let a_addr = rhs_t.as_ptr() as usize;
     let b_addr = lhs_b.as_ptr() as usize;
     let c_addr = dst.as_mut_ptr() as usize;
-    // Gating the fan-out on a work threshold was measured and rejected: it helps only when the
-    // pool is shared with another busy thread, and costs ~3.4% otherwise. With a single-worker
-    // pool there is still nothing to fan out to, so call the kernel directly and skip the join.
-    let nth = rayon::current_num_threads().max(1);
-    if nth == 1 {
-        // SAFETY: the sole worker's tile range covers the output exactly once, so nothing
-        // aliases. Bounds were checked above against the slice lengths.
-        unsafe { sgemm_q8_0_tile(a_addr, b_addr, c_addr, n, m, k_blocks, 0, 1) };
-        return Ok(());
-    }
-    (0..nth).into_par_iter().for_each(|ith| {
+    // A single-participant pool runs the closure inline, so a one-worker build still pays no
+    // join here and needs no special case. Gating the fan-out on a work threshold was measured
+    // and rejected: it helps only when the pool is shared with another busy thread, and costs
+    // ~3.4% otherwise.
+    crate::threadpool::dispatch(|ith, nth| {
         // SAFETY: tile assignments are disjoint across `ith` values, so
         // writes through `c_addr` do not alias. Bounds were checked
         // above against the slice lengths.
@@ -759,9 +753,8 @@ fn matmul_q8_0_sgemm(
 
 // Run the `ith` of `nth` tile ranges on whichever sgemm kernel this build has.
 //
-// Both the serial and the fanned-out paths go through here, so a target can never end up at a
-// call site whose `cfg` arms it fails to match -- which would leave `dst` untouched and return
-// `Ok`. The three arms are exhaustive over the `cfg` on `matmul_q8_0_sgemm` itself.
+// The three arms are exhaustive over the `cfg` on `matmul_q8_0_sgemm` itself, so a target can
+// never fall through all of them, leave `dst` untouched and still return `Ok`.
 //
 // # Safety
 // `a` and `b` must address at least `n * k_blocks` and `m * k_blocks` `BlockQ8_0`s, `c` at

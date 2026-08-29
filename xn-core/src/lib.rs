@@ -17,6 +17,7 @@ pub mod shape;
 pub mod streaming;
 pub mod tensor;
 pub mod tensor_view;
+pub mod threadpool;
 pub mod utils;
 
 pub use backend::Backend;
