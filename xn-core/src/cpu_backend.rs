@@ -1291,8 +1291,7 @@ fn reduce_combine<T: WithDType + Copy>(
             let row = &src[outer * dim_size..(outer + 1) * dim_size];
             const LANES: usize = 16;
             let mut acc = [init; LANES];
-            let chunks = row.chunks_exact(LANES);
-            let rem = chunks.remainder();
+            let (chunks, rem) = row.as_chunks::<LANES>();
             for chunk in chunks {
                 for (a, &v) in acc.iter_mut().zip(chunk) {
                     *a = combine(*a, v);

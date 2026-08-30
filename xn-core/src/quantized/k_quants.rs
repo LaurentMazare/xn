@@ -984,7 +984,9 @@ impl GgmlType for BlockQ2K {
 
             let mut is = 0;
 
-            for (y_block, qs) in y.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
+            for (y_block, qs) in
+                y.as_chunks_mut::<128>().0.iter_mut().zip(block.qs.as_chunks::<32>().0)
+            {
                 // Step by 32 over q.
                 let mut shift = 0;
                 let mut y_block_index = 0;
@@ -1145,7 +1147,7 @@ impl GgmlType for BlockQ3K {
     fn from_float(xs: &[f32], ys: &mut [Self]) -> Result<()> {
         for (block, x) in group_for_quantization(xs, ys)? {
             let mut scales: [f32; QK_K / 16] = [0.0; QK_K / 16];
-            for (j, x_scale_slice) in x.chunks_exact(16).enumerate() {
+            for (j, x_scale_slice) in x.as_chunks::<16>().0.iter().enumerate() {
                 scales[j] = make_q3_quants(x_scale_slice, 4, true);
             }
 
@@ -1248,11 +1250,11 @@ impl GgmlType for BlockQ3K {
             // Dequantize both 128 long blocks
             // 32 qs values per 128 long block
             // Each 16 elements get a scale
-            for (y, qs) in y.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
+            for (y, qs) in y.as_chunks_mut::<128>().0.iter_mut().zip(block.qs.as_chunks::<32>().0) {
                 let mut shift = 0;
-                for shift_scoped_y in y.chunks_exact_mut(32) {
+                for shift_scoped_y in y.as_chunks_mut::<32>().0 {
                     for (scale_index, scale_scoped_y) in
-                        shift_scoped_y.chunks_exact_mut(16).enumerate()
+                        shift_scoped_y.as_chunks_mut::<16>().0.iter_mut().enumerate()
                     {
                         let dl = d_all * (scales[is] as f32 - 32.0);
                         for (i, inner_y) in scale_scoped_y.iter_mut().enumerate() {
@@ -1384,7 +1386,7 @@ impl GgmlType for BlockQ4K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
+            for (j, x_scale_slice) in x.as_chunks::<32>().0.iter().enumerate() {
                 (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
             }
 
@@ -1578,7 +1580,7 @@ impl GgmlType for BlockQ5K {
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
+            for (j, x_scale_slice) in x.as_chunks::<32>().0.iter().enumerate() {
                 (scales[j], mins[j]) = make_qkx1_quants(31, 5, x_scale_slice);
             }
 
