@@ -273,6 +273,128 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         Ok(result)
     }
 
+    /// Scaled-dot-product attention for a single query position (autoregressive decode).
+    ///
+    /// `self` is the query, shape `(b, 1, h, d)`. `k` and `v` are the accumulated keys and
+    /// values, shape `(b, kv, h, d)` — the layout an attention cache is written in, so callers
+    /// need no transposes. Returns `(b, 1, h * d)`, ready for the output projection.
+    ///
+    /// Backends advertising [`Backend::FUSED_SDPA_DECODE`] run this as one pass; otherwise it
+    /// is composed from transpose/matmul/softmax, which is what the caller would have written
+    /// by hand.
+    #[tracing::instrument(name = "sdpa-decode", skip_all)]
+    pub fn sdpa_decode(
+        &self,
+        k: &crate::TensorView<T, B>,
+        v: &crate::TensorView<T, B>,
+        mask: Option<&Self>,
+        scale: f32,
+    ) -> Result<Self> {
+        let qd = self.shape.dims();
+        if qd.len() != 4 || qd[1] != 1 {
+            crate::bail!("sdpa_decode expects a (b, 1, h, d) query, got {:?}", self.shape)
+        }
+        let (b, h, d) = (qd[0], qd[2], qd[3]);
+        for (name, t) in [("k", k), ("v", v)] {
+            let td = t.dims();
+            if td.len() != 4 || td[0] != b || td[2] != h || td[3] != d {
+                crate::bail!(
+                    "sdpa_decode: {name} shape {:?} incompatible with q {:?}",
+                    t.shape(),
+                    self.shape
+                )
+            }
+        }
+        let kv = k.dims()[1];
+        if v.dims()[1] != kv {
+            crate::bail!("sdpa_decode: k has {kv} positions but v has {}", v.dims()[1])
+        }
+
+        // The fused kernel addresses operands as (b, pos, head, dim) with `dim` innermost, so
+        // it applies only when the trailing dims are laid out that way. A cache narrowed to its
+        // filled prefix satisfies this even though it is shorter than its storage.
+        let hd = h * d;
+        let laid_out = |strides: &[usize], batch_stride: usize| {
+            strides[3] == 1 && strides[2] == d && strides[1] == hd && strides[0] == batch_stride
+        };
+        // The kernel takes one batch stride for both k and v, so they must agree on it.
+        let kv_batch_stride = k.strides()[0];
+        let q_ok = laid_out(&self.shape.stride_contiguous(), hd);
+        let k_ok = laid_out(k.strides(), kv_batch_stride);
+        let v_ok = laid_out(v.strides(), kv_batch_stride);
+
+        // A mask is applied per key position, broadcast over heads and batch, so it has to be
+        // exactly `kv` values with every leading dimension 1.
+        let mask_ok = match mask {
+            None => true,
+            Some(m) => {
+                m.shape.elem_count() == kv
+                    && *m.shape.dims().last().unwrap_or(&0) == kv
+                    && m.shape.is_contiguous(&m.shape.stride_contiguous())
+            }
+        };
+        if B::FUSED_SDPA_DECODE
+            && d <= B::SDPA_MAX_HEAD_DIM
+            && kv > 0
+            && q_ok
+            && k_ok
+            && v_ok
+            && mask_ok
+        {
+            let out: Tensor<T, B> =
+                unsafe { Tensor::alloc_uninit(crate::Shape::from((b, 1, hd)), self.device()) }?;
+            {
+                let qs = self.storage()?;
+                let (ks, k_off) = k.storage_and_offset()?;
+                let (vs, v_off) = v.storage_and_offset()?;
+                let mut os = out.storage_mut()?;
+                let ms = match mask {
+                    Some(m) => Some(m.storage()?),
+                    None => None,
+                };
+                B::sdpa_decode(
+                    &mut os,
+                    (&qs, 0),
+                    (&ks, k_off),
+                    (&vs, v_off),
+                    ms.as_deref().map(|m| (m, 0)),
+                    kv_batch_stride,
+                    b,
+                    h,
+                    d,
+                    kv,
+                    scale,
+                )?;
+            }
+            return Ok(out);
+        }
+
+        self.sdpa_composed(k, v, mask, scale, b, hd)
+    }
+
+    /// The transpose/matmul/softmax sequence a caller would otherwise write by hand. Used when
+    /// the backend has no fused kernel, or when the operands do not match the layout it needs.
+    fn sdpa_composed(
+        &self,
+        k: &crate::TensorView<T, B>,
+        v: &crate::TensorView<T, B>,
+        mask: Option<&Self>,
+        scale: f32,
+        b: usize,
+        hd: usize,
+    ) -> Result<Self> {
+        let q = crate::TensorView::from(self).transpose(1, 2)?;
+        let kt = k.transpose(1, 2)?;
+        let vt = v.transpose(1, 2)?;
+        let attn = q.matmul_t(&kt)?.scale(T::from_f32(scale))?;
+        let attn = match mask {
+            Some(m) => attn.broadcast_add(m)?,
+            None => attn,
+        };
+        let attn = attn.softmax()?;
+        attn.matmul(&vt)?.transpose(1, 2)?.reshape((b, 1, hd))?.contiguous()
+    }
+
     #[tracing::instrument(skip_all)]
     pub fn rope_i(&self, cos: &Self, sin: &Self, pos: usize) -> Result<Self> {
         let result = unsafe { Tensor::alloc_uninit(self.shape.clone(), self.device()) }?;

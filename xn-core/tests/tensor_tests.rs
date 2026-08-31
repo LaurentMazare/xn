@@ -1065,6 +1065,96 @@ fn check_grouped_matches_per_group(
     Ok(())
 }
 
+// -----------------------------------------------------------------------------
+// Fused single-query attention (sdpa_decode)
+// -----------------------------------------------------------------------------
+
+/// Reference: the transpose/matmul/softmax sequence a caller would otherwise write.
+fn sdpa_reference(
+    q: &Tensor<f32, xn::CpuDevice>,
+    k: &xn::TensorView<f32, xn::CpuDevice>,
+    v: &xn::TensorView<f32, xn::CpuDevice>,
+    mask: Option<&Tensor<f32, xn::CpuDevice>>,
+    scale: f32,
+) -> Result<Vec<f32>> {
+    let d = q.dims()[3];
+    let (b, h) = (q.dims()[0], q.dims()[2]);
+    let qt = xn::TensorView::from(q).transpose(1, 2)?;
+    let kt = k.transpose(1, 2)?;
+    let vt = v.transpose(1, 2)?;
+    let attn = qt.matmul_t(&kt)?.scale(scale)?;
+    let attn = match mask {
+        Some(m) => attn.broadcast_add(m)?,
+        None => attn,
+    };
+    let attn = attn.softmax()?;
+    attn.matmul(&vt)?.transpose(1, 2)?.reshape((b, 1, h * d))?.contiguous()?.to_vec()
+}
+
+fn check_sdpa(b: usize, h: usize, d: usize, kv: usize, cache_kv: usize) -> Result<()> {
+    check_sdpa_masked(b, h, d, kv, cache_kv, false)?;
+    check_sdpa_masked(b, h, d, kv, cache_kv, true)
+}
+
+fn check_sdpa_masked(
+    b: usize,
+    h: usize,
+    d: usize,
+    kv: usize,
+    cache_kv: usize,
+    masked: bool,
+) -> Result<()> {
+    let dev = &xn::CPU;
+    let mut seed = 0x2545_f491u32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed as f32 / u32::MAX as f32) - 0.5
+    };
+    let q: Tensor<f32, _> =
+        Tensor::from_vec((0..b * h * d).map(|_| rnd()).collect(), (b, 1, h, d), dev)?;
+    // Allocate the cache at `cache_kv` and use only its first `kv` positions, so the operands
+    // are a contiguous prefix of a longer storage -- the real decode situation.
+    let kc: Tensor<f32, _> = Tensor::from_vec(
+        (0..b * cache_kv * h * d).map(|_| rnd()).collect(),
+        (b, cache_kv, h, d),
+        dev,
+    )?;
+    let vc: Tensor<f32, _> = Tensor::from_vec(
+        (0..b * cache_kv * h * d).map(|_| rnd()).collect(),
+        (b, cache_kv, h, d),
+        dev,
+    )?;
+    let k = kc.narrow(1, 0..kv)?;
+    let v = vc.narrow(1, 0..kv)?;
+    let scale = 1.0 / (d as f32).sqrt();
+    // Sliding-window style: drop the oldest half of the context.
+    let mask: Option<Tensor<f32, _>> = if masked {
+        let cut = kv / 2;
+        Some(Tensor::from_vec(
+            (0..kv).map(|j| if j < cut { f32::NEG_INFINITY } else { 0.0 }).collect(),
+            (1, 1, 1, kv),
+            dev,
+        )?)
+    } else {
+        None
+    };
+
+    let got = q.sdpa_decode(&k, &v, mask.as_ref(), scale)?;
+    assert_eq!(got.dims(), &[b, 1, h * d]);
+    let got = got.to_vec()?;
+    let want = sdpa_reference(&q, &k, &v, mask.as_ref(), scale)?;
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert!(
+            (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+            "b={b} h={h} d={d} kv={kv}: index {i}: got {g}, want {w}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn test_conv_transpose1d_depthwise_cpu() -> Result<()> {
     // groups == in_channels == out_channels: the depthwise branch.
@@ -1133,6 +1223,32 @@ fn test_conv_transpose1d_output_padding_appends_zeros_cpu() -> Result<()> {
             assert_eq!(ext_v[c * (base_len + q) + i], 0., "ch {c} tail index {i} not zero");
         }
     }
+    Ok(())
+}
+
+#[test]
+fn test_sdpa_decode_matches_composed_cpu() -> Result<()> {
+    // exact-size cache (no prefix), then genuine prefixes of a longer cache
+    check_sdpa(1, 12, 64, 7, 7)?;
+    check_sdpa(1, 12, 64, 200, 4096)?;
+    check_sdpa(1, 1, 8, 1, 16)?;
+    check_sdpa(2, 4, 16, 33, 64)?;
+    check_sdpa(1, 8, 64, 1, 4096)
+}
+
+#[test]
+fn test_sdpa_decode_rejects_bad_shapes_cpu() -> Result<()> {
+    let dev = &xn::CPU;
+    let q: Tensor<f32, _> = Tensor::full(0.5, (1, 1, 4, 8), dev)?;
+    let kc: Tensor<f32, _> = Tensor::full(0.25, (1, 5, 4, 8), dev)?;
+    let bad: Tensor<f32, _> = Tensor::full(0.25, (1, 5, 4, 16), dev)?;
+    let k = kc.narrow(1, 0..5)?;
+    let badv = bad.narrow(1, 0..5)?;
+    // mismatched head dim between q and v
+    assert!(q.sdpa_decode(&k, &badv, None, 1.0).is_err());
+    // a query with more than one position is not a decode step
+    let q2: Tensor<f32, _> = Tensor::full(0.5, (1, 2, 4, 8), dev)?;
+    assert!(q2.sdpa_decode(&k, &k, None, 1.0).is_err());
     Ok(())
 }
 

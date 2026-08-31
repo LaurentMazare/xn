@@ -1195,6 +1195,110 @@ impl crate::Backend for crate::CpuDevice {
         }
     }
 
+    const FUSED_SDPA_DECODE: bool = true;
+    const SDPA_MAX_HEAD_DIM: usize = CPU_SDPA_MAX_HEAD_DIM;
+
+    #[allow(clippy::too_many_arguments)]
+    fn sdpa_decode<T: WithDTypeF>(
+        dst: &mut Self::Storage<T>,
+        (q, q_off): (&Self::Storage<T>, usize),
+        (k, k_off): (&Self::Storage<T>, usize),
+        (v, v_off): (&Self::Storage<T>, usize),
+        mask: Option<(&Self::Storage<T>, usize)>,
+        kv_batch_stride: usize,
+        b: usize,
+        h: usize,
+        d: usize,
+        kv: usize,
+        scale: f32,
+    ) -> Result<()> {
+        if d > CPU_SDPA_MAX_HEAD_DIM {
+            crate::bail!("sdpa_decode: head dim {d} exceeds {CPU_SDPA_MAX_HEAD_DIM}")
+        }
+        if kv == 0 {
+            crate::bail!("sdpa_decode: empty kv")
+        }
+        let hd = h * d;
+        // One (batch, head) pair per unit of work; each owns a disjoint `d`-wide slice of dst.
+        //
+        // Streaming ("online") softmax: carry a running max, denominator and weighted sum so
+        // that no kv-sized score buffer is needed and a single pass over k and v suffices,
+        // while staying as numerically stable as a two-pass max-subtracted softmax.
+        let head = |idx: usize, out: &mut [T]| {
+            let bi = idx / h;
+            let hh = idx % h;
+            let qo = q_off + bi * hd + hh * d;
+            let kb = k_off + bi * kv_batch_stride + hh * d;
+            let vb = v_off + bi * kv_batch_stride + hh * d;
+            let qrow = &q[qo..qo + d];
+            let mut acc = [0f32; CPU_SDPA_MAX_HEAD_DIM];
+            let acc = &mut acc[..d];
+            let mut max = f32::NEG_INFINITY;
+            let mut denom = 0f32;
+            for j in 0..kv {
+                let ko = kb + j * hd;
+                let krow = &k[ko..ko + d];
+                // Independent partial sums, the same shape as `reduce_combine`: a single
+                // `s += q * k` accumulator is a serial dependency chain the compiler cannot
+                // reorder (float addition is not associative), which pins the dot product at
+                // one FMA per latency. Eight lanes -- two 4-wide f32 vectors -- let it both
+                // vectorize and keep several FMAs in flight; eight measured distinctly
+                // better than four here.
+                const LANES: usize = 8;
+                let mut lanes = [0f32; LANES];
+                // Head dims are multiples of 8 in practice, so these tails are normally empty.
+                let (q_chunks, q_rem) = qrow.as_chunks::<LANES>();
+                let (k_chunks, k_rem) = krow.as_chunks::<LANES>();
+                for (qc, kc) in q_chunks.iter().zip(k_chunks.iter()) {
+                    for l in 0..LANES {
+                        lanes[l] +=
+                            <T as WithDTypeF>::to_f32(qc[l]) * <T as WithDTypeF>::to_f32(kc[l]);
+                    }
+                }
+                let mut s: f32 = lanes.iter().sum();
+                for (qq, kk) in q_rem.iter().zip(k_rem.iter()) {
+                    s += <T as WithDTypeF>::to_f32(*qq) * <T as WithDTypeF>::to_f32(*kk);
+                }
+                s *= scale;
+                if let Some((m, m_off)) = mask {
+                    s += <T as WithDTypeF>::to_f32(m[m_off + j]);
+                }
+                if s == f32::NEG_INFINITY {
+                    // Fully masked: contributes nothing to the sum or the denominator. Skipping
+                    // it also keeps the running max finite, which `exp(max - s)` relies on.
+                    continue;
+                }
+                if s > max {
+                    // Rebase the running totals onto the new maximum. On the first step
+                    // `max` is -inf, so this correctly zeroes them.
+                    let c = (max - s).exp();
+                    denom *= c;
+                    for a in acc.iter_mut() {
+                        *a *= c;
+                    }
+                    max = s;
+                }
+                let p = (s - max).exp();
+                denom += p;
+                let vo = vb + j * hd;
+                for (a, vv) in acc.iter_mut().zip(v[vo..vo + d].iter()) {
+                    *a += p * <T as WithDTypeF>::to_f32(*vv);
+                }
+            }
+            let inv = 1.0 / denom;
+            for (o, a) in out.iter_mut().zip(acc.iter()) {
+                *o = T::from_f32(*a * inv);
+            }
+        };
+        let dst = &mut dst[..b * hd];
+        if use_parallelism(b * h * kv * d) {
+            dst.par_chunks_mut(d).enumerate().for_each(|(i, o)| head(i, o));
+        } else {
+            dst.chunks_mut(d).enumerate().for_each(|(i, o)| head(i, o));
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn conv_transpose1d<T: WithDTypeF>(
         dst: &mut Self::Storage<T>,
@@ -1412,6 +1516,10 @@ fn reduce_arg<T: WithDType + Copy>(
         }
     }
 }
+
+/// Largest head dimension the fused attention kernel keeps its accumulator on the stack for.
+/// Well above any head dim in practice; callers fall back to the composed path beyond it.
+const CPU_SDPA_MAX_HEAD_DIM: usize = 256;
 
 /// Below this many elements, elementwise ops run serially: the rayon fork/join overhead
 /// (~10us) dwarfs the work itself.

@@ -329,4 +329,44 @@ pub trait Backend: Sized + Clone + 'static + Sync + Send + std::fmt::Debug {
         output_padding: usize,
         groups: usize,
     ) -> Result<()>;
+
+    /// Whether this backend implements [`Backend::sdpa_decode`]. When false, callers compose
+    /// the operation from transpose/matmul/softmax instead.
+    const FUSED_SDPA_DECODE: bool = false;
+
+    /// Largest head dim [`Backend::sdpa_decode`] accepts. Callers fall back to the composed
+    /// form above it, so a backend may cap this at whatever its kernel is sized for.
+    const SDPA_MAX_HEAD_DIM: usize = 0;
+
+    /// Fused scaled-dot-product attention for a single query position, i.e. one step of
+    /// autoregressive decode.
+    ///
+    /// Operands keep the `(batch, pos, head, dim)` layout the attention cache is written in,
+    /// with `dim` innermost and contiguous, so no transposes are needed:
+    ///   `q[q_off + bi * h * d + hh * d + i]`
+    ///   `k[k_off + bi * kv_batch_stride + j * h * d + hh * d + i]` (same for `v`)
+    /// `dst` is contiguous `(b, h * d)`.
+    ///
+    /// `mask`, when given, is `kv` contiguous additive terms applied to every head and batch
+    /// (`0` to keep a position, `-inf` to drop it).
+    ///
+    /// Fusing matters here because the composed form is a batch of `h` tiny matmuls per
+    /// projection plus a separate softmax pass, which is dominated by per-call overhead rather
+    /// than arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    fn sdpa_decode<T: crate::WithDTypeF>(
+        _dst: &mut Self::Storage<T>,
+        _q: (&Self::Storage<T>, usize),
+        _k: (&Self::Storage<T>, usize),
+        _v: (&Self::Storage<T>, usize),
+        _mask: Option<(&Self::Storage<T>, usize)>,
+        _kv_batch_stride: usize,
+        _b: usize,
+        _h: usize,
+        _d: usize,
+        _kv: usize,
+        _scale: f32,
+    ) -> Result<()> {
+        crate::bail!("sdpa_decode is not implemented for this backend")
+    }
 }
