@@ -738,7 +738,64 @@ fn matmul_q8_0_sgemm(
     let a_addr = rhs_t.as_ptr() as usize;
     let b_addr = lhs_b.as_ptr() as usize;
     let c_addr = dst.as_mut_ptr() as usize;
+    // Gating the fan-out on a work threshold was measured and rejected: it helps only when the
+    // pool is shared with another busy thread, and costs ~3.4% otherwise. With a single-worker
+    // pool there is still nothing to fan out to, so call the kernel directly and skip the join.
     let nth = rayon::current_num_threads().max(1);
+    if nth == 1 {
+        // SAFETY: the sole worker's tile range covers the output exactly once, so nothing
+        // aliases. Bounds were checked above against the slice lengths. The three arms are
+        // exhaustive over the `cfg` on `matmul_q8_0_sgemm` itself.
+        unsafe {
+            #[cfg(target_feature = "avx")]
+            super::avx::sgemm_q8_0_q8_0_raw(
+                n,
+                m,
+                k_blocks,
+                a_addr as *const BlockQ8_0,
+                k_blocks,
+                b_addr as *const BlockQ8_0,
+                k_blocks,
+                c_addr as *mut f32,
+                n,
+                0,
+                1,
+            );
+            #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
+            super::neon::sgemm_q8_0_q8_0_raw(
+                n,
+                m,
+                k_blocks,
+                a_addr as *const BlockQ8_0,
+                k_blocks,
+                b_addr as *const BlockQ8_0,
+                k_blocks,
+                c_addr as *mut f32,
+                n,
+                0,
+                1,
+            );
+            #[cfg(all(
+                target_feature = "simd128",
+                not(target_feature = "avx"),
+                not(target_feature = "neon"),
+            ))]
+            super::simd128::sgemm_q8_0_q8_0_raw(
+                n,
+                m,
+                k_blocks,
+                a_addr as *const BlockQ8_0,
+                k_blocks,
+                b_addr as *const BlockQ8_0,
+                k_blocks,
+                c_addr as *mut f32,
+                n,
+                0,
+                1,
+            );
+        }
+        return Ok(());
+    }
     (0..nth).into_par_iter().for_each(|ith| {
         // SAFETY: tile assignments are disjoint across `ith` values, so
         // writes through `c_addr` do not alias. Bounds were checked
