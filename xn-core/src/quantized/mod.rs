@@ -12,6 +12,7 @@ pub mod k_quants;
 #[cfg(target_feature = "neon")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod neon;
+pub mod repack;
 #[cfg(target_feature = "simd128")]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod simd128;
@@ -66,12 +67,7 @@ impl QStorage {
 
     fn data(&self) -> Result<Cow<'_, [u8]>> {
         match self {
-            QStorage::Cpu(storage) => {
-                let data_ptr = storage.as_ptr();
-                let size_in_bytes = storage.storage_size_in_bytes();
-                let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
-                Ok(Cow::from(data))
-            }
+            QStorage::Cpu(storage) => storage.raw_data(),
         }
     }
 }
@@ -205,6 +201,15 @@ pub trait QuantizedType: Send + Sync {
     fn storage_size_in_bytes(&self) -> usize;
     fn as_ptr(&self) -> *const u8;
     fn block_size(&self) -> usize;
+    /// The tensor's bytes in its *canonical* on-disk layout.
+    ///
+    /// Storages that reorder the data for compute (see [`repack`]) must undo that here, so
+    /// anything persisting the tensor writes the format its dtype claims.
+    fn raw_data(&self) -> Result<Cow<'_, [u8]>> {
+        let data =
+            unsafe { std::slice::from_raw_parts(self.as_ptr(), self.storage_size_in_bytes()) };
+        Ok(Cow::from(data))
+    }
     #[allow(clippy::wrong_self_convention)]
     fn from_float(&mut self, xs: &[f32]) -> Result<()>;
     fn size(&self) -> usize;

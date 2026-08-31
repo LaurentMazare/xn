@@ -744,112 +744,88 @@ fn matmul_q8_0_sgemm(
     let nth = rayon::current_num_threads().max(1);
     if nth == 1 {
         // SAFETY: the sole worker's tile range covers the output exactly once, so nothing
-        // aliases. Bounds were checked above against the slice lengths. The three arms are
-        // exhaustive over the `cfg` on `matmul_q8_0_sgemm` itself.
-        unsafe {
-            #[cfg(target_feature = "avx")]
-            super::avx::sgemm_q8_0_q8_0_raw(
-                n,
-                m,
-                k_blocks,
-                a_addr as *const BlockQ8_0,
-                k_blocks,
-                b_addr as *const BlockQ8_0,
-                k_blocks,
-                c_addr as *mut f32,
-                n,
-                0,
-                1,
-            );
-            #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
-            super::neon::sgemm_q8_0_q8_0_raw(
-                n,
-                m,
-                k_blocks,
-                a_addr as *const BlockQ8_0,
-                k_blocks,
-                b_addr as *const BlockQ8_0,
-                k_blocks,
-                c_addr as *mut f32,
-                n,
-                0,
-                1,
-            );
-            #[cfg(all(
-                target_feature = "simd128",
-                not(target_feature = "avx"),
-                not(target_feature = "neon"),
-            ))]
-            super::simd128::sgemm_q8_0_q8_0_raw(
-                n,
-                m,
-                k_blocks,
-                a_addr as *const BlockQ8_0,
-                k_blocks,
-                b_addr as *const BlockQ8_0,
-                k_blocks,
-                c_addr as *mut f32,
-                n,
-                0,
-                1,
-            );
-        }
+        // aliases. Bounds were checked above against the slice lengths.
+        unsafe { sgemm_q8_0_tile(a_addr, b_addr, c_addr, n, m, k_blocks, 0, 1) };
         return Ok(());
     }
     (0..nth).into_par_iter().for_each(|ith| {
         // SAFETY: tile assignments are disjoint across `ith` values, so
         // writes through `c_addr` do not alias. Bounds were checked
         // above against the slice lengths.
-        unsafe {
-            #[cfg(target_feature = "avx")]
-            super::avx::sgemm_q8_0_q8_0_raw(
-                n,
-                m,
-                k_blocks,
-                a_addr as *const BlockQ8_0,
-                k_blocks,
-                b_addr as *const BlockQ8_0,
-                k_blocks,
-                c_addr as *mut f32,
-                n,
-                ith,
-                nth,
-            );
-            #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
-            super::neon::sgemm_q8_0_q8_0_raw(
-                n,
-                m,
-                k_blocks,
-                a_addr as *const BlockQ8_0,
-                k_blocks,
-                b_addr as *const BlockQ8_0,
-                k_blocks,
-                c_addr as *mut f32,
-                n,
-                ith,
-                nth,
-            );
-            #[cfg(all(
-                target_feature = "simd128",
-                not(target_feature = "avx"),
-                not(target_feature = "neon"),
-            ))]
-            super::simd128::sgemm_q8_0_q8_0_raw(
-                n,
-                m,
-                k_blocks,
-                a_addr as *const BlockQ8_0,
-                k_blocks,
-                b_addr as *const BlockQ8_0,
-                k_blocks,
-                c_addr as *mut f32,
-                n,
-                ith,
-                nth,
-            );
-        }
+        unsafe { sgemm_q8_0_tile(a_addr, b_addr, c_addr, n, m, k_blocks, ith, nth) };
     });
     Ok(())
+}
+
+// Run the `ith` of `nth` tile ranges on whichever sgemm kernel this build has.
+//
+// Both the serial and the fanned-out paths go through here, so a target can never end up at a
+// call site whose `cfg` arms it fails to match -- which would leave `dst` untouched and return
+// `Ok`. The three arms are exhaustive over the `cfg` on `matmul_q8_0_sgemm` itself.
+//
+// # Safety
+// `a` and `b` must address at least `n * k_blocks` and `m * k_blocks` `BlockQ8_0`s, `c` at
+// least `m * n` floats, and no two concurrent calls may share an `ith`.
+#[cfg(any(target_feature = "avx", target_feature = "neon", target_feature = "simd128"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sgemm_q8_0_tile(
+    a: usize,
+    b: usize,
+    c: usize,
+    n: usize,
+    m: usize,
+    k_blocks: usize,
+    ith: usize,
+    nth: usize,
+) {
+    unsafe {
+        #[cfg(target_feature = "avx")]
+        super::avx::sgemm_q8_0_q8_0_raw(
+            n,
+            m,
+            k_blocks,
+            a as *const BlockQ8_0,
+            k_blocks,
+            b as *const BlockQ8_0,
+            k_blocks,
+            c as *mut f32,
+            n,
+            ith,
+            nth,
+        );
+        #[cfg(all(target_feature = "neon", not(target_feature = "avx")))]
+        super::neon::sgemm_q8_0_q8_0_raw(
+            n,
+            m,
+            k_blocks,
+            a as *const BlockQ8_0,
+            k_blocks,
+            b as *const BlockQ8_0,
+            k_blocks,
+            c as *mut f32,
+            n,
+            ith,
+            nth,
+        );
+        #[cfg(all(
+            target_feature = "simd128",
+            not(target_feature = "avx"),
+            not(target_feature = "neon"),
+        ))]
+        super::simd128::sgemm_q8_0_q8_0_raw(
+            n,
+            m,
+            k_blocks,
+            a as *const BlockQ8_0,
+            k_blocks,
+            b as *const BlockQ8_0,
+            k_blocks,
+            c as *mut f32,
+            n,
+            ith,
+            nth,
+        );
+    }
 }
 
 impl GgmlType for BlockQ8_1 {
@@ -2168,5 +2144,67 @@ impl GgmlType for f16 {
             *y = x.to_f32()
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q8_0_weights(n: usize, k: usize) -> Vec<BlockQ8_0> {
+        let raw: Vec<f32> = (0..n * k).map(|i| ((i * 37 % 211) as f32 - 105.0) / 64.0).collect();
+        let mut blocks = vec![BlockQ8_0::zeros(); n * k / QK8_0];
+        BlockQ8_0::from_float(&raw, &mut blocks).unwrap();
+        blocks
+    }
+
+    /// Dot the quantized operands in f64, which is what both kernels approximate.
+    fn reference(w: &[BlockQ8_0], lhs: &[f32], m: usize, k: usize, n: usize) -> Vec<f64> {
+        let kb = k / QK8_0;
+        let mut a = vec![BlockQ8_0::zeros(); m * kb];
+        for row in 0..m {
+            BlockQ8_0::from_float(&lhs[row * k..(row + 1) * k], &mut a[row * kb..(row + 1) * kb])
+                .unwrap();
+        }
+        let mut dst = vec![0f64; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0f64;
+                for b in 0..kb {
+                    let (ab, wb) = (&a[row * kb + b], &w[col * kb + b]);
+                    let sum: i32 =
+                        ab.qs.iter().zip(wb.qs.iter()).map(|(&x, &y)| x as i32 * y as i32).sum();
+                    acc += sum as f64 * ab.d.to_f32() as f64 * wb.d.to_f32() as f64;
+                }
+                dst[row * n + col] = acc;
+            }
+        }
+        dst
+    }
+
+    /// The single-worker path takes a different branch from the fanned-out one, and used to
+    /// dispatch to no kernel at all on targets whose `cfg` arm was missing -- returning `Ok`
+    /// with `dst` untouched, i.e. silently all zeros. Pin both pool sizes against a reference.
+    #[test]
+    fn q8_0_matmul_matches_reference_at_every_pool_size() {
+        for (m, k, n) in [(1, 256, 64), (4, 128, 32), (7, 96, 12)] {
+            let w = q8_0_weights(n, k);
+            let lhs: Vec<f32> = (0..m * k).map(|i| ((i * 53 % 173) as f32 - 86.0) / 32.0).collect();
+            let want = reference(&w, &lhs, m, k, n);
+
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                let mut got = vec![0f32; m * n];
+                pool.install(|| matmul((m, k, n), &lhs, &w, &mut got)).unwrap();
+
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    let tol = 1e-4 * w.abs().max(1.0);
+                    assert!(
+                        (*g as f64 - w).abs() <= tol,
+                        "threads={threads} m={m} k={k} n={n} idx={i}: got {g}, want {w}"
+                    );
+                }
+            }
+        }
     }
 }
