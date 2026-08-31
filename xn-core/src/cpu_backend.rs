@@ -922,7 +922,10 @@ impl crate::Backend for crate::CpuDevice {
     ) -> Result<()> {
         let src = &src[..d * dim_m1];
         let dst = &mut dst[..d * dim_m1];
-        src.par_chunks(dim_m1).zip(dst.par_chunks_mut(dim_m1)).for_each(|(src, dst)| {
+        // Rows are independent, so this is gated the same way as the elementwise ops: during
+        // autoregressive decode a row is a single short attention vector, and the fork/join
+        // cost dominates the handful of exps it saves.
+        let softmax_row = |src: &[T], dst: &mut [T]| {
             let mut max = T::neg_infinity();
             for &v in src.iter() {
                 max = T::max(v, max)
@@ -934,7 +937,14 @@ impl crate::Backend for crate::CpuDevice {
             for d in dst.iter_mut() {
                 *d = T::from_f32(d.to_f32() / sum_exp)
             }
-        });
+        };
+        if use_parallelism(d * dim_m1) {
+            src.par_chunks(dim_m1)
+                .zip(dst.par_chunks_mut(dim_m1))
+                .for_each(|(s, d)| softmax_row(s, d));
+        } else {
+            src.chunks(dim_m1).zip(dst.chunks_mut(dim_m1)).for_each(|(s, d)| softmax_row(s, d));
+        }
         Ok(())
     }
 
@@ -1699,52 +1709,67 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
         }
     }
 
-    // Process each kernel offset
-    for k_offset in 0..kernel_size {
-        // Parallelize over output channels
-        (0..out_channels).into_par_iter().for_each(|out_c| {
-            let g = out_c / out_c_per_group;
-            let oc_in_group = out_c % out_c_per_group;
-            let in_c_start = g * in_c_per_group;
+    // Each (b, out_c) pair owns a contiguous `out_length` slice of dst, so the op splits over
+    // those slices instead of over channels once per kernel offset. That means one fork/join
+    // for the whole call rather than `kernel_size` of them, and safe mutable access instead of
+    // raw pointers. Keeping k_offset outermost within a slice preserves the original
+    // accumulation order into dst, so results are unchanged.
+    let src_reordered = src_reordered.as_slice();
+    let accumulate = |bc: usize, dst_row: &mut [T]| {
+        let b = bc / out_channels;
+        let out_c = bc % out_channels;
+        let g = out_c / out_c_per_group;
+        let oc_in_group = out_c % out_c_per_group;
+        let in_c_start = g * in_c_per_group;
+        let src_row = &src_reordered[b * length * in_channels..(b + 1) * length * in_channels];
+        // Kernel layout: [in_channels, out_channels/groups, kernel_size]
+        let k_base = in_c_start * out_c_per_group * kernel_size + oc_in_group * kernel_size;
 
-            // Gather kernel weights for this output channel and kernel offset
-            // Kernel layout: [in_channels, out_channels/groups, kernel_size]
-            let k_cont: Vec<T> = (0..in_c_per_group)
-                .map(|ic| {
-                    let in_c = in_c_start + ic;
-                    let k_idx =
-                        in_c * out_c_per_group * kernel_size + oc_in_group * kernel_size + k_offset;
-                    kernel[k_idx]
-                })
-                .collect();
-
-            for b in 0..batch {
+        if in_c_per_group == 1 {
+            // Depthwise: the dot product over input channels collapses to a single multiply,
+            // and this channel's kernel taps are contiguous.
+            let w = &kernel[k_base..k_base + kernel_size];
+            for (k_offset, &wk) in w.iter().enumerate() {
                 for il in 0..length {
                     let out_pos_raw = il * stride + k_offset;
-
-                    // Check padding bounds
                     if out_pos_raw < padding || out_pos_raw >= out_length + padding {
                         continue;
                     }
-                    let out_pos = out_pos_raw - padding;
-
-                    // Compute dot product over input channels
-                    let src_base = b * length * in_channels + il * in_channels + in_c_start;
-                    let mut d = T::zero();
-                    for ic in 0..in_c_per_group {
-                        d += src_reordered[src_base + ic] * k_cont[ic];
-                    }
-
-                    // Accumulate into output
-                    // Safety: each out_c is processed by a different thread, so no races
-                    let dst_idx = b * out_channels * out_length + out_c * out_length + out_pos;
-                    unsafe {
-                        let ptr = dst.as_ptr().add(dst_idx) as *mut T;
-                        *ptr += d;
-                    }
+                    dst_row[out_pos_raw - padding] += src_row[il * in_channels + in_c_start] * wk;
                 }
             }
-        });
+        } else {
+            // This channel's taps for a given k_offset sit `out_c_per_group * kernel_size`
+            // apart in `kernel`, so gather them once per offset rather than reading them
+            // strided inside the `il` loop: the dot product below then walks two contiguous
+            // buffers and vectorizes. The gather costs one `in_c_per_group` copy per
+            // (slice, offset), which is `length` times less work than the loop it feeds.
+            let mut k_cont = vec![T::zero(); in_c_per_group];
+            for k_offset in 0..kernel_size {
+                for (ic, kc) in k_cont.iter_mut().enumerate() {
+                    *kc = kernel[k_base + ic * out_c_per_group * kernel_size + k_offset];
+                }
+                for il in 0..length {
+                    let out_pos_raw = il * stride + k_offset;
+                    if out_pos_raw < padding || out_pos_raw >= out_length + padding {
+                        continue;
+                    }
+                    let src_base = il * in_channels + in_c_start;
+                    let mut acc = T::zero();
+                    for (ic, &kc) in k_cont.iter().enumerate() {
+                        acc += src_row[src_base + ic] * kc;
+                    }
+                    dst_row[out_pos_raw - padding] += acc;
+                }
+            }
+        }
+    };
+
+    let dst = &mut dst[..batch * out_channels * out_length];
+    if use_parallelism(batch * out_channels * kernel_size * length) {
+        dst.par_chunks_mut(out_length).enumerate().for_each(|(bc, d)| accumulate(bc, d));
+    } else {
+        dst.chunks_mut(out_length).enumerate().for_each(|(bc, d)| accumulate(bc, d));
     }
     Ok(())
 }
