@@ -109,15 +109,19 @@ impl Vocab {
     }
 }
 
+// Reinterpret the on-disk bytes as the dtype's block stream. GGUF aligns tensor data well
+// past any block's alignment, so the cast is sound for every type this file dispatches to.
+fn blocks_from_raw<T>(raw_data: &[u8], size_in_bytes: usize) -> &[T] {
+    let n_blocks = size_in_bytes / std::mem::size_of::<T>();
+    unsafe { std::slice::from_raw_parts(raw_data.as_ptr() as *const T, n_blocks) }
+}
+
 fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
     raw_data: &[u8],
     size_in_bytes: usize,
     dims: Vec<usize>,
 ) -> Result<super::QTensor> {
-    let raw_data_ptr = raw_data.as_ptr();
-    let n_blocks = size_in_bytes / std::mem::size_of::<T>();
-    let data = unsafe { std::slice::from_raw_parts(raw_data_ptr as *const T, n_blocks) };
-    let data = QStorage::Cpu(Box::new(data.to_vec()));
+    let data = QStorage::Cpu(Box::new(blocks_from_raw::<T>(raw_data, size_in_bytes).to_vec()));
     super::QTensor::new(data, dims)
 }
 
@@ -144,7 +148,11 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q4_1 => from_raw_data::<k_quants::BlockQ4_1>(raw_data, size_in_bytes, dims),
         GgmlDType::Q5_0 => from_raw_data::<k_quants::BlockQ5_0>(raw_data, size_in_bytes, dims),
         GgmlDType::Q5_1 => from_raw_data::<k_quants::BlockQ5_1>(raw_data, size_in_bytes, dims),
-        GgmlDType::Q8_0 => from_raw_data::<k_quants::BlockQ8_0>(raw_data, size_in_bytes, dims),
+        GgmlDType::Q8_0 => {
+            let blocks = blocks_from_raw::<k_quants::BlockQ8_0>(raw_data, size_in_bytes);
+            let storage = super::repack::q8_0_storage(blocks, &dims);
+            super::QTensor::new(storage, dims)
+        }
         GgmlDType::Q2K => from_raw_data::<k_quants::BlockQ2K>(raw_data, size_in_bytes, dims),
         GgmlDType::Q3K => from_raw_data::<k_quants::BlockQ3K>(raw_data, size_in_bytes, dims),
         GgmlDType::Q4K => from_raw_data::<k_quants::BlockQ4K>(raw_data, size_in_bytes, dims),
