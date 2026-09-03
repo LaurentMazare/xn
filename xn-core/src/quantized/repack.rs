@@ -21,7 +21,6 @@ use super::GgmlDType;
 use super::k_quants::{BlockQ8_0, GgmlType, QK8_0};
 use crate::Result;
 use half::f16;
-use rayon::prelude::*;
 use std::borrow::Cow;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -249,7 +248,6 @@ fn matmul_interleaved(
     kb: usize,
 ) {
     let ngroups = n / NCOLS;
-    let nth = rayon::current_num_threads().max(1);
 
     // Each worker owns a contiguous run of column groups, so it walks one unbroken span of the
     // weight buffer and writes a disjoint set of dst columns.
@@ -263,13 +261,14 @@ fn matmul_interleaved(
         kb,
     };
 
-    if nth == 1 || ngroups == 1 {
-        // SAFETY: single worker, so the one range covers the output exactly once.
+    if ngroups == 1 {
+        // SAFETY: one range, covering the output exactly once.
         unsafe { job.run(0, ngroups) };
         return;
     }
-    let duty = ngroups.div_ceil(nth);
-    (0..nth).into_par_iter().for_each(|ith| {
+    // A single-participant pool runs this inline, so a one-worker build pays no join.
+    crate::threadpool::dispatch(|ith, nth| {
+        let duty = ngroups.div_ceil(nth);
         let g0 = (duty * ith).min(ngroups);
         let g1 = (g0 + duty).min(ngroups);
         if g0 == g1 {
@@ -281,7 +280,7 @@ fn matmul_interleaved(
     });
 }
 
-/// One matmul's operands, as addresses so the rayon closure needs no wrapper type.
+/// One matmul's operands, as addresses so the dispatched closure needs no wrapper type.
 #[derive(Clone, Copy)]
 struct Job {
     w: usize,
