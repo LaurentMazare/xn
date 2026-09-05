@@ -8,11 +8,11 @@ const USE_IM2COL_CONV1D: bool = true;
 const USE_COL2IM_CONV1D_TR: bool = true;
 
 /// Whether to use a parallel implementation for this many elements of work. The work must be
-/// large enough to amortize the rayon fork/join overhead, and the global pool must actually
-/// have more than one thread: with a single-thread pool (e.g. RAYON_NUM_THREADS=1) every
-/// parallel call would still pay a cross-thread job handoff for no benefit.
+/// large enough to amortize the dispatch, and the pool must actually have more than one
+/// participant: with a single-thread pool (e.g. RAYON_NUM_THREADS=1) every parallel call would
+/// still pay a handoff for no benefit.
 fn use_parallelism(work: usize) -> bool {
-    work >= ELEMWISE_PAR_THRESHOLD && rayon::current_num_threads() > 1
+    work >= ELEMWISE_PAR_THRESHOLD && crate::threadpool::size() > 1
 }
 
 fn copy_strided_2d<T: WithDType>(
@@ -78,10 +78,63 @@ fn gemm_<T: WithDType>(
 ) -> Result<()> {
     let lhs = &lhs[lhs_o..];
     let rhs = &rhs[rhs_o..];
+
+    // Column stripes, run on xn's own pool rather than letting `gemm` reach for rayon.
+    //
+    // Two pools would otherwise both be live inside a decode step -- this one for the f32
+    // matmuls and xn's for everything else -- and their idle workers spin against each other
+    // for cores. Splitting by output column is what `Parallelism::Rayon` does internally
+    // anyway; the cost is that each stripe re-packs the lhs panel, which is negligible at the
+    // batch sizes decode uses.
+    let nth = crate::threadpool::size();
+    // One stripe per participant. Measured against 0.25x, 0.5x, 2x and 4x that count: 1x and
+    // 2x tie, everything else is worse. Splitting the rows instead when the output is too
+    // narrow to stripe was also tried and nets nothing, so narrow outputs stay serial.
+    let stripes = if nth > 1 && n >= nth * 4 && m * n * k >= 1 << 14 { nth } else { 1 };
+
     for b_idx in 0..lhs_b {
         let dst = &mut dst[b_idx * m * n..(b_idx + 1) * m * n];
         let lhs = &lhs[b_idx * lhs_b_stride..];
         let rhs = &rhs[b_idx * rhs_b_stride..];
+        if stripes > 1 {
+            let dst_p = dst.as_mut_ptr() as usize;
+            let lhs_p = lhs.as_ptr() as usize;
+            let rhs_p = rhs.as_ptr() as usize;
+            crate::threadpool::par_units(stripes, |s| {
+                let per = n.div_ceil(stripes);
+                let n0 = (s * per).min(n);
+                let n1 = (n0 + per).min(n);
+                if n0 == n1 {
+                    return;
+                }
+                // SAFETY: stripes own disjoint output columns, and every offset stays inside
+                // the slices borrowed above, which outlive the dispatch.
+                unsafe {
+                    gemm::gemm(
+                        m,
+                        n1 - n0,
+                        k,
+                        (dst_p as *mut T).add(n0 * dst_cs),
+                        dst_cs as isize,
+                        dst_rs as isize,
+                        false,
+                        lhs_p as *const T,
+                        lhs_cs as isize,
+                        lhs_rs as isize,
+                        (rhs_p as *const T).add(n0 * rhs_cs),
+                        rhs_cs as isize,
+                        rhs_rs as isize,
+                        T::zero(),
+                        T::one(),
+                        false,
+                        false,
+                        false,
+                        gemm::Parallelism::None,
+                    )
+                }
+            });
+            continue;
+        }
         unsafe {
             gemm::gemm(
                 /* m: usize = */ m,
@@ -102,7 +155,7 @@ fn gemm_<T: WithDType>(
                 /* conj_dst: bool = */ false,
                 /* conj_lhs: bool = */ false,
                 /* conj_rhs: bool = */ false,
-                gemm::Parallelism::Rayon(crate::get_num_threads()),
+                gemm::Parallelism::None,
             )
         }
     }
@@ -939,9 +992,9 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(d * dim_m1) {
-            src.par_chunks(dim_m1)
-                .zip(dst.par_chunks_mut(dim_m1))
-                .for_each(|(s, d)| softmax_row(s, d));
+            crate::threadpool::par_chunks_zip(dst, dim_m1, src, dim_m1, |_, d, s| {
+                softmax_row(s, d)
+            });
         } else {
             src.chunks(dim_m1).zip(dst.chunks_mut(dim_m1)).for_each(|(s, d)| softmax_row(s, d));
         }
@@ -958,7 +1011,7 @@ impl crate::Backend for crate::CpuDevice {
     ) -> Result<()> {
         let src = &src[..d * dim_m1];
         let dst = &mut dst[..d * dim_m1];
-        src.par_chunks(dim_m1).zip(dst.par_chunks_mut(dim_m1)).for_each(|(src, dst)| {
+        crate::threadpool::par_chunks_zip(dst, dim_m1, src, dim_m1, |_, dst, src| {
             let sum2 = src.iter().map(|&v| v.to_f32() * v.to_f32()).sum::<f32>();
             let m = (sum2 / dim_m1 as f32 + eps).sqrt();
             for ((d, s), alpha) in dst.iter_mut().zip(src.iter()).zip(alpha) {
@@ -982,7 +1035,7 @@ impl crate::Backend for crate::CpuDevice {
         let dst = &mut dst[..d * dim_m1];
         let weight = &weight[..dim_m1];
         let bias = &bias[..dim_m1];
-        src.par_chunks(dim_m1).zip(dst.par_chunks_mut(dim_m1)).for_each(|(src, dst)| {
+        crate::threadpool::par_chunks_zip(dst, dim_m1, src, dim_m1, |_, dst, src| {
             // Compute mean
             let sum: f32 = src.iter().map(|&v| v.to_f32()).sum();
             let mean = sum / dim_m1 as f32;
@@ -1292,7 +1345,7 @@ impl crate::Backend for crate::CpuDevice {
         };
         let dst = &mut dst[..b * hd];
         if use_parallelism(b * h * kv * d) {
-            dst.par_chunks_mut(d).enumerate().for_each(|(i, o)| head(i, o));
+            crate::threadpool::par_chunks_mut(dst, d, |i, o| head(i, o));
         } else {
             dst.chunks_mut(d).enumerate().for_each(|(i, o)| head(i, o));
         }
@@ -1539,8 +1592,12 @@ where
             f(d, *s);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
-            |(dst, src)| {
+        crate::threadpool::par_chunks_zip(
+            dst,
+            ELEMWISE_CHUNK,
+            src,
+            ELEMWISE_CHUNK,
+            |_, dst, src| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     f(d, *s);
                 }
@@ -1560,7 +1617,7 @@ where
             f(d);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK).for_each(|dst| {
+        crate::threadpool::par_chunks_mut(dst, ELEMWISE_CHUNK, |_, dst| {
             for d in dst.iter_mut() {
                 f(d);
             }
@@ -1579,8 +1636,12 @@ where
             *d = f(*s);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK).zip(src.par_chunks(ELEMWISE_CHUNK)).for_each(
-            |(dst, src)| {
+        crate::threadpool::par_chunks_zip(
+            dst,
+            ELEMWISE_CHUNK,
+            src,
+            ELEMWISE_CHUNK,
+            |_, dst, src| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d = f(*s);
                 }
@@ -1600,13 +1661,20 @@ where
             *d = f(*l, *r);
         }
     } else {
-        dst.par_chunks_mut(ELEMWISE_CHUNK)
-            .zip(lhs.par_chunks(ELEMWISE_CHUNK).zip(rhs.par_chunks(ELEMWISE_CHUNK)))
-            .for_each(|(dst, (lhs, rhs))| {
+        crate::threadpool::par_chunks_zip(
+            dst,
+            ELEMWISE_CHUNK,
+            lhs,
+            ELEMWISE_CHUNK,
+            |c, dst, lhs| {
+                // `rhs` is chunked the same way, so the piece is fixed by the chunk index.
+                let start = c * ELEMWISE_CHUNK;
+                let rhs = &rhs[start..(start + dst.len()).min(rhs.len())];
                 for ((d, l), r) in dst.iter_mut().zip(lhs).zip(rhs) {
                     *d = f(*l, *r);
                 }
-            });
+            },
+        );
     }
 }
 
@@ -1652,7 +1720,7 @@ fn im2col1d<T: WithDTypeF>(
         }
     };
     if use_parallelism(batch * l_out * k) {
-        dst.par_chunks_mut(k).enumerate().for_each(|(bl, dst_row)| fill_row(bl, dst_row));
+        crate::threadpool::par_chunks_mut(&mut dst, k, |bl, dst_row| fill_row(bl, dst_row));
     } else {
         dst.chunks_mut(k).enumerate().for_each(|(bl, dst_row)| fill_row(bl, dst_row));
     }
@@ -1777,7 +1845,7 @@ fn col2im1d<T: WithDTypeF>(
         }
     };
     if use_parallelism(dst.len().max(col.len())) {
-        dst.par_chunks_mut(l_out).enumerate().for_each(|(bc, dst)| accumulate(bc, dst));
+        crate::threadpool::par_chunks_mut(dst, l_out, |bc, dst| accumulate(bc, dst));
     } else {
         dst.chunks_mut(l_out).enumerate().for_each(|(bc, dst)| accumulate(bc, dst));
     }
@@ -1875,7 +1943,7 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
 
     let dst = &mut dst[..batch * out_channels * out_length];
     if use_parallelism(batch * out_channels * kernel_size * length) {
-        dst.par_chunks_mut(out_length).enumerate().for_each(|(bc, d)| accumulate(bc, d));
+        crate::threadpool::par_chunks_mut(dst, out_length, |bc, d| accumulate(bc, d));
     } else {
         dst.chunks_mut(out_length).enumerate().for_each(|(bc, d)| accumulate(bc, d));
     }
