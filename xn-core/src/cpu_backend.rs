@@ -79,6 +79,27 @@ fn gemm_<T: WithDType>(
     let lhs = &lhs[lhs_o..];
     let rhs = &rhs[rhs_o..];
 
+    // Unit-stride `f32` products on the wasm SIMD target: `x @ W^T` on a row-major weight is
+    // a tile of dot products, `x @ W` a broadcast tile, and neither packs anything. A strided
+    // `k` axis still goes through `gemm`.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    if lhs_cs == 1 && dst_cs == 1 && (rhs_rs == 1 || rhs_cs == 1) {
+        if let (Some(dst), Some(lhs), Some(rhs)) = (as_f32_mut(dst), as_f32(lhs), as_f32(rhs)) {
+            for b in 0..lhs_b {
+                let dst = &mut dst[b * m * n..(b + 1) * m * n];
+                let (lhs, rhs) = (&lhs[b * lhs_b_stride..], &rhs[b * rhs_b_stride..]);
+                if rhs_rs == 1 {
+                    crate::simd128_conv::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, k);
+                } else {
+                    crate::simd128_conv::gemm_bcast_lhs(
+                        dst, dst_rs, lhs, lhs_rs, 1, rhs, rhs_rs, m, n, k,
+                    );
+                }
+            }
+            return Ok(());
+        }
+    }
+
     // Column stripes, run on xn's own pool rather than letting `gemm` reach for rayon.
     //
     // Two pools would otherwise both be live inside a decode step -- this one for the f32
@@ -1208,6 +1229,32 @@ impl crate::Backend for crate::CpuDevice {
         dilation: usize,
         groups: usize,
     ) -> Result<()> {
+        // Stride-1 `f32` convolutions on the wasm SIMD target skip im2col, packing and the
+        // transpose: `simd128_conv::conv1d` reads the input in place.
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if groups == 1
+            && stride == 1
+            && padding == 0
+            && kernel_size > 0
+            && (out_length == 0 || (out_length - 1) + (kernel_size - 1) * dilation < length)
+        {
+            if let (Some(dst), Some(src), Some(w)) = (as_f32_mut(dst), as_f32(src), as_f32(kernel))
+            {
+                crate::simd128_conv::conv1d(
+                    dst,
+                    src,
+                    w,
+                    batch,
+                    in_channels,
+                    out_channels,
+                    length,
+                    out_length,
+                    kernel_size,
+                    dilation,
+                );
+                return Ok(());
+            }
+        }
         if USE_IM2COL_CONV1D && groups == 1 {
             // IM2COL approach: transform conv1d into matrix multiplication
             // 1. Im2Col: transform input [B, C, L] -> [B, L_out, C * K]
@@ -1398,6 +1445,42 @@ impl crate::Backend for crate::CpuDevice {
         // - output_padding == 0
         let can_use_col2im = groups == 1 && padding == 0 && output_padding == 0;
 
+        // On the wasm SIMD target the column matrix comes from a broadcast-lhs kernel that
+        // does no packing. The input is still transposed first: the kernel reads one value
+        // per channel per tile row, and down a `[C_in, L_in]` column that is a cache line
+        // per value.
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        if USE_COL2IM_CONV1D_TR && can_use_col2im {
+            if let (Some(dst), Some(src), Some(w)) = (as_f32_mut(dst), as_f32(src), as_f32(kernel))
+            {
+                let n = out_channels * kernel_size;
+                let mut col = vec![0f32; batch * length * n];
+                let mut src_t = vec![0f32; length * in_channels];
+                for b in 0..batch {
+                    let x = &src[b * in_channels * length..(b + 1) * in_channels * length];
+                    for c in 0..in_channels {
+                        for (l, v) in x[c * length..(c + 1) * length].iter().enumerate() {
+                            src_t[l * in_channels + c] = *v;
+                        }
+                    }
+                    let col_b = &mut col[b * length * n..(b + 1) * length * n];
+                    crate::simd128_conv::gemm_bcast_lhs(
+                        col_b,
+                        n,
+                        &src_t,
+                        in_channels,
+                        1,
+                        w,
+                        n,
+                        length,
+                        n,
+                        in_channels,
+                    );
+                }
+                col2im1d(dst, &col, batch, length, out_channels, kernel_size, stride);
+                return Ok(());
+            }
+        }
         if USE_COL2IM_CONV1D_TR && can_use_col2im {
             // COL2IM approach: matmul + col2im transformation
             // 1. Transpose input from [B, C_in, L_in] to [B, L_in, C_in]

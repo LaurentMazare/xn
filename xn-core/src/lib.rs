@@ -15,6 +15,8 @@ pub mod quantized;
 pub mod safetensors;
 pub mod shape;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub mod simd128_conv;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub mod simd128_math;
 pub mod streaming;
 pub mod tensor;
