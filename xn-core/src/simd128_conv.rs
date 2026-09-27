@@ -159,12 +159,15 @@ pub fn conv1d(
     assert!(w.len() >= co * ci * k);
     assert!(dst.len() >= batch * co * l_out);
     assert!(l_out == 0 || (l_out - 1) + (k - 1) * dilation < l_in);
-    // SAFETY: the shapes asserted above bound every access.
-    unsafe {
+    // Units of four output channels, handed out on demand so a fast core absorbs more of
+    // them than a slow one; each unit re-reads the shared input window, which is small.
+    let (d, s, w) = (dst.as_mut_ptr() as usize, src.as_ptr() as usize, w.as_ptr() as usize);
+    // SAFETY: the shapes asserted above bound every access, and units write disjoint channels.
+    let job = move |c_lo: usize, c_hi: usize| unsafe {
         conv1d_channels(
-            dst.as_mut_ptr(),
-            src.as_ptr(),
-            w.as_ptr(),
+            d as *mut f32,
+            s as *const f32,
+            w as *const f32,
             batch,
             ci,
             co,
@@ -172,10 +175,11 @@ pub fn conv1d(
             l_out,
             k,
             dilation,
-            0,
-            co,
+            c_lo,
+            c_hi,
         )
-    }
+    };
+    crate::threadpool::par_units_by(batch * co * l_out * ci * k, co, 4, job);
 }
 
 /// `R` rows by `4 * V` columns of a broadcast-lhs product.
@@ -293,22 +297,26 @@ pub fn gemm_bcast_lhs(
     if k > 0 {
         assert!(lhs.len() > (m - 1) * lhs_rs + (k - 1) * lhs_cs);
     }
-    // SAFETY: the bounds asserted above.
-    unsafe {
+    // Column blocks of sixteen are the unit: each owns disjoint output columns and
+    // streams its own slice of the right operand.
+    let (o, l, r) = (out.as_mut_ptr() as usize, lhs.as_ptr() as usize, rhs.as_ptr() as usize);
+    // SAFETY: the bounds asserted above, and units write disjoint columns.
+    let job = move |j_lo: usize, j_hi: usize| unsafe {
         bcast_cols(
-            out.as_mut_ptr(),
+            o as *mut f32,
             out_rs,
-            lhs.as_ptr(),
+            l as *const f32,
             lhs_rs,
             lhs_cs,
-            rhs.as_ptr(),
+            r as *const f32,
             rhs_rs,
             m,
             k,
-            0,
-            n,
+            j_lo,
+            j_hi,
         )
-    }
+    };
+    crate::threadpool::par_units_by(m * n * k, n, 16, job);
 }
 
 /// `R` lhs rows against `C` rhs rows, `k` deep; writes `out[r][0..C]`.
@@ -439,8 +447,24 @@ pub fn gemm_dot(
     assert!(out.len() >= (m - 1) * out_rs + n);
     assert!(lhs.len() >= (m - 1) * lhs_rs + k);
     assert!(rhs.len() >= (n - 1) * rhs_cs + k);
-    // SAFETY: the bounds asserted above.
-    unsafe {
-        dot_cols(out.as_mut_ptr(), out_rs, lhs.as_ptr(), lhs_rs, rhs.as_ptr(), rhs_cs, m, k, 0, n)
-    }
+    // Units of 32 output columns: each streams its own rows of the right operand (the
+    // weight) and writes disjoint columns, enough of them to balance a fast core against a
+    // slow one.
+    let (o, l, r) = (out.as_mut_ptr() as usize, lhs.as_ptr() as usize, rhs.as_ptr() as usize);
+    // SAFETY: the bounds asserted above, and units write disjoint columns.
+    let job = move |j_lo: usize, j_hi: usize| unsafe {
+        dot_cols(
+            o as *mut f32,
+            out_rs,
+            l as *const f32,
+            lhs_rs,
+            r as *const f32,
+            rhs_cs,
+            m,
+            k,
+            j_lo,
+            j_hi,
+        )
+    };
+    crate::threadpool::par_units_by(m * n * k, n, 32, job);
 }
