@@ -486,3 +486,118 @@ pub fn gemm_dot(
         crate::threadpool::par_units(units, |u| job(u * 32, ((u + 1) * 32).min(n)));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Run under wasmtime: `cargo test -p xn --lib --target wasm32-wasip1 -- simd128` with
+    //! `-C target-feature=+simd128`. Shapes are chosen to hit every tile and tail branch.
+    use super::*;
+
+    fn data(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{what}[{i}]: got {g}, want {w}");
+        }
+    }
+
+    #[test]
+    fn conv1d_matches_the_scalar_reference() {
+        for batch in [1, 2] {
+            for (ci, co) in [(1, 1), (3, 5), (5, 4), (2, 17)] {
+                for (k, dilation) in [(1, 1), (3, 1), (3, 2), (7, 1)] {
+                    for l_out in [1, 5, 16, 17, 33, 48] {
+                        let l_in = l_out + (k - 1) * dilation;
+                        let x = data(batch * ci * l_in, 1);
+                        let w = data(co * ci * k, 2);
+                        let mut got = vec![0f32; batch * co * l_out];
+                        conv1d(&mut got, &x, &w, batch, ci, co, l_in, l_out, k, dilation);
+                        let mut want = vec![0f32; batch * co * l_out];
+                        for b in 0..batch {
+                            for o in 0..co {
+                                for l in 0..l_out {
+                                    let mut acc = 0f32;
+                                    for c in 0..ci {
+                                        for t in 0..k {
+                                            acc += w[o * ci * k + c * k + t]
+                                                * x[b * ci * l_in + c * l_in + l + t * dilation];
+                                        }
+                                    }
+                                    want[b * co * l_out + o * l_out + l] = acc;
+                                }
+                            }
+                        }
+                        assert_close(
+                            &got,
+                            &want,
+                            &format!("conv {batch}x{ci}->{co} k{k} d{dilation} L{l_out}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_bcast_lhs_matches_the_scalar_reference() {
+        for (m, n, k) in
+            [(1, 1, 1), (1, 16, 3), (3, 5, 4), (4, 17, 5), (5, 33, 8), (7, 19, 17), (16, 48, 2)]
+        {
+            // Both layouts the backend hands over: row-major lhs, and a `[k, m]` lhs read
+            // down its columns, as a transposed convolution's input is.
+            for (lhs_rs, lhs_cs) in [(k, 1), (1, m)] {
+                let lhs = data(m * k, 3);
+                let rhs = data(k * n, 4);
+                let mut got = vec![0f32; m * n];
+                gemm_bcast_lhs(&mut got, n, &lhs, lhs_rs, lhs_cs, &rhs, n, m, n, k);
+                let mut want = vec![0f32; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f32;
+                        for kk in 0..k {
+                            acc += lhs[i * lhs_rs + kk * lhs_cs] * rhs[kk * n + j];
+                        }
+                        want[i * n + j] = acc;
+                    }
+                }
+                assert_close(&got, &want, &format!("bcast {m}x{n}x{k} strides {lhs_rs},{lhs_cs}"));
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_dot_matches_the_scalar_reference() {
+        for (m, n, k) in [
+            (1, 1, 1),
+            (1, 8, 4),
+            (1, 9, 5),
+            (3, 3, 3),
+            (4, 4, 4),
+            (5, 7, 6),
+            (4, 17, 33),
+            (16, 12, 7),
+            (9, 40, 16),
+        ] {
+            let lhs = data(m * k, 5);
+            let rhs = data(n * k, 6);
+            let mut got = vec![0f32; m * n];
+            gemm_dot(&mut got, n, &lhs, k, &rhs, k, m, n, k);
+            let mut want = vec![0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    want[i * n + j] = (0..k).map(|t| lhs[i * k + t] * rhs[j * k + t]).sum();
+                }
+            }
+            assert_close(&got, &want, &format!("dot {m}x{n}x{k}"));
+        }
+    }
+}

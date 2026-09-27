@@ -124,3 +124,87 @@ pub fn gelu_erf(dst: &mut [f32], src: &[f32]) {
     dst[..n].copy_from_slice(&src[..n]);
     gelu_erf_inplace(&mut dst[..n])
 }
+
+#[cfg(test)]
+mod tests {
+    //! Run under wasmtime: `cargo test -p xn --lib --target wasm32-wasip1 -- simd128` with
+    //! `-C target-feature=+simd128`.
+    use super::*;
+
+    /// Both tails of `exp`'s range, the clamp, signed zero, infinities, NaN, and lengths that
+    /// leave a padded tail.
+    fn sweep() -> Vec<f32> {
+        let mut v: Vec<f32> = (-2000..=2000).map(|i| i as f32 * 0.05).collect();
+        v.extend([
+            0.0,
+            -0.0,
+            1e-30,
+            -1e-30,
+            -87.0,
+            -87.5,
+            -90.0,
+            -200.0,
+            87.0,
+            88.0,
+            88.5,
+            100.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+        ]);
+        v
+    }
+
+    fn assert_close(got: f32, want: f32, tol: f32, what: &str) {
+        if want.is_nan() {
+            assert!(got.is_nan(), "{what}: expected NaN, got {got}");
+        } else if want.is_infinite() {
+            assert_eq!(got, want, "{what}");
+        } else {
+            let err = (got - want).abs();
+            assert!(err <= tol * want.abs().max(1.0), "{what}: got {got}, want {want}, err {err}");
+        }
+    }
+
+    #[test]
+    fn elu_matches_the_scalar_reference() {
+        let src = sweep();
+        for len in [src.len(), src.len() - 1, src.len() - 2, src.len() - 3, 1, 5] {
+            let src = &src[..len];
+            let mut dst = vec![0f32; len];
+            elu(&mut dst, src, 1.0);
+            let mut inplace = src.to_vec();
+            elu_inplace(&mut inplace, 1.0);
+            for (i, &x) in src.iter().enumerate() {
+                let want = if x > 0.0 { x } else { x.exp() - 1.0 };
+                assert_close(dst[i], want, 2e-6, &format!("elu({x})"));
+                assert_eq!(dst[i].to_bits(), inplace[i].to_bits(), "in place differs at {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn gelu_matches_the_scalar_reference() {
+        let src = sweep();
+        for len in [src.len(), src.len() - 3, 3] {
+            let src = &src[..len];
+            let mut dst = vec![0f32; len];
+            gelu_erf(&mut dst, src);
+            for (i, &x) in src.iter().enumerate() {
+                let want = x * 0.5 * (1.0 + libm::erff(x * core::f32::consts::FRAC_1_SQRT_2));
+                assert_close(dst[i], want, 4e-7, &format!("gelu({x})"));
+            }
+        }
+    }
+
+    #[test]
+    fn exp_saturates_instead_of_overflowing() {
+        for x in [88.0f32, 88.5, 100.0, 1e6, f32::INFINITY] {
+            let y = f32x4_extract_lane::<0>(exp_f32x4(f32x4_splat(x)));
+            assert!(y.is_finite(), "exp({x}) = {y}");
+        }
+        let floor = f32x4_extract_lane::<0>(exp_f32x4(f32x4_splat(f32::NEG_INFINITY)));
+        assert!(floor >= 0.0 && floor <= 2.0 * f32::MIN_POSITIVE, "exp(-inf) = {floor}");
+    }
+}
