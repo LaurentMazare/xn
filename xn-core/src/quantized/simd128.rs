@@ -129,6 +129,61 @@ fn hsum_f32x4(v: v128) -> f32 {
         + f32x4_extract_lane::<3>(v)
 }
 
+/// A `BlockQ8_0`'s 32 i8s as two raw `i8x16` vectors, for the 8-bit dot product.
+#[inline(always)]
+unsafe fn load_block_i8(qs: *const i8) -> [v128; 2] {
+    unsafe { [v128_load(qs as *const v128), v128_load(qs.add(16) as *const v128)] }
+}
+
+/// `f16` bits to `f32` without branches: `half::f16::to_f32` is a branchy software routine
+/// on wasm and ran once per block per output. Exact for every finite `f16`, subnormals
+/// included; infinity and NaN, which no block scale is, come out finite (about 1e5).
+#[inline(always)]
+fn f16_to_f32_fast(h: f16) -> f32 {
+    let bits = h.to_bits() as u32;
+    let magnitude = f32::from_bits((bits & 0x7fff) << 13) * f32::from_bits(0x7780_0000);
+    f32::from_bits(magnitude.to_bits() | ((bits & 0x8000) << 16))
+}
+
+/// Whether `i32x4.relaxed_dot_i8x16_i7x16_add_s` multiplies both operands as signed bytes.
+/// The instruction leaves that implementation-defined: ARM engines lower it to `sdot`, which
+/// is what a `q8_0 . q8_0` product needs; x86 engines read the second operand as unsigned.
+/// One probe at first use tells them apart.
+#[cfg(target_feature = "relaxed-simd")]
+fn dot8_is_signed() -> bool {
+    static SIGNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SIGNED.get_or_init(|| {
+        // -128 on both sides also catches an engine whose i16 pairwise intermediate
+        // saturates or wraps: (-128)(-128) + (-128)(-128) = 32768 does not fit in i16.
+        let a = i8x16_splat(-128);
+        let b = i8x16_splat(-128);
+        let r = i32x4_relaxed_dot_i8x16_i7x16_add(a, b, i32x4_splat(0));
+        // Exact signed: 4 * 16384. Unsigned-by-signed: 4 * 128 * -128. Saturating i16: 65534.
+        i32x4_extract_lane::<0>(r) == 65536
+    })
+}
+
+#[cfg(not(target_feature = "relaxed-simd"))]
+fn dot8_is_signed() -> bool {
+    false
+}
+
+/// `acc + a . b` over 16 signed bytes into four i32 lanes. Only called when
+/// [`dot8_is_signed`] holds, which cannot be without relaxed SIMD: the two `cfg`s below
+/// mirror the two on that probe.
+#[inline(always)]
+fn dot8_add(a: v128, b: v128, acc: v128) -> v128 {
+    #[cfg(target_feature = "relaxed-simd")]
+    {
+        i32x4_relaxed_dot_i8x16_i7x16_add(a, b, acc)
+    }
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    {
+        let _ = (a, b, acc);
+        unreachable!("8-bit dot path without relaxed SIMD")
+    }
+}
+
 // Quantized matrix multiplication, mirroring `tinyBLAS_Q0_AVX` /
 // `tinyBLAS_Q0_ARM` from llama.cpp/ggml/src/ggml-cpu/llamafile/sgemm.cpp.
 // Both lhs and rhs are `BlockQ8_0`; the result is float. `lda`/`ldb` are
@@ -233,11 +288,16 @@ struct TinyBlasQ0Simd128 {
 impl TinyBlasQ0Simd128 {
     #[inline]
     unsafe fn matmul(&self, m: usize, n: usize) {
-        self.mnpack(0, m, 0, n)
+        if dot8_is_signed() {
+            unsafe { self.mnpack::<true>(0, m, 0, n) }
+        } else {
+            unsafe { self.mnpack::<false>(0, m, 0, n) }
+        }
     }
 
+    /// `DOT8` selects the 8-bit `sdot` inner product; see [`dot8_is_signed`].
     #[inline(never)]
-    unsafe fn mnpack(&self, m0: usize, m: usize, n0: usize, n: usize) {
+    unsafe fn mnpack<const DOT8: bool>(&self, m0: usize, m: usize, n0: usize, n: usize) {
         let mr = (m - m0).min(4);
         let nr = (n - n0).min(4);
         // 16-register dispatch borrowed from the AVX port: 4×N tiles
@@ -245,63 +305,63 @@ impl TinyBlasQ0Simd128 {
         // the same 16 XMM register budget.
         let (mc, nc) = match (mr << 4) | nr {
             0x42..=0x44 => {
-                self.gemm::<4, 2>(m0, m, n0, n);
+                self.gemm::<4, 2, DOT8>(m0, m, n0, n);
                 (4, 2)
             }
             0x34 | 0x24 => {
-                self.gemm::<2, 4>(m0, m, n0, n);
+                self.gemm::<2, 4, DOT8>(m0, m, n0, n);
                 (2, 4)
             }
             0x33 | 0x32 => {
-                self.gemm::<3, 2>(m0, m, n0, n);
+                self.gemm::<3, 2, DOT8>(m0, m, n0, n);
                 (3, 2)
             }
             0x23 => {
-                self.gemm::<2, 3>(m0, m, n0, n);
+                self.gemm::<2, 3, DOT8>(m0, m, n0, n);
                 (2, 3)
             }
             0x41 => {
-                self.gemm::<4, 1>(m0, m, n0, n);
+                self.gemm::<4, 1, DOT8>(m0, m, n0, n);
                 (4, 1)
             }
             0x22 => {
-                self.gemm::<2, 2>(m0, m, n0, n);
+                self.gemm::<2, 2, DOT8>(m0, m, n0, n);
                 (2, 2)
             }
             0x14 => {
-                self.gemm::<1, 4>(m0, m, n0, n);
+                self.gemm::<1, 4, DOT8>(m0, m, n0, n);
                 (1, 4)
             }
             0x31 => {
-                self.gemm::<3, 1>(m0, m, n0, n);
+                self.gemm::<3, 1, DOT8>(m0, m, n0, n);
                 (3, 1)
             }
             0x13 => {
-                self.gemm::<1, 3>(m0, m, n0, n);
+                self.gemm::<1, 3, DOT8>(m0, m, n0, n);
                 (1, 3)
             }
             0x21 => {
-                self.gemm::<2, 1>(m0, m, n0, n);
+                self.gemm::<2, 1, DOT8>(m0, m, n0, n);
                 (2, 1)
             }
             0x12 => {
-                self.gemm::<1, 2>(m0, m, n0, n);
+                self.gemm::<1, 2, DOT8>(m0, m, n0, n);
                 (1, 2)
             }
             0x11 => {
-                self.gemm::<1, 1>(m0, m, n0, n);
+                self.gemm::<1, 1, DOT8>(m0, m, n0, n);
                 (1, 1)
             }
             _ => return,
         };
         let mp = m0 + (m - m0) / mc * mc;
         let np = n0 + (n - n0) / nc * nc;
-        self.mnpack(mp, m, n0, np);
-        self.mnpack(m0, m, np, n);
+        unsafe { self.mnpack::<DOT8>(mp, m, n0, np) };
+        unsafe { self.mnpack::<DOT8>(m0, m, np, n) };
     }
 
     #[inline(never)]
-    unsafe fn gemm<const RM: usize, const RN: usize>(
+    unsafe fn gemm<const RM: usize, const RN: usize, const DOT8: bool>(
         &self,
         m0: usize,
         m: usize,
@@ -331,26 +391,52 @@ impl TinyBlasQ0Simd128 {
             // to repeating four `i16x8_load_extend_i8x8` per (l, j, i).
             // f16::to_f32 is software on wasm (no f16c), so the saving
             // matters even though it's only a few scalar ops per call.
-            for l in 0..self.k {
-                let mut avs = [[f32x4_splat(0.0); 4]; RM];
-                let mut a_ds = [0f32; RM];
-                for i in 0..RM {
-                    let a = &*self.a.add(self.lda * (ii + i) + l);
-                    avs[i] = load_block_q8_0(a.qs.as_ptr());
-                    a_ds[i] = f16::to_f32(a.d);
-                }
-                for j in 0..RN {
-                    let b = &*self.b.add(self.ldb * (jj + j) + l);
-                    let bv = load_block_q8_0(b.qs.as_ptr());
-                    let b_d = f16::to_f32(b.d);
+            if DOT8 {
+                // Two 16-byte loads and two `sdot`s per block pair, against eight
+                // load-extends, four 16-bit dots and three adds on the other path.
+                let zero = i32x4_splat(0);
+                for l in 0..self.k {
+                    let mut avs = [[zero; 2]; RM];
+                    let mut a_ds = [0f32; RM];
                     for i in 0..RM {
-                        let av = avs[i];
-                        let mut s = i32x4_dot_i16x8(av[0], bv[0]);
-                        s = i32x4_add(s, i32x4_dot_i16x8(av[1], bv[1]));
-                        s = i32x4_add(s, i32x4_dot_i16x8(av[2], bv[2]));
-                        s = i32x4_add(s, i32x4_dot_i16x8(av[3], bv[3]));
-                        let scale = f32x4_splat(a_ds[i] * b_d);
-                        cv[j][i] = f32x4_madd(f32x4_convert_i32x4(s), scale, cv[j][i]);
+                        let a = &*self.a.add(self.lda * (ii + i) + l);
+                        avs[i] = load_block_i8(a.qs.as_ptr());
+                        a_ds[i] = f16_to_f32_fast(a.d);
+                    }
+                    for j in 0..RN {
+                        let b = &*self.b.add(self.ldb * (jj + j) + l);
+                        let bv = load_block_i8(b.qs.as_ptr());
+                        let b_d = f16_to_f32_fast(b.d);
+                        for i in 0..RM {
+                            let s = dot8_add(avs[i][0], bv[0], zero);
+                            let s = dot8_add(avs[i][1], bv[1], s);
+                            let scale = f32x4_splat(a_ds[i] * b_d);
+                            cv[j][i] = f32x4_madd(f32x4_convert_i32x4(s), scale, cv[j][i]);
+                        }
+                    }
+                }
+            } else {
+                for l in 0..self.k {
+                    let mut avs = [[f32x4_splat(0.0); 4]; RM];
+                    let mut a_ds = [0f32; RM];
+                    for i in 0..RM {
+                        let a = &*self.a.add(self.lda * (ii + i) + l);
+                        avs[i] = load_block_q8_0(a.qs.as_ptr());
+                        a_ds[i] = f16_to_f32_fast(a.d);
+                    }
+                    for j in 0..RN {
+                        let b = &*self.b.add(self.ldb * (jj + j) + l);
+                        let bv = load_block_q8_0(b.qs.as_ptr());
+                        let b_d = f16_to_f32_fast(b.d);
+                        for i in 0..RM {
+                            let av = avs[i];
+                            let mut s = i32x4_dot_i16x8(av[0], bv[0]);
+                            s = i32x4_add(s, i32x4_dot_i16x8(av[1], bv[1]));
+                            s = i32x4_add(s, i32x4_dot_i16x8(av[2], bv[2]));
+                            s = i32x4_add(s, i32x4_dot_i16x8(av[3], bv[3]));
+                            let scale = f32x4_splat(a_ds[i] * b_d);
+                            cv[j][i] = f32x4_madd(f32x4_convert_i32x4(s), scale, cv[j][i]);
+                        }
                     }
                 }
             }
@@ -658,5 +744,92 @@ pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> Res
             + f32x4_extract_lane::<2>(acc)
             + f32x4_extract_lane::<3>(acc);
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Run under wasmtime: `cargo test -p xn --lib --target wasm32-wasip1 -- simd128` with
+    //! `-C target-feature=+simd128,+relaxed-simd`.
+    use super::*;
+
+    #[test]
+    fn f16_to_f32_fast_matches_half_for_every_finite_value() {
+        for bits in 0u16..=u16::MAX {
+            let h = f16::from_bits(bits);
+            if h.is_finite() {
+                assert_eq!(f16_to_f32_fast(h).to_bits(), h.to_f32().to_bits(), "{bits:#06x}");
+            }
+        }
+    }
+
+    /// Blocks with every value the format can hold, `-128` included, which a third-party
+    /// quantizer may emit even though xn's own never does.
+    fn blocks(n: usize, k: usize, seed: u32) -> Vec<BlockQ8_0> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) as u8 as i8
+        };
+        (0..n * k / QK8_0)
+            .map(|i| {
+                let mut qs = [0i8; QK8_0];
+                for (j, q) in qs.iter_mut().enumerate() {
+                    *q = if (i + j) % 37 == 0 { -128 } else { next() };
+                }
+                BlockQ8_0 { d: f16::from_f32(0.01 + (i % 7) as f32 * 0.003), qs }
+            })
+            .collect()
+    }
+
+    fn reference(a: &[BlockQ8_0], b: &[BlockQ8_0], m: usize, n: usize, kb: usize) -> Vec<f32> {
+        let mut c = vec![0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for l in 0..kb {
+                    let (x, y) = (&a[i * kb + l], &b[j * kb + l]);
+                    let dot: i32 =
+                        x.qs.iter().zip(y.qs.iter()).map(|(p, q)| *p as i32 * *q as i32).sum();
+                    acc += dot as f64 * (x.d.to_f32() as f64) * (y.d.to_f32() as f64);
+                }
+                c[j * m + i] = acc as f32;
+            }
+        }
+        c
+    }
+
+    #[test]
+    fn both_dot_paths_match_the_reference_with_minus_128() {
+        for (m, n, k) in [(1, 8, 64), (4, 4, 32), (5, 7, 96), (16, 12, 128)] {
+            let kb = k / QK8_0;
+            let a = blocks(m, k, 1);
+            let b = blocks(n, k, 2);
+            let want = reference(&a, &b, m, n, kb);
+            let mut got16 = vec![0f32; m * n];
+            let blas = TinyBlasQ0Simd128 {
+                k: kb,
+                a: a.as_ptr(),
+                lda: kb,
+                b: b.as_ptr(),
+                ldb: kb,
+                c: got16.as_mut_ptr(),
+                ldc: m,
+                ith: 0,
+                nth: 1,
+            };
+            unsafe { blas.mnpack::<false>(0, m, 0, n) };
+            for (g, w) in got16.iter().zip(want.iter()) {
+                assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "16-bit: got {g}, want {w}");
+            }
+            if dot8_is_signed() {
+                let mut got8 = vec![0f32; m * n];
+                let blas = TinyBlasQ0Simd128 { c: got8.as_mut_ptr(), ..blas };
+                unsafe { blas.mnpack::<true>(0, m, 0, n) };
+                for (g, w) in got8.iter().zip(want.iter()) {
+                    assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "8-bit: got {g}, want {w}");
+                }
+            }
+        }
     }
 }
