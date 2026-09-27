@@ -35,6 +35,10 @@ use std::sync::{Condvar, Mutex, OnceLock};
 const DEFAULT_SPIN_BUDGET: u32 = 5_000;
 
 fn spin_budget() -> u32 {
+    let forced = SPIN_BUDGET_OVERRIDE.load(Ordering::Relaxed);
+    if forced > 0 {
+        return forced;
+    }
     static B: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *B.get_or_init(|| {
         std::env::var("XN_SPIN_BUDGET")
@@ -42,6 +46,15 @@ fn spin_budget() -> u32 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_SPIN_BUDGET)
     })
+}
+
+/// Set by [`set_spin_budget`]; `0` means the environment or the default decides.
+static SPIN_BUDGET_OVERRIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Iterations a worker spins before parking, overriding `XN_SPIN_BUDGET` and the default:
+/// a browser has no environment to read, and needs a budget long enough to bridge a frame.
+pub fn set_spin_budget(iterations: u32) {
+    SPIN_BUDGET_OVERRIDE.store(iterations, Ordering::Relaxed);
 }
 
 type Job = dyn Fn(usize, usize) + Sync;
@@ -98,19 +111,24 @@ thread_local! {
 
 static POOL: OnceLock<Pool> = OnceLock::new();
 
+fn new_shared() -> &'static Shared {
+    Box::leak(Box::new(Shared {
+        seq: AtomicU64::new(0),
+        job: std::cell::UnsafeCell::new(None),
+        done: AtomicUsize::new(0),
+        panicked: AtomicBool::new(false),
+        quit: AtomicBool::new(false),
+        lock: Mutex::new(()),
+        wake: Condvar::new(),
+    }))
+}
+
 /// Unreachable where `enabled()` is false, but `size` and `dispatch` still name it.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let size = crate::get_num_threads().max(1);
-        let shared: &'static Shared = Box::leak(Box::new(Shared {
-            seq: AtomicU64::new(0),
-            job: std::cell::UnsafeCell::new(None),
-            done: AtomicUsize::new(0),
-            panicked: AtomicBool::new(false),
-            quit: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
-        }));
+        let shared = new_shared();
         for ith in 1..size {
             std::thread::Builder::new()
                 .name(format!("xn-worker-{ith}"))
@@ -121,6 +139,54 @@ fn pool() -> &'static Pool {
     })
 }
 
+/// The browser pool exists only once [`start_browser_pool`] has built it, and `enabled()`
+/// is false until then, so nothing reaches here first.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn pool() -> &'static Pool {
+    POOL.get().expect("the browser pool is started before it is used")
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+static BROWSER_POOL: AtomicBool = AtomicBool::new(false);
+
+/// Browser only: run this pool's workers on `workers` of rayon's threads, permanently.
+///
+/// A browser build cannot spawn `std::thread`s, but the page can give rayon a pool of Web
+/// Workers. Rayon's own fork/join parks idle workers at once, and waking one costs about a
+/// millisecond on a phone, so per-operator fan-out through it ran 2-3x slower than one
+/// thread. Each worker here is a `rayon::spawn`ed task that never returns and spins between
+/// operators, so a dispatch costs microseconds. Give rayon exactly `workers` threads (the
+/// count is clamped to that) and route nothing else through rayon afterwards, or that work
+/// waits forever. The caller is participant 0 and must be a Web Worker, since a dispatch can
+/// block on a mutex the main thread may not wait on. Returns the pool's width, `workers + 1`;
+/// a second call is a no-op returning it.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn start_browser_pool(workers: usize) -> usize {
+    let pool = POOL.get_or_init(|| {
+        // A worker rayon cannot schedule would never acknowledge a job, and the first
+        // dispatch would wait for it forever.
+        let workers = workers.min(rayon::current_num_threads());
+        let size = workers + 1;
+        let shared = new_shared();
+        for ith in 1..size {
+            rayon::spawn(move || worker(shared, ith, size));
+        }
+        // A dispatch now costs microseconds, so far smaller operators are worth splitting
+        // than when a fan-out meant waking a Web Worker. A threshold the page set stands.
+        if !BROWSER_MIN_PARALLEL_WORK_SET.load(Ordering::Relaxed) {
+            BROWSER_MIN_PARALLEL_WORK.store(256 << 10, Ordering::Relaxed);
+        }
+        if SPIN_BUDGET_OVERRIDE.load(Ordering::Relaxed) == 0 {
+            // Roughly a few milliseconds of spinning: longer than any gap inside a frame,
+            // shorter than the silence between utterances.
+            SPIN_BUDGET_OVERRIDE.store(4_000_000, Ordering::Relaxed);
+        }
+        BROWSER_POOL.store(true, Ordering::Release);
+        Pool { shared, size, publish: AtomicBool::new(false) }
+    });
+    pool.size
+}
+
 /// `nth` is fixed for the lifetime of the pool, so a worker never has to read it.
 fn worker(shared: &'static Shared, ith: usize, nth: usize) {
     let mut last = 0u64;
@@ -129,8 +195,9 @@ fn worker(shared: &'static Shared, ith: usize, nth: usize) {
         // a few microseconds, and catching it here is what keeps dispatch cheap.
         let mut seq = shared.seq.load(Ordering::Acquire);
         let mut spins = 0u32;
+        let budget = spin_budget();
         while seq == last && !shared.quit.load(Ordering::Relaxed) {
-            if spins < spin_budget() {
+            if spins < budget {
                 spins += 1;
                 std::hint::spin_loop();
             } else {
@@ -181,7 +248,56 @@ fn enabled() -> bool {
 /// Emscripten can spawn, so they keep it.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn enabled() -> bool {
-    false
+    BROWSER_POOL.load(Ordering::Acquire)
+}
+
+/// Browser only: the smallest operator, in multiply-adds (or elements), that [`threads_for`]
+/// and [`dispatch_work`] fan out. Before [`start_browser_pool`] nothing fans out (a rayon
+/// fork/join on Web Workers costs about a millisecond on a phone, more than most operators
+/// take); after it, the generic helpers use the pool for any size, as natively, and this
+/// gates only the callers that name their size. `0` fans out everything at rayon's width.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+static BROWSER_MIN_PARALLEL_WORK: AtomicUsize = AtomicUsize::new(4 << 20);
+/// Whether the page chose the threshold, so [`start_browser_pool`] leaves it alone.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+static BROWSER_MIN_PARALLEL_WORK_SET: AtomicBool = AtomicBool::new(false);
+
+/// See [`threads_for`]. Browser only; a no-op elsewhere.
+pub fn set_browser_min_parallel_work(work: usize) {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        BROWSER_MIN_PARALLEL_WORK.store(work, Ordering::Relaxed);
+        BROWSER_MIN_PARALLEL_WORK_SET.store(true, Ordering::Relaxed);
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let _ = work;
+}
+
+/// Threads worth putting on an operator of `work` multiply-adds (or elements).
+///
+/// Native: [`size`], the pool's width. Browser: the pool's width once
+/// [`start_browser_pool`] has run and `work` reaches [`set_browser_min_parallel_work`]'s
+/// threshold; 1 otherwise, unless the threshold is 0, which fans out at rayon's width.
+pub fn threads_for(work: usize) -> usize {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let min = BROWSER_MIN_PARALLEL_WORK.load(Ordering::Relaxed);
+        if work < min {
+            return 1;
+        }
+        if enabled() {
+            return pool().size;
+        }
+        if min == 0 {
+            return rayon::current_num_threads().max(1);
+        }
+        1
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        let _ = work;
+        size()
+    }
 }
 
 /// Holds the right to drive the pool, releasing it even if the dispatch unwinds.
@@ -214,9 +330,40 @@ impl Drop for PublishGuard {
 /// rayon's width, read afresh.
 pub fn size() -> usize {
     if !enabled() {
+        // In a browser the generic helpers built on this (`par_units`, `par_chunks_*`,
+        // `use_parallelism`, the gemm stripes) serve operators too small to amortize a
+        // Web Worker fork/join, so they see one thread unless the threshold is off.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if BROWSER_MIN_PARALLEL_WORK.load(Ordering::Relaxed) > 0 {
+            return 1;
+        }
         return rayon::current_num_threads().max(1);
     }
     pool().size
+}
+
+/// [`dispatch`] for an operator of `work` multiply-adds: in a browser it fans out only when
+/// [`threads_for`] says the operator is large enough, native is unchanged.
+pub fn dispatch_work<F: Fn(usize, usize) + Sync>(work: usize, f: F) {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let nth = threads_for(work);
+        if nth <= 1 {
+            f(0, 1);
+            return;
+        }
+        if enabled() {
+            dispatch(f);
+            return;
+        }
+        use rayon::prelude::*;
+        (0..nth).into_par_iter().for_each(|ith| f(ith, nth));
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        let _ = work;
+        dispatch(f)
+    }
 }
 
 /// Run `f(ith, nth)` on every participant and return once all of them have finished.
@@ -231,8 +378,10 @@ pub fn size() -> usize {
 pub fn dispatch<F: Fn(usize, usize) + Sync>(f: F) {
     if !enabled() {
         // Fan out through rayon, the way this used to work. A nested dispatch fans out
-        // again here rather than collapsing to `(0, 1)`; rayon copes.
-        let nth = rayon::current_num_threads().max(1);
+        // again here rather than collapsing to `(0, 1)`; rayon copes. In a browser the
+        // width is `size()`, i.e. 1 while the work threshold is on: callers that know
+        // their operator's size go through `dispatch_work`.
+        let nth = size();
         use rayon::prelude::*;
         (0..nth).into_par_iter().for_each(|ith| f(ith, nth));
         return;

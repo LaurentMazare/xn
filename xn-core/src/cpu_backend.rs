@@ -1,7 +1,6 @@
 use crate::error::Context;
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
 use half::{bf16, f16};
-use rayon::prelude::*;
 use std::any::Any;
 
 const USE_IM2COL_CONV1D: bool = true;
@@ -29,7 +28,7 @@ fn copy_strided_2d<T: WithDType>(
     };
     let dst = &mut dst[..d0 * d1];
     if use_parallelism(d0 * d1) {
-        dst.par_chunks_mut(d1).with_min_len(4).enumerate().for_each(|(i0, dst)| copy_row(i0, dst));
+        crate::threadpool::par_chunks_mut(dst, d1, |i0, dst| copy_row(i0, dst));
     } else {
         dst.chunks_mut(d1).enumerate().for_each(|(i0, dst)| copy_row(i0, dst));
     }
@@ -55,7 +54,7 @@ fn copy_strided_3d<T: WithDType>(
     };
     let dst = &mut dst[..d0 * d1 * d2];
     if use_parallelism(d0 * d1 * d2) {
-        dst.par_chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| copy_block(i0, dst));
+        crate::threadpool::par_chunks_mut(dst, d1 * d2, |i0, dst| copy_block(i0, dst));
     } else {
         dst.chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| copy_block(i0, dst));
     }
@@ -464,9 +463,9 @@ impl crate::Backend for crate::CpuDevice {
                     }
                 };
                 if parallel {
-                    dst.par_chunks_mut(d2 * d_j * d1)
-                        .enumerate()
-                        .for_each(|(i, dst)| transpose_block(i, dst));
+                    crate::threadpool::par_chunks_mut(dst, d2 * d_j * d1, |i, dst| {
+                        transpose_block(i, dst)
+                    });
                 } else {
                     dst.chunks_mut(d2 * d_j * d1)
                         .enumerate()
@@ -487,9 +486,9 @@ impl crate::Backend for crate::CpuDevice {
                     }
                 };
                 if parallel {
-                    dst.par_chunks_mut(d2 * d_j * d1 * d_k)
-                        .enumerate()
-                        .for_each(|(i, dst)| transpose_block(i, dst));
+                    crate::threadpool::par_chunks_mut(dst, d2 * d_j * d1 * d_k, |i, dst| {
+                        transpose_block(i, dst)
+                    });
                 } else {
                     dst.chunks_mut(d2 * d_j * d1 * d_k)
                         .enumerate()
@@ -508,10 +507,13 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].copy_from_slice(&src[..l]);
         } else {
-            dst[..l]
-                .par_chunks_mut(ELEMWISE_CHUNK)
-                .zip(src[..l].par_chunks(ELEMWISE_CHUNK))
-                .for_each(|(d, s)| d.copy_from_slice(s));
+            crate::threadpool::par_chunks_zip(
+                &mut dst[..l],
+                ELEMWISE_CHUNK,
+                &src[..l],
+                ELEMWISE_CHUNK,
+                |_, d, s| d.copy_from_slice(s),
+            );
         }
         Ok(())
     }
@@ -583,7 +585,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+            crate::threadpool::par_chunks_mut(&mut dst[..len], ELEMWISE_CHUNK, |_, d| fill(d));
         } else {
             fill(&mut dst[..len]);
         }
@@ -604,7 +606,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+            crate::threadpool::par_chunks_mut(&mut dst[..len], ELEMWISE_CHUNK, |_, d| fill(d));
         } else {
             fill(&mut dst[..len]);
         }
@@ -615,7 +617,7 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].fill(v);
         } else {
-            dst[..l].par_chunks_mut(ELEMWISE_CHUNK).for_each(|d| d.fill(v));
+            crate::threadpool::par_chunks_mut(&mut dst[..l], ELEMWISE_CHUNK, |_, d| d.fill(v));
         }
         Ok(())
     }
@@ -640,25 +642,23 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_t in 0..t {
-                    for i_d in 0..d / 2 {
-                        let i1 = i_t * d + i_d;
-                        let i2 = i1 + d / 2;
-                        let i_cs = i_t * (d / 2) + i_d;
-                        let i_cs = if unbatched_rope {
-                            let b_i = bh_i / h;
-                            i_cs + b_i * t * d / 2
-                        } else {
-                            i_cs
-                        };
-                        dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
-                        dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
-                    }
+        crate::threadpool::par_chunks_zip(dst, t * d, src, t * d, |bh_i, dst, src| {
+            for i_t in 0..t {
+                for i_d in 0..d / 2 {
+                    let i1 = i_t * d + i_d;
+                    let i2 = i1 + d / 2;
+                    let i_cs = i_t * (d / 2) + i_d;
+                    let i_cs = if unbatched_rope {
+                        let b_i = bh_i / h;
+                        i_cs + b_i * t * d / 2
+                    } else {
+                        i_cs
+                    };
+                    dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                    dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
                 }
-            },
-        );
+            }
+        });
         Ok(())
     }
 
@@ -682,21 +682,19 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_over_2 in 0..t * d / 2 {
-                    let i = 2 * i_over_2;
-                    let rope_i = if unbatched_rope {
-                        let b_i = bh_i / h;
-                        i_over_2 + b_i * t * d / 2
-                    } else {
-                        i_over_2
-                    };
-                    dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
-                    dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
-                }
-            },
-        );
+        crate::threadpool::par_chunks_zip(dst, t * d, src, t * d, |bh_i, dst, src| {
+            for i_over_2 in 0..t * d / 2 {
+                let i = 2 * i_over_2;
+                let rope_i = if unbatched_rope {
+                    let b_i = bh_i / h;
+                    i_over_2 + b_i * t * d / 2
+                } else {
+                    i_over_2
+                };
+                dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
+                dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+            }
+        });
         Ok(())
     }
 
@@ -914,19 +912,19 @@ impl crate::Backend for crate::CpuDevice {
             }
         // The width that will actually run it; `get_num_threads` is 1 off the pool.
         } else if n_outer >= crate::threadpool::size() {
-            dst[..total]
-                .par_chunks_mut(d_a * d_b)
-                .enumerate()
-                .for_each(|(o, dst)| tiled_2d_gather(dst, outer_offset(o)));
+            crate::threadpool::par_chunks_mut(&mut dst[..total], d_a * d_b, |o, dst| {
+                tiled_2d_gather(dst, outer_offset(o))
+            });
         } else {
             // Few outer blocks (e.g. a plain 2d transpose): parallelize over row tiles
             // within each block instead.
             for o in 0..n_outer {
                 let off = outer_offset(o);
-                dst[o * d_a * d_b..(o + 1) * d_a * d_b]
-                    .par_chunks_mut(TILE * d_b)
-                    .enumerate()
-                    .for_each(|(a_t, dst)| tiled_2d_gather(dst, off + a_t * TILE * s_a));
+                crate::threadpool::par_chunks_mut(
+                    &mut dst[o * d_a * d_b..(o + 1) * d_a * d_b],
+                    TILE * d_b,
+                    |a_t, dst| tiled_2d_gather(dst, off + a_t * TILE * s_a),
+                );
             }
         }
         Ok(())
@@ -1576,10 +1574,11 @@ fn reduce_combine<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size];
         if parallel {
-            dst.par_iter_mut()
-                .with_min_len(4)
-                .enumerate()
-                .for_each(|(outer, dst)| reduce_row(outer, dst));
+            crate::threadpool::par_chunks_mut(dst, 4, |c, piece| {
+                for (j, d) in piece.iter_mut().enumerate() {
+                    reduce_row(c * 4 + j, d);
+                }
+            });
         } else {
             dst.iter_mut().enumerate().for_each(|(outer, dst)| reduce_row(outer, dst));
         }
@@ -1596,9 +1595,9 @@ fn reduce_combine<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size * inner_size];
         if parallel {
-            dst.par_chunks_mut(inner_size)
-                .enumerate()
-                .for_each(|(outer, dst)| reduce_block(outer, dst));
+            crate::threadpool::par_chunks_mut(dst, inner_size, |outer, dst| {
+                reduce_block(outer, dst)
+            });
         } else {
             dst.chunks_mut(inner_size)
                 .enumerate()
@@ -1638,10 +1637,11 @@ fn reduce_arg<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size];
         if parallel {
-            dst.par_iter_mut()
-                .with_min_len(4)
-                .enumerate()
-                .for_each(|(outer, dst)| arg_row(outer, dst));
+            crate::threadpool::par_chunks_mut(dst, 4, |c, piece| {
+                for (j, d) in piece.iter_mut().enumerate() {
+                    arg_row(c * 4 + j, d);
+                }
+            });
         } else {
             dst.iter_mut().enumerate().for_each(|(outer, dst)| arg_row(outer, dst));
         }
@@ -1662,9 +1662,7 @@ fn reduce_arg<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size * inner_size];
         if parallel {
-            dst.par_chunks_mut(inner_size)
-                .enumerate()
-                .for_each(|(outer, dst)| arg_block(outer, dst));
+            crate::threadpool::par_chunks_mut(dst, inner_size, |outer, dst| arg_block(outer, dst));
         } else {
             dst.chunks_mut(inner_size).enumerate().for_each(|(outer, dst)| arg_block(outer, dst));
         }
@@ -1882,7 +1880,7 @@ fn conv1d_direct<T: WithDTypeF>(
     // Process each kernel offset
     for k_offset in 0..kernel_size {
         // Parallelize over output channels
-        (0..out_channels).into_par_iter().for_each(|out_c| {
+        crate::threadpool::par_units(out_channels, |out_c| {
             let g = out_c / (out_channels / groups);
             let in_c_start = g * in_c_per_group;
 
