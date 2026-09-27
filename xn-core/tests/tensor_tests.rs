@@ -1257,7 +1257,8 @@ fn test_sdpa_decode_rejects_bad_shapes_cpu() -> Result<()> {
 #[test]
 fn test_sdpa_decode_per_row_mask_cpu() -> Result<()> {
     let dev = &xn::CPU;
-    let (b, h, d, kv) = (3usize, 4usize, 16usize, 9usize);
+    // b == h, so the mask has the shape a per-head mask would; it must still land per row.
+    let (b, h, d, kv) = (4usize, 4usize, 16usize, 9usize);
     let mut seed = 0x9e37_79b9u32;
     let mut rnd = || {
         seed ^= seed << 13;
@@ -1273,7 +1274,7 @@ fn test_sdpa_decode_per_row_mask_cpu() -> Result<()> {
         Tensor::from_vec((0..b * kv * h * d).map(|_| rnd()).collect(), (b, kv, h, d), dev)?;
     let scale = 1.0 / (d as f32).sqrt();
     // Row r hides its first `pads[r]` positions, as left padding to a common length would.
-    let pads = [0usize, 4, 7];
+    let pads = [0usize, 4, 7, 2];
     let row_mask = |p: usize| -> Vec<f32> {
         (0..kv).map(|j| if j < p { f32::NEG_INFINITY } else { 0.0 }).collect()
     };
@@ -1366,11 +1367,21 @@ fn test_sdpa_decode_composed_path_masks_cpu() -> Result<()> {
 #[test]
 fn test_sdpa_decode_rejects_bad_masks_cpu() -> Result<()> {
     let dev = &xn::CPU;
+    // b == h, so the per-head spellings have a per-row mask's element count, and the rank-3
+    // one, (h, 1, kv), is the very shape (b, 1, kv). Every one of them must be refused.
     let (b, h, d, kv) = (2usize, 2usize, 8usize, 5usize);
     let q: Tensor<f32, _> = Tensor::full(0.5, (b, 1, h, d), dev)?;
     let kc: Tensor<f32, _> = Tensor::full(0.25, (b, kv, h, d), dev)?;
     let k = kc.narrow(1, 0..kv)?;
-    for shape in [vec![kv + 1], vec![b + 1, kv], vec![kv, b], vec![b, kv - 1], vec![b, h, 1, kv]] {
+    for shape in [
+        vec![kv + 1],
+        vec![b + 1, kv],
+        vec![kv, b],
+        vec![b, kv - 1],
+        vec![b, 1, kv],
+        vec![1, h, 1, kv],
+        vec![b, h, 1, kv],
+    ] {
         let mask: Tensor<f32, _> = Tensor::zeros(shape.clone(), dev)?;
         assert!(q.sdpa_decode(&k, &k, Some(&mask), 1.0).is_err(), "mask {shape:?} was accepted");
     }

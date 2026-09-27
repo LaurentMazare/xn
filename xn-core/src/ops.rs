@@ -281,10 +281,12 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     ///
     /// `mask`, when given, holds additive terms per key position (`0` to keep it, `-inf` to
     /// drop it), applied to every head. It is either `kv` values, shared by the whole batch,
-    /// or `b * kv` values with `b` as its first dimension and `kv` as its last, one row per
-    /// batch entry — which is how a batch of sequences padded to a common length hides each
-    /// one's padding. The per-row form spells `kv` out even when it is 1, so `(b, 1)` rather
-    /// than `(b,)`. A mask per head is not supported on either path.
+    /// or one row of `kv` values per batch entry, shaped `(b, kv)` or `(b, 1, 1, kv)` — which
+    /// is how a batch of sequences padded to a common length hides each one's padding. The
+    /// per-row form spells `kv` out even when it is 1, so `(b, 1)` rather than `(b,)`. A mask
+    /// per head is not supported on either path, and neither is a rank-3 per-row mask: against
+    /// the `(b, h, 1, kv)` scores a rank-3 mask's first dimension is the head, so `(b, 1, kv)`
+    /// is the same shape as the per-head `(h, 1, kv)` whenever `b == h`.
     ///
     /// Backends advertising [`Backend::FUSED_SDPA_DECODE`] run this as one pass; otherwise it
     /// is composed from transpose/matmul/softmax, which is what the caller would have written
@@ -371,18 +373,24 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
 
     /// How many rows of `kv` terms `mask` holds: 1 when shared by the batch, `b` when there is
     /// one per entry. Anything else is a shape error.
+    ///
+    /// The per-row form is `(b, kv)` or `(b, 1, 1, kv)`, never rank 3. Against the
+    /// `(b, h, 1, kv)` scores a rank-3 mask's first dimension is the head, so `(h, 1, kv)` was
+    /// a per-head mask on the composed path, and it is the same shape as `(b, 1, kv)` whenever
+    /// `b == h`. Refusing rank 3 keeps that mask from being applied per row without a word.
     fn sdpa_mask_rows(mask: &Self, b: usize, kv: usize) -> Result<usize> {
         let dims = mask.shape.dims();
         let last = dims.last().copied().unwrap_or(0);
         let n = mask.shape.elem_count();
+        let per_row = (dims.len() == 2 || dims.len() == 4) && dims.first() == Some(&b);
         if last == kv && n == kv {
             Ok(1)
-        } else if last == kv && n == b * kv && dims.first() == Some(&b) {
+        } else if last == kv && n == b * kv && per_row {
             Ok(b)
         } else {
             crate::bail!(
-                "sdpa_decode: mask {:?} must be {kv} terms, or {b} rows of {kv} with the batch \
-                 as its first dimension; a mask per head is not supported",
+                "sdpa_decode: mask {:?} must be {kv} terms, or {b} rows of {kv} shaped \
+                 ({b}, {kv}) or ({b}, 1, 1, {kv}); a mask per head is not supported",
                 mask.shape
             )
         }
