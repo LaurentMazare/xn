@@ -1,4 +1,5 @@
-//! Four-lane `exp` and `erf` for the wasm SIMD target, and the ELU and GELU built on them.
+//! Four-lane `exp` and `erf` for the wasm SIMD target, and the ELU, GELU, SiLU and sigmoid
+//! built on them.
 //!
 //! On wasm32 the scalar `f32::exp` and `libm::erff` are software routines costing several
 //! nanoseconds per element, and the Mimi decoder applies ELU to every activation it
@@ -123,4 +124,197 @@ pub fn gelu_erf(dst: &mut [f32], src: &[f32]) {
     let n = dst.len().min(src.len());
     dst[..n].copy_from_slice(&src[..n]);
     gelu_erf_inplace(&mut dst[..n])
+}
+
+/// Lanes whose `exp` argument lies outside `[EXP_LO, EXP_HI]`, where [`exp_f32x4`] saturates.
+/// NaN is in neither half, so it stays on the vector path and propagates.
+#[inline(always)]
+fn past_clamp(arg: v128) -> v128 {
+    v128_or(f32x4_lt(arg, f32x4_splat(EXP_LO)), f32x4_gt(arg, f32x4_splat(EXP_HI)))
+}
+
+/// `f` four lanes at a time, except that a lane whose `exp` argument (`arg` of the input) is
+/// past the clamp is recomputed by `scalar`, the CPU backend's own formula. The public ops
+/// then underflow to zero and overflow to infinity exactly as the scalar path does, for one
+/// compare per vector on inputs that stay in range.
+fn map_exact_inplace(
+    dst: &mut [f32],
+    arg: impl Fn(v128) -> v128,
+    f: impl Fn(v128) -> v128,
+    scalar: impl Fn(f32) -> f32,
+) {
+    map_inplace(dst, |x| {
+        let y = f(x);
+        let edge = past_clamp(arg(x));
+        if !v128_any_true(edge) {
+            return y;
+        }
+        let (mut xs, mut ys, mut es) = ([0f32; 4], [0f32; 4], [0u32; 4]);
+        unsafe {
+            v128_store(xs.as_mut_ptr() as *mut v128, x);
+            v128_store(ys.as_mut_ptr() as *mut v128, y);
+            v128_store(es.as_mut_ptr() as *mut v128, edge);
+        }
+        for ((y, &x), &e) in ys.iter_mut().zip(&xs).zip(&es) {
+            if e != 0 {
+                *y = scalar(x);
+            }
+        }
+        unsafe { v128_load(ys.as_ptr() as *const v128) }
+    })
+}
+
+/// `exp`, in place. Past the polynomial's range it is the scalar `f32::exp`, so it
+/// underflows to zero and overflows to infinity like every other backend.
+pub fn exp_inplace(dst: &mut [f32]) {
+    map_exact_inplace(dst, |x| x, exp_f32x4, f32::exp)
+}
+
+/// [`exp_inplace`] from `src` into `dst`.
+pub fn exp(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    exp_inplace(&mut dst[..n])
+}
+
+/// `x / (1 + exp(-x))`, in place, with the scalar formula where `-x` is past the clamp.
+pub fn silu_inplace(dst: &mut [f32]) {
+    let one = f32x4_splat(1.0);
+    map_exact_inplace(
+        dst,
+        |x| f32x4_neg(x),
+        |x| f32x4_div(x, f32x4_add(one, exp_f32x4(f32x4_neg(x)))),
+        |x| x / (1.0 + (0.0 - x).exp()),
+    )
+}
+
+/// [`silu_inplace`] from `src` into `dst`.
+pub fn silu(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    silu_inplace(&mut dst[..n])
+}
+
+/// `1 / (1 + exp(-x))`, in place, with the scalar formula where `-x` is past the clamp.
+pub fn sigmoid_inplace(dst: &mut [f32]) {
+    let one = f32x4_splat(1.0);
+    map_exact_inplace(
+        dst,
+        |x| f32x4_neg(x),
+        |x| f32x4_div(one, f32x4_add(one, exp_f32x4(f32x4_neg(x)))),
+        |x| 1.0 / (1.0 + (0.0 - x).exp()),
+    )
+}
+
+/// [`sigmoid_inplace`] from `src` into `dst`.
+pub fn sigmoid(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    sigmoid_inplace(&mut dst[..n])
+}
+
+#[cfg(test)]
+mod tests {
+    //! Run under wasmtime: `cargo test -p xn --lib --target wasm32-wasip1 -- simd128` with
+    //! `-C target-feature=+simd128`.
+    use super::*;
+
+    /// Both of `exp`'s tails, past the clamp on each side, the underflow range where the scalar
+    /// result goes subnormal and then zero, the gap between `EXP_HI` and overflow, infinities
+    /// and NaN.
+    fn sweep() -> Vec<f32> {
+        let mut v: Vec<f32> = (-2000..=2000).map(|i| i as f32 * 0.05).collect();
+        v.extend([0.0, -0.0, 1e-30, -1e-30, f32::MIN_POSITIVE, -f32::MIN_POSITIVE]);
+        v.extend([-87.0, -87.5, -90.0, -100.0, -103.9, -110.0, -200.0]);
+        v.extend([87.0, 88.0, 88.3, 88.7, 89.0, 200.0]);
+        v.extend([f32::INFINITY, f32::NEG_INFINITY, f32::NAN]);
+        v
+    }
+
+    /// NaN for NaN; zeros (with their sign) and infinities exactly; relative error `tol`
+    /// everywhere else, down to the subnormals, which get `tol * f32::MIN_POSITIVE`.
+    fn assert_matches(got: f32, want: f32, tol: f32, what: &str) {
+        if want.is_nan() {
+            assert!(got.is_nan(), "{what}: got {got}, want NaN");
+        } else if want == 0.0 || want.is_infinite() {
+            assert_eq!(got.to_bits(), want.to_bits(), "{what}: got {got}, want {want}");
+        } else {
+            let err = (got - want).abs();
+            let bound = tol * want.abs().max(f32::MIN_POSITIVE);
+            assert!(err <= bound, "{what}: got {got}, want {want}, err {err}");
+        }
+    }
+
+    /// `f` out of place and `f_inplace` must agree bit for bit, and both match `reference`.
+    fn check(
+        name: &str,
+        f: fn(&mut [f32], &[f32]),
+        f_inplace: fn(&mut [f32]),
+        reference: fn(f32) -> f32,
+        tol: f32,
+    ) {
+        let src = sweep();
+        for len in [src.len(), src.len() - 1, src.len() - 2, src.len() - 3, 1, 5] {
+            let src = &src[..len];
+            let mut dst = vec![0f32; len];
+            f(&mut dst, src);
+            let mut inplace = src.to_vec();
+            f_inplace(&mut inplace);
+            for (i, &x) in src.iter().enumerate() {
+                assert_matches(dst[i], reference(x), tol, &format!("{name}({x})"));
+                assert_eq!(
+                    dst[i].to_bits(),
+                    inplace[i].to_bits(),
+                    "{name}: in place differs at {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exp_matches_the_scalar_reference() {
+        check("exp", exp, exp_inplace, f32::exp, 1e-6);
+    }
+
+    #[test]
+    fn silu_matches_the_scalar_reference() {
+        check("silu", silu, silu_inplace, |x| x / (1.0 + (0.0 - x).exp()), 1e-6);
+    }
+
+    #[test]
+    fn sigmoid_matches_the_scalar_reference() {
+        check("sigmoid", sigmoid, sigmoid_inplace, |x| 1.0 / (1.0 + (0.0 - x).exp()), 1e-6);
+    }
+
+    /// Past the clamp every op is the scalar formula itself, so it matches to the bit: `exp`
+    /// is zero or subnormal on the left and infinite on the right, and so on through SiLU and
+    /// sigmoid. Mixed with in-range values, so only the edge lanes take the scalar path.
+    #[test]
+    fn past_the_clamp_is_the_scalar_path() {
+        let edges = [-110.0f32, 1.0, -103.9, -100.0, 88.7, 89.0, 0.5, f32::INFINITY];
+        let edges: Vec<f32> = edges.iter().flat_map(|&x| [x, -x]).collect();
+        let exp_ref = |x: f32| x.exp();
+        let silu_ref = |x: f32| x / (1.0 + (0.0 - x).exp());
+        let sigmoid_ref = |x: f32| 1.0 / (1.0 + (0.0 - x).exp());
+        type Op = (&'static str, fn(&mut [f32], &[f32]), fn(f32) -> f32, fn(f32) -> f32);
+        let ops: [Op; 3] = [
+            ("exp", exp, exp_ref, |x| x),
+            ("silu", silu, silu_ref, |x| -x),
+            ("sigmoid", sigmoid, sigmoid_ref, |x| -x),
+        ];
+        for (name, f, reference, arg) in ops {
+            let mut dst = vec![0f32; edges.len()];
+            f(&mut dst, &edges);
+            for (&x, &got) in edges.iter().zip(&dst) {
+                let a = arg(x);
+                if !(EXP_LO..=EXP_HI).contains(&a) {
+                    let want = reference(x);
+                    assert!(
+                        got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                        "{name}({x}): got {got}, want {want}"
+                    );
+                }
+            }
+        }
+    }
 }
