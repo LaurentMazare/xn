@@ -2030,3 +2030,77 @@ fn test_matmul_batched_strided_impl<B: Backend>(dev: &B) -> Result<()> {
     Ok(())
 }
 test_all_backends!(test_matmul_batched_strided, test_matmul_batched_strided_impl);
+
+// =============================================================================
+// rope / rope_i across the parallelism threshold
+// =============================================================================
+
+/// Deterministic pseudo-random values in `[-1, 1)`.
+fn conv_test_values(seed: u64, len: usize) -> Vec<f32> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        })
+        .collect()
+}
+
+fn assert_close(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= 1e-5 * scale, "{what} idx {i}: got {g}, want {w}");
+    }
+}
+
+/// `rope` and `rope_i` run serially below the elementwise parallelism threshold and on the
+/// worker pool above it, so both sides of that gate have to compute the same thing. The
+/// shapes here straddle it: `2 * 8 * 4 * 64` is 4k elements and `2 * 8 * 512 * 64` is 512k.
+#[test]
+fn rope_matches_the_reference_on_both_sides_of_the_gate() -> Result<()> {
+    let dev = &xn::CPU;
+    for (b, h, t, d) in [(2, 8, 4, 64), (2, 8, 512, 64), (1, 1, 1, 8)] {
+        let n = b * h * t * d;
+        let src_v = conv_test_values(0x51de + t as u64, n);
+        let cos_v = conv_test_values(0xc05, t * d / 2);
+        let sin_v = conv_test_values(0x5117, t * d / 2);
+        let src: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(src_v.clone(), (b, h, t, d), dev)?;
+        let cos: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(cos_v.clone(), (t, d / 2), dev)?;
+        let sin: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(sin_v.clone(), (t, d / 2), dev)?;
+
+        // Non-interleaved: pairs are (i, i + d/2) within a row.
+        let mut want = vec![0f32; n];
+        for bh in 0..b * h {
+            for i_t in 0..t {
+                for i_d in 0..d / 2 {
+                    let (i1, i2) = (bh * t * d + i_t * d + i_d, bh * t * d + i_t * d + i_d + d / 2);
+                    let c = cos_v[i_t * (d / 2) + i_d];
+                    let s = sin_v[i_t * (d / 2) + i_d];
+                    want[i1] = src_v[i1] * c - src_v[i2] * s;
+                    want[i2] = src_v[i1] * s + src_v[i2] * c;
+                }
+            }
+        }
+        assert_close(&src.rope(&cos, &sin, 0)?.to_vec()?, &want, &format!("rope {b}x{h}x{t}x{d}"));
+
+        // Interleaved: pairs are (2i, 2i + 1).
+        let mut want_i = vec![0f32; n];
+        for bh in 0..b * h {
+            for j in 0..t * d / 2 {
+                let i = bh * t * d + 2 * j;
+                let (c, s) = (cos_v[j], sin_v[j]);
+                want_i[i] = src_v[i] * c - src_v[i + 1] * s;
+                want_i[i + 1] = src_v[i] * s + src_v[i + 1] * c;
+            }
+        }
+        assert_close(
+            &src.rope_i(&cos, &sin, 0)?.to_vec()?,
+            &want_i,
+            &format!("rope_i {b}x{h}x{t}x{d}"),
+        );
+    }
+    Ok(())
+}
