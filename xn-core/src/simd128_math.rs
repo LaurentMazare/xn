@@ -124,3 +124,101 @@ pub fn gelu_erf(dst: &mut [f32], src: &[f32]) {
     dst[..n].copy_from_slice(&src[..n]);
     gelu_erf_inplace(&mut dst[..n])
 }
+
+/// `exp` four lanes at a time, in place.
+pub fn exp_inplace(dst: &mut [f32]) {
+    map_inplace(dst, exp_f32x4)
+}
+
+pub fn exp(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    exp_inplace(&mut dst[..n])
+}
+
+/// `x / (1 + exp(-x))`, in place. The flow-LM MLP applies it on every step.
+pub fn silu_inplace(dst: &mut [f32]) {
+    let one = f32x4_splat(1.0);
+    map_inplace(dst, |x| f32x4_div(x, f32x4_add(one, exp_f32x4(f32x4_neg(x)))))
+}
+
+pub fn silu(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    silu_inplace(&mut dst[..n])
+}
+
+/// `1 / (1 + exp(-x))`, in place.
+pub fn sigmoid_inplace(dst: &mut [f32]) {
+    let one = f32x4_splat(1.0);
+    map_inplace(dst, |x| f32x4_div(one, f32x4_add(one, exp_f32x4(f32x4_neg(x)))))
+}
+
+pub fn sigmoid(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    sigmoid_inplace(&mut dst[..n])
+}
+
+#[cfg(test)]
+mod tests {
+    //! Run under wasmtime: `cargo test -p xn --lib --target wasm32-wasip1 -- simd128` with
+    //! `-C target-feature=+simd128`.
+    use super::*;
+
+    /// Finite inputs across both of `exp`'s tails and past its clamp, with lengths that leave
+    /// every size of padded tail.
+    fn sweep() -> Vec<f32> {
+        let mut v: Vec<f32> = (-2000..=2000).map(|i| i as f32 * 0.05).collect();
+        v.extend([0.0, -0.0, 1e-30, -1e-30, -87.0, -87.5, -90.0, -200.0, 87.0, 88.0, 88.5, 200.0]);
+        v
+    }
+
+    fn assert_close(got: f32, want: f32, tol: f32, what: &str) {
+        let err = (got - want).abs();
+        assert!(err <= tol * want.abs().max(1.0), "{what}: got {got}, want {want}, err {err}");
+    }
+
+    /// `f` out of place and `f_inplace` must agree bit for bit, and both match `reference`.
+    fn check(
+        name: &str,
+        f: fn(&mut [f32], &[f32]),
+        f_inplace: fn(&mut [f32]),
+        reference: fn(f32) -> f32,
+        domain: impl Fn(f32) -> bool,
+        tol: f32,
+    ) {
+        let src: Vec<f32> = sweep().into_iter().filter(|&x| domain(x)).collect();
+        for len in [src.len(), src.len() - 1, src.len() - 2, src.len() - 3, 1, 5] {
+            let src = &src[..len];
+            let mut dst = vec![0f32; len];
+            f(&mut dst, src);
+            let mut inplace = src.to_vec();
+            f_inplace(&mut inplace);
+            for (i, &x) in src.iter().enumerate() {
+                assert_close(dst[i], reference(x), tol, &format!("{name}({x})"));
+                assert_eq!(
+                    dst[i].to_bits(),
+                    inplace[i].to_bits(),
+                    "{name}: in place differs at {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exp_matches_the_scalar_reference() {
+        // Inside the clamp; past it the kernel saturates on purpose.
+        check("exp", exp, exp_inplace, f32::exp, |x| (EXP_LO..=EXP_HI).contains(&x), 2e-6);
+    }
+
+    #[test]
+    fn silu_matches_the_scalar_reference() {
+        check("silu", silu, silu_inplace, |x| x / (1.0 + (-x).exp()), |_| true, 1e-6);
+    }
+
+    #[test]
+    fn sigmoid_matches_the_scalar_reference() {
+        check("sigmoid", sigmoid, sigmoid_inplace, |x| 1.0 / (1.0 + (-x).exp()), |_| true, 1e-6);
+    }
+}

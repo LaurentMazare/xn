@@ -231,6 +231,9 @@ impl crate::Backend for crate::CpuDevice {
             match op {
                 UnaryOp::Elu { alpha } => return Ok(crate::simd128_math::elu_inplace(dst, alpha)),
                 UnaryOp::GeluErf => return Ok(crate::simd128_math::gelu_erf_inplace(dst)),
+                UnaryOp::Exp => return Ok(crate::simd128_math::exp_inplace(dst)),
+                UnaryOp::Silu => return Ok(crate::simd128_math::silu_inplace(dst)),
+                UnaryOp::Sigmoid => return Ok(crate::simd128_math::sigmoid_inplace(dst)),
                 _ => {}
             }
         }
@@ -284,6 +287,9 @@ impl crate::Backend for crate::CpuDevice {
             match op {
                 UnaryOp::Elu { alpha } => return Ok(crate::simd128_math::elu(dst, src, alpha)),
                 UnaryOp::GeluErf => return Ok(crate::simd128_math::gelu_erf(dst, src)),
+                UnaryOp::Exp => return Ok(crate::simd128_math::exp(dst, src)),
+                UnaryOp::Silu => return Ok(crate::simd128_math::silu(dst, src)),
+                UnaryOp::Sigmoid => return Ok(crate::simd128_math::sigmoid(dst, src)),
                 _ => {}
             }
         }
