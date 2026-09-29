@@ -625,25 +625,26 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_t in 0..t {
-                    for i_d in 0..d / 2 {
-                        let i1 = i_t * d + i_d;
-                        let i2 = i1 + d / 2;
-                        let i_cs = i_t * (d / 2) + i_d;
-                        let i_cs = if unbatched_rope {
-                            let b_i = bh_i / h;
-                            i_cs + b_i * t * d / 2
-                        } else {
-                            i_cs
-                        };
-                        dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
-                        dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
-                    }
+        let row = |bh_i: usize, src: &[T], dst: &mut [T]| {
+            let base = if unbatched_rope { (bh_i / h) * t * d / 2 } else { 0 };
+            for i_t in 0..t {
+                for i_d in 0..d / 2 {
+                    let i1 = i_t * d + i_d;
+                    let i2 = i1 + d / 2;
+                    let i_cs = base + i_t * (d / 2) + i_d;
+                    dst[i1] = src[i1] * cos[i_cs] - src[i2] * sin[i_cs];
+                    dst[i2] = src[i1] * sin[i_cs] + src[i2] * cos[i_cs];
                 }
-            },
-        );
+            }
+        };
+        // Same gating as `rope_i`.
+        if use_parallelism(b * h * t * d) {
+            crate::threadpool::par_chunks_zip(dst, t * d, src, t * d, |bh_i, d, s| row(bh_i, s, d));
+        } else {
+            for (bh_i, (s, d)) in src.chunks(t * d).zip(dst.chunks_mut(t * d)).enumerate() {
+                row(bh_i, s, d);
+            }
+        }
         Ok(())
     }
 
@@ -667,21 +668,25 @@ impl crate::Backend for crate::CpuDevice {
         }
         let cos = &cos[pos * d / 2..];
         let sin = &sin[pos * d / 2..];
-        src.par_chunks(t * d).zip(dst.par_chunks_mut(t * d)).enumerate().for_each(
-            |(bh_i, (src, dst))| {
-                for i_over_2 in 0..t * d / 2 {
-                    let i = 2 * i_over_2;
-                    let rope_i = if unbatched_rope {
-                        let b_i = bh_i / h;
-                        i_over_2 + b_i * t * d / 2
-                    } else {
-                        i_over_2
-                    };
-                    dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
-                    dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
-                }
-            },
-        );
+        let row = |bh_i: usize, src: &[T], dst: &mut [T]| {
+            let base = if unbatched_rope { (bh_i / h) * t * d / 2 } else { 0 };
+            for i_over_2 in 0..t * d / 2 {
+                let i = 2 * i_over_2;
+                let rope_i = base + i_over_2;
+                dst[i] = src[i] * cos[rope_i] - src[i + 1] * sin[rope_i];
+                dst[i + 1] = src[i] * sin[rope_i] + src[i + 1] * cos[rope_i];
+            }
+        };
+        // One (b, h) row per chunk. At single-token decode a row is `d` elements and there are
+        // only b*h of them, so a fork/join costs more than the whole rotation; past the
+        // elementwise threshold it goes to the same resident pool as every other operator.
+        if use_parallelism(b * h * t * d) {
+            crate::threadpool::par_chunks_zip(dst, t * d, src, t * d, |bh_i, d, s| row(bh_i, s, d));
+        } else {
+            for (bh_i, (s, d)) in src.chunks(t * d).zip(dst.chunks_mut(t * d)).enumerate() {
+                row(bh_i, s, d);
+            }
+        }
         Ok(())
     }
 
