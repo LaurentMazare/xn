@@ -32,6 +32,9 @@ use std::sync::{Condvar, Mutex, OnceLock};
 /// fighting. With everything on one pool the tradeoff is gone and a longer bridge is uniformly
 /// better: measured across 3-8 threads and both vocoder windows, 5000 is at or above every
 /// other value tried, and roughly 20% better than 1000 at 8 threads.
+///
+/// An embedder whose threads are more expensive to wake can raise it through
+/// [`PoolConfig::spin_budget`].
 const DEFAULT_SPIN_BUDGET: u32 = 5_000;
 
 fn spin_budget() -> u32 {
@@ -98,31 +101,91 @@ thread_local! {
 
 static POOL: OnceLock<Pool> = OnceLock::new();
 
-/// Unreachable where `enabled()` is false, but `size` and `dispatch` still name it.
-fn pool() -> &'static Pool {
-    POOL.get_or_init(|| {
+/// How a pool is built when the caller brings the threads. See [`start_pool_with`].
+pub struct PoolConfig {
+    /// Worker threads the caller will spawn. The calling thread joins them as participant 0,
+    /// so the pool ends up `workers + 1` wide.
+    pub workers: usize,
+    /// Iterations a worker spins before parking. `None` takes `XN_SPIN_BUDGET`, else
+    /// [`DEFAULT_SPIN_BUDGET`]. Raise it where waking a parked thread is expensive.
+    pub spin_budget: Option<u32>,
+}
+
+fn new_shared() -> &'static Shared {
+    Box::leak(Box::new(Shared {
+        seq: AtomicU64::new(0),
+        job: std::cell::UnsafeCell::new(None),
+        done: AtomicUsize::new(0),
+        panicked: AtomicBool::new(false),
+        quit: AtomicBool::new(false),
+        lock: Mutex::new(()),
+        wake: Condvar::new(),
+    }))
+}
+
+/// Whether this platform lets the pool spawn threads of its own.
+///
+/// Asked rather than assumed, by spawning one and looking at the result: `std::thread` exists
+/// on every target, but on some -- a wasm build for the browser, say -- it cannot start one
+/// and says so. The probe costs one thread, once.
+fn can_spawn_threads() -> bool {
+    static CAN: OnceLock<bool> = OnceLock::new();
+    *CAN.get_or_init(|| std::thread::Builder::new().name("xn-probe".into()).spawn(|| {}).is_ok())
+}
+
+/// The pool, once something has built it.
+///
+/// `None` until then on a platform that cannot spawn its own threads, which is not a failure:
+/// callers fall back to a rayon fork/join, and an embedder that has threads to lend can still
+/// build it with [`start_pool_with`]. Nothing is stored in that case, so a later call wins.
+fn pool() -> Option<&'static Pool> {
+    if let Some(pool) = POOL.get() {
+        return Some(pool);
+    }
+    if !use_own_threads() || !can_spawn_threads() {
+        return None;
+    }
+    Some(POOL.get_or_init(|| {
         let size = crate::get_num_threads().max(1);
-        let shared: &'static Shared = Box::leak(Box::new(Shared {
-            seq: AtomicU64::new(0),
-            job: std::cell::UnsafeCell::new(None),
-            done: AtomicUsize::new(0),
-            panicked: AtomicBool::new(false),
-            quit: AtomicBool::new(false),
-            lock: Mutex::new(()),
-            wake: Condvar::new(),
-        }));
+        let shared = new_shared();
+        let budget = spin_budget();
         for ith in 1..size {
             std::thread::Builder::new()
                 .name(format!("xn-worker-{ith}"))
-                .spawn(move || worker(shared, ith, size))
+                .spawn(move || worker(shared, ith, size, budget))
                 .expect("spawning an xn worker thread");
         }
         Pool { shared, size, publish: AtomicBool::new(false) }
-    })
+    }))
+}
+
+/// Build the pool on threads the caller provides, rather than on `std::thread`s of its own,
+/// which is how a target that cannot spawn any gets one.
+///
+/// `spawn` must put each job on a thread of its own and let it run forever: a worker never
+/// returns, so whatever `spawn` draws on is committed to this pool. With `rayon::spawn` that
+/// is rayon's threads, and nothing may go through rayon afterwards, including this module's
+/// own fallback. The calling thread is participant 0 and must be one that may block.
+///
+/// Returns the pool's width, `workers + 1`; a second call is a no-op returning it.
+pub fn start_pool_with(
+    cfg: PoolConfig,
+    spawn: impl Fn(Box<dyn FnOnce() + Send + 'static>),
+) -> usize {
+    let pool = POOL.get_or_init(|| {
+        let size = cfg.workers + 1;
+        let shared = new_shared();
+        let budget = cfg.spin_budget.unwrap_or_else(spin_budget);
+        for ith in 1..size {
+            spawn(Box::new(move || worker(shared, ith, size, budget)));
+        }
+        Pool { shared, size, publish: AtomicBool::new(false) }
+    });
+    pool.size
 }
 
 /// `nth` is fixed for the lifetime of the pool, so a worker never has to read it.
-fn worker(shared: &'static Shared, ith: usize, nth: usize) {
+fn worker(shared: &'static Shared, ith: usize, nth: usize, budget: u32) {
     let mut last = 0u64;
     loop {
         // Spin first: between two operators of the same layer the next job usually lands within
@@ -130,7 +193,7 @@ fn worker(shared: &'static Shared, ith: usize, nth: usize) {
         let mut seq = shared.seq.load(Ordering::Acquire);
         let mut spins = 0u32;
         while seq == last && !shared.quit.load(Ordering::Relaxed) {
-            if spins < spin_budget() {
+            if spins < budget {
                 spins += 1;
                 std::hint::spin_loop();
             } else {
@@ -168,20 +231,38 @@ fn worker(shared: &'static Shared, ith: usize, nth: usize) {
     }
 }
 
-/// Whether to use the persistent pool. `XN_THREADPOOL=0` reverts to a rayon fork/join per
+/// Whether the pool may build itself. `XN_THREADPOOL=0` reverts to a rayon fork/join per
 /// operator, which is the escape hatch if the resident workers ever fight with something else
-/// for cores.
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// for cores. It does not reject a pool an embedder supplies through [`start_pool_with`].
+fn use_own_threads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| !matches!(std::env::var("XN_THREADPOOL").as_deref(), Ok("0")))
 }
 
-/// The pool spawns `std::thread`s, which this target has none of. `wasip1-threads` and
-/// Emscripten can spawn, so they keep it.
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn enabled() -> bool {
-    false
+/// The threshold [`set_min_parallel_work`] holds. `0`, the default, fans out every size.
+static MIN_PARALLEL_WORK: AtomicUsize = AtomicUsize::new(0);
+
+/// The smallest operator, in multiply-adds or elements, that [`threads_for`] and
+/// [`dispatch_work`] will fan out. `0`, the default, fans out every size.
+///
+/// A threshold is only worth setting where a fan-out is expensive relative to the work. This
+/// pool's own dispatch costs microseconds, so once it is running every size is worth
+/// splitting; it is the fallback path, a rayon fork/join, that can cost far more than a small
+/// operator takes. An embedder on such a runtime sets this, and lowers it once its pool is
+/// running.
+pub fn set_min_parallel_work(work: usize) {
+    MIN_PARALLEL_WORK.store(work, Ordering::Relaxed);
+}
+
+/// Threads worth putting on an operator of `work` multiply-adds (or elements).
+///
+/// [`size`] once `work` reaches [`set_min_parallel_work`]'s threshold, which by default is
+/// every operator; `1` below it, since a fan-out that costs more than the operator is a loss.
+pub(crate) fn threads_for(work: usize) -> usize {
+    if work < MIN_PARALLEL_WORK.load(Ordering::Relaxed) {
+        return 1;
+    }
+    size()
 }
 
 /// Holds the right to drive the pool, releasing it even if the dispatch unwinds.
@@ -213,10 +294,27 @@ impl Drop for PublishGuard {
 /// after that point changes how work is chunked but cannot grow it. Without the pool it is
 /// rayon's width, read afresh.
 pub fn size() -> usize {
-    if !enabled() {
-        return rayon::current_num_threads().max(1);
+    match pool() {
+        Some(pool) => pool.size,
+        None => rayon::current_num_threads().max(1),
     }
-    pool().size
+}
+
+/// [`dispatch`] for an operator whose size the caller knows, in multiply-adds or elements.
+///
+/// Runs it on [`threads_for`] threads, so with no threshold set this is [`dispatch`].
+pub fn dispatch_work<F: Fn(usize, usize) + Sync>(work: usize, f: F) {
+    let nth = threads_for(work);
+    if nth <= 1 {
+        f(0, 1);
+        return;
+    }
+    if pool().is_some() {
+        dispatch(f);
+        return;
+    }
+    use rayon::prelude::*;
+    (0..nth).into_par_iter().for_each(|ith| f(ith, nth));
 }
 
 /// Run `f(ith, nth)` on every participant and return once all of them have finished.
@@ -229,20 +327,21 @@ pub fn size() -> usize {
 /// `f` must give each `ith` a disjoint slice of the output: the pool provides the barrier, not
 /// mutual exclusion.
 pub fn dispatch<F: Fn(usize, usize) + Sync>(f: F) {
-    if !enabled() {
+    let Some(pool) = pool() else {
         // Fan out through rayon, the way this used to work. A nested dispatch fans out
-        // again here rather than collapsing to `(0, 1)`; rayon copes.
-        let nth = rayon::current_num_threads().max(1);
+        // again here rather than collapsing to `(0, 1)`; rayon copes. The width is `size()`,
+        // rayon's own, which no threshold bends: a caller that knows how much work it has
+        // says so through `dispatch_work` and is gated there.
+        let nth = size();
         use rayon::prelude::*;
         (0..nth).into_par_iter().for_each(|ith| f(ith, nth));
         return;
-    }
+    };
     // A job that dispatches again would wait on workers already inside this job.
     if IN_JOB.with(|f| f.get()) {
         f(0, 1);
         return;
     }
-    let pool = pool();
     let nth = pool.size;
     if nth <= 1 {
         f(0, 1);
@@ -299,6 +398,20 @@ pub fn dispatch<F: Fn(usize, usize) + Sync>(f: F) {
     }
 }
 
+/// Run `f(lo, hi)` over `n` items in pieces of `unit`, on the pool when an operator of
+/// `work` is worth splitting and on the calling thread otherwise.
+///
+/// The piece is the caller's unit of disjointness -- output channels, column blocks -- so it
+/// says how to cut the work and this decides whether to.
+pub fn par_units_by<F: Fn(usize, usize) + Sync>(work: usize, n: usize, unit: usize, f: F) {
+    let units = n.div_ceil(unit.max(1));
+    if threads_for(work).min(units) <= 1 {
+        f(0, n);
+        return;
+    }
+    par_units(units, |u| f(u * unit, ((u + 1) * unit).min(n)));
+}
+
 /// Run `f(i)` for every `i` in `0..n`, handing indices out on demand.
 ///
 /// The counterpart to [`dispatch`], which splits statically. A static split is only right when
@@ -345,12 +458,24 @@ pub fn par_chunks_mut<T: Send + Sync, F>(dst: &mut [T], chunk: usize, f: F)
 where
     F: Fn(usize, &mut [T]) + Sync,
 {
+    par_chunks_mut_by(dst.len(), dst, chunk, f)
+}
+
+/// [`par_chunks_mut`] for a call whose output elements cost more than a pass over them.
+///
+/// `dst.len()` says how to cut the output, `work` says how much there is to do: a matmul row
+/// of `n` columns `k` deep is `n * k`, not `n`. They differ only for an embedder that set
+/// [`set_min_parallel_work`], which weighs the latter.
+pub fn par_chunks_mut_by<T: Send + Sync, F>(work: usize, dst: &mut [T], chunk: usize, f: F)
+where
+    F: Fn(usize, &mut [T]) + Sync,
+{
     if chunk == 0 {
         return;
     }
     let len = dst.len();
     let nchunks = len.div_ceil(chunk);
-    if nchunks <= 1 || size() == 1 {
+    if nchunks <= 1 || threads_for(work) == 1 {
         for (i, d) in dst.chunks_mut(chunk).enumerate() {
             f(i, d);
         }
@@ -387,7 +512,7 @@ pub fn par_chunks_zip<T: Send + Sync, U: Sync, F>(
     let len = dst.len();
     let src_len = src.len();
     let nchunks = len.div_ceil(chunk);
-    if nchunks <= 1 || size() == 1 {
+    if nchunks <= 1 || threads_for(len) == 1 {
         for (i, d) in dst.chunks_mut(chunk).enumerate() {
             let s = (i * src_chunk).min(src_len);
             let e = ((i + 1) * src_chunk).min(src_len);
@@ -418,7 +543,7 @@ pub fn par_chunks_zip<T: Send + Sync, U: Sync, F>(
 ///
 /// The pool replacement for `(0..n).into_par_iter().for_each(..)`.
 pub fn par_range<F: Fn(usize) + Sync>(n: usize, f: F) {
-    if n <= 1 || size() == 1 {
+    if n <= 1 || threads_for(n) == 1 {
         (0..n).for_each(&f);
         return;
     }

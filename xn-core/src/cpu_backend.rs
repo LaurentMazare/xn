@@ -1,7 +1,6 @@
 use crate::error::Context;
 use crate::{BinaryOp, DType, Result, UnaryOp, WithDType, WithDTypeF};
 use half::{bf16, f16};
-use rayon::prelude::*;
 use std::any::Any;
 
 const USE_IM2COL_CONV1D: bool = true;
@@ -12,7 +11,7 @@ const USE_COL2IM_CONV1D_TR: bool = true;
 /// participant: with a single-thread pool (e.g. RAYON_NUM_THREADS=1) every parallel call would
 /// still pay a handoff for no benefit.
 fn use_parallelism(work: usize) -> bool {
-    work >= ELEMWISE_PAR_THRESHOLD && crate::threadpool::size() > 1
+    work >= ELEMWISE_PAR_THRESHOLD && crate::threadpool::threads_for(work) > 1
 }
 
 fn copy_strided_2d<T: WithDType>(
@@ -29,7 +28,7 @@ fn copy_strided_2d<T: WithDType>(
     };
     let dst = &mut dst[..d0 * d1];
     if use_parallelism(d0 * d1) {
-        dst.par_chunks_mut(d1).with_min_len(4).enumerate().for_each(|(i0, dst)| copy_row(i0, dst));
+        crate::threadpool::par_chunks_mut(dst, d1, |i0, dst| copy_row(i0, dst));
     } else {
         dst.chunks_mut(d1).enumerate().for_each(|(i0, dst)| copy_row(i0, dst));
     }
@@ -55,7 +54,7 @@ fn copy_strided_3d<T: WithDType>(
     };
     let dst = &mut dst[..d0 * d1 * d2];
     if use_parallelism(d0 * d1 * d2) {
-        dst.par_chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| copy_block(i0, dst));
+        crate::threadpool::par_chunks_mut(dst, d1 * d2, |i0, dst| copy_block(i0, dst));
     } else {
         dst.chunks_mut(d1 * d2).enumerate().for_each(|(i0, dst)| copy_block(i0, dst));
     }
@@ -78,6 +77,21 @@ fn gemm_<T: WithDType>(
 ) -> Result<()> {
     let lhs = &lhs[lhs_o..];
     let rhs = &rhs[rhs_o..];
+
+    let layout = arch::Gemm {
+        m,
+        n,
+        k,
+        batch: lhs_b,
+        lhs_b_stride,
+        rhs_b_stride,
+        dst: (dst_cs, dst_rs),
+        lhs: (lhs_cs, lhs_rs),
+        rhs: (rhs_cs, rhs_rs),
+    };
+    if arch::gemm(dst, lhs, rhs, &layout) {
+        return Ok(());
+    }
 
     // Column stripes, run on xn's own pool rather than letting `gemm` reach for rayon.
     //
@@ -432,9 +446,9 @@ impl crate::Backend for crate::CpuDevice {
                     }
                 };
                 if parallel {
-                    dst.par_chunks_mut(d2 * d_j * d1)
-                        .enumerate()
-                        .for_each(|(i, dst)| transpose_block(i, dst));
+                    crate::threadpool::par_chunks_mut(dst, d2 * d_j * d1, |i, dst| {
+                        transpose_block(i, dst)
+                    });
                 } else {
                     dst.chunks_mut(d2 * d_j * d1)
                         .enumerate()
@@ -455,9 +469,9 @@ impl crate::Backend for crate::CpuDevice {
                     }
                 };
                 if parallel {
-                    dst.par_chunks_mut(d2 * d_j * d1 * d_k)
-                        .enumerate()
-                        .for_each(|(i, dst)| transpose_block(i, dst));
+                    crate::threadpool::par_chunks_mut(dst, d2 * d_j * d1 * d_k, |i, dst| {
+                        transpose_block(i, dst)
+                    });
                 } else {
                     dst.chunks_mut(d2 * d_j * d1 * d_k)
                         .enumerate()
@@ -476,10 +490,13 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].copy_from_slice(&src[..l]);
         } else {
-            dst[..l]
-                .par_chunks_mut(ELEMWISE_CHUNK)
-                .zip(src[..l].par_chunks(ELEMWISE_CHUNK))
-                .for_each(|(d, s)| d.copy_from_slice(s));
+            crate::threadpool::par_chunks_zip(
+                &mut dst[..l],
+                ELEMWISE_CHUNK,
+                &src[..l],
+                ELEMWISE_CHUNK,
+                |_, d, s| d.copy_from_slice(s),
+            );
         }
         Ok(())
     }
@@ -551,7 +568,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+            crate::threadpool::par_chunks_mut(&mut dst[..len], ELEMWISE_CHUNK, |_, d| fill(d));
         } else {
             fill(&mut dst[..len]);
         }
@@ -572,7 +589,7 @@ impl crate::Backend for crate::CpuDevice {
             }
         };
         if use_parallelism(len) {
-            dst[..len].par_chunks_mut(ELEMWISE_CHUNK).for_each(fill);
+            crate::threadpool::par_chunks_mut(&mut dst[..len], ELEMWISE_CHUNK, |_, d| fill(d));
         } else {
             fill(&mut dst[..len]);
         }
@@ -583,7 +600,7 @@ impl crate::Backend for crate::CpuDevice {
         if !use_parallelism(l) {
             dst[..l].fill(v);
         } else {
-            dst[..l].par_chunks_mut(ELEMWISE_CHUNK).for_each(|d| d.fill(v));
+            crate::threadpool::par_chunks_mut(&mut dst[..l], ELEMWISE_CHUNK, |_, d| d.fill(v));
         }
         Ok(())
     }
@@ -887,19 +904,19 @@ impl crate::Backend for crate::CpuDevice {
             }
         // The width that will actually run it; `get_num_threads` is 1 off the pool.
         } else if n_outer >= crate::threadpool::size() {
-            dst[..total]
-                .par_chunks_mut(d_a * d_b)
-                .enumerate()
-                .for_each(|(o, dst)| tiled_2d_gather(dst, outer_offset(o)));
+            crate::threadpool::par_chunks_mut(&mut dst[..total], d_a * d_b, |o, dst| {
+                tiled_2d_gather(dst, outer_offset(o))
+            });
         } else {
             // Few outer blocks (e.g. a plain 2d transpose): parallelize over row tiles
             // within each block instead.
             for o in 0..n_outer {
                 let off = outer_offset(o);
-                dst[o * d_a * d_b..(o + 1) * d_a * d_b]
-                    .par_chunks_mut(TILE * d_b)
-                    .enumerate()
-                    .for_each(|(a_t, dst)| tiled_2d_gather(dst, off + a_t * TILE * s_a));
+                crate::threadpool::par_chunks_mut(
+                    &mut dst[o * d_a * d_b..(o + 1) * d_a * d_b],
+                    TILE * d_b,
+                    |a_t, dst| tiled_2d_gather(dst, off + a_t * TILE * s_a),
+                );
             }
         }
         Ok(())
@@ -1196,6 +1213,21 @@ impl crate::Backend for crate::CpuDevice {
         dilation: usize,
         groups: usize,
     ) -> Result<()> {
+        let shape = arch::Conv1d {
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        };
+        if arch::conv1d(dst, src, kernel, &shape) {
+            return Ok(());
+        }
         if USE_IM2COL_CONV1D && groups == 1 {
             // IM2COL approach: transform conv1d into matrix multiplication
             // 1. Im2Col: transform input [B, C, L] -> [B, L_out, C * K]
@@ -1487,10 +1519,11 @@ fn reduce_combine<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size];
         if parallel {
-            dst.par_iter_mut()
-                .with_min_len(4)
-                .enumerate()
-                .for_each(|(outer, dst)| reduce_row(outer, dst));
+            crate::threadpool::par_chunks_mut(dst, 4, |c, piece| {
+                for (j, d) in piece.iter_mut().enumerate() {
+                    reduce_row(c * 4 + j, d);
+                }
+            });
         } else {
             dst.iter_mut().enumerate().for_each(|(outer, dst)| reduce_row(outer, dst));
         }
@@ -1507,9 +1540,12 @@ fn reduce_combine<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size * inner_size];
         if parallel {
-            dst.par_chunks_mut(inner_size)
-                .enumerate()
-                .for_each(|(outer, dst)| reduce_block(outer, dst));
+            crate::threadpool::par_chunks_mut_by(
+                outer_size * dim_size * inner_size,
+                dst,
+                inner_size,
+                |outer, dst| reduce_block(outer, dst),
+            );
         } else {
             dst.chunks_mut(inner_size)
                 .enumerate()
@@ -1549,10 +1585,11 @@ fn reduce_arg<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size];
         if parallel {
-            dst.par_iter_mut()
-                .with_min_len(4)
-                .enumerate()
-                .for_each(|(outer, dst)| arg_row(outer, dst));
+            crate::threadpool::par_chunks_mut(dst, 4, |c, piece| {
+                for (j, d) in piece.iter_mut().enumerate() {
+                    arg_row(c * 4 + j, d);
+                }
+            });
         } else {
             dst.iter_mut().enumerate().for_each(|(outer, dst)| arg_row(outer, dst));
         }
@@ -1573,9 +1610,12 @@ fn reduce_arg<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size * inner_size];
         if parallel {
-            dst.par_chunks_mut(inner_size)
-                .enumerate()
-                .for_each(|(outer, dst)| arg_block(outer, dst));
+            crate::threadpool::par_chunks_mut_by(
+                outer_size * dim_size * inner_size,
+                dst,
+                inner_size,
+                |outer, dst| arg_block(outer, dst),
+            );
         } else {
             dst.chunks_mut(inner_size).enumerate().for_each(|(outer, dst)| arg_block(outer, dst));
         }
@@ -1777,7 +1817,7 @@ fn conv1d_direct<T: WithDTypeF>(
     // Process each kernel offset
     for k_offset in 0..kernel_size {
         // Parallelize over output channels
-        (0..out_channels).into_par_iter().for_each(|out_c| {
+        crate::threadpool::par_units(out_channels, |out_c| {
             let g = out_c / (out_channels / groups);
             let in_c_start = g * in_c_per_group;
 
@@ -2052,18 +2092,98 @@ mod arch {
 
     use crate::UnaryOp;
 
-    // wasm32: `exp` and `erf` are software routines there, several nanoseconds per element.
+    /// A 1d convolution's shape, as the backend's `conv1d` receives it.
+    #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+    pub(super) struct Conv1d {
+        pub batch: usize,
+        pub in_channels: usize,
+        pub out_channels: usize,
+        pub length: usize,
+        pub out_length: usize,
+        pub kernel_size: usize,
+        pub stride: usize,
+        pub padding: usize,
+        pub dilation: usize,
+        pub groups: usize,
+    }
+
+    /// A batched matmul's layout, as the backend's `gemm_` receives it: `(col, row)` strides.
+    #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+    pub(super) struct Gemm {
+        pub m: usize,
+        pub n: usize,
+        pub k: usize,
+        pub batch: usize,
+        pub lhs_b_stride: usize,
+        pub rhs_b_stride: usize,
+        pub dst: (usize, usize),
+        pub lhs: (usize, usize),
+        pub rhs: (usize, usize),
+    }
+
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    use crate::simd128_math as imp;
+    mod imp {
+        use super::{Conv1d, Gemm};
+        use crate::simd128_conv as k;
+        pub use crate::simd128_math::{unary, unary_inplace};
+
+        /// Stride 1, no padding, one group: read the input in place, no im2col or transpose.
+        pub fn conv1d(dst: &mut [f32], src: &[f32], w: &[f32], s: &Conv1d) -> bool {
+            let span = (s.kernel_size.max(1) - 1) * s.dilation;
+            let fits = s.out_length == 0 || s.out_length - 1 + span < s.length;
+            if s.groups != 1 || s.stride != 1 || s.padding != 0 || s.kernel_size == 0 || !fits {
+                return false;
+            }
+            let (l_in, l_out) = (s.length, s.out_length);
+            k::conv1d(
+                dst,
+                src,
+                w,
+                s.batch,
+                s.in_channels,
+                s.out_channels,
+                l_in,
+                l_out,
+                s.kernel_size,
+                s.dilation,
+            );
+            true
+        }
+
+        /// `x @ W^T` on a row-major weight, both operands contiguous along `k`.
+        pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
+            let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
+            if lhs_cs != 1 || dst_cs != 1 || rhs_rs != 1 {
+                return false;
+            }
+            let (m, n, kk) = (g.m, g.n, g.k);
+            for b in 0..g.batch {
+                let dst = &mut dst[b * m * n..(b + 1) * m * n];
+                let (lhs, rhs) = (&lhs[b * g.lhs_b_stride..], &rhs[b * g.rhs_b_stride..]);
+                k::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk);
+            }
+            true
+        }
+    }
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
     mod imp {
+        use super::{Conv1d, Gemm};
+        use crate::UnaryOp;
         #[inline(always)]
-        pub fn unary_inplace(_: &mut [f32], _: crate::UnaryOp) -> bool {
+        pub fn unary_inplace(_: &mut [f32], _: UnaryOp) -> bool {
             false
         }
         #[inline(always)]
-        pub fn unary(_: &mut [f32], _: &[f32], _: crate::UnaryOp) -> bool {
+        pub fn unary(_: &mut [f32], _: &[f32], _: UnaryOp) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn gemm(_: &mut [f32], _: &[f32], _: &[f32], _: &Gemm) -> bool {
             false
         }
     }
@@ -2075,6 +2195,20 @@ mod arch {
     pub(super) fn unary<T: 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -> bool {
         match (as_f32_mut(dst), as_f32(src)) {
             (Some(dst), Some(src)) => imp::unary(dst, src, op),
+            _ => false,
+        }
+    }
+
+    pub(super) fn conv1d<T: 'static>(dst: &mut [T], src: &[T], w: &[T], s: &Conv1d) -> bool {
+        match (as_f32_mut(dst), as_f32(src), as_f32(w)) {
+            (Some(dst), Some(src), Some(w)) => imp::conv1d(dst, src, w, s),
+            _ => false,
+        }
+    }
+
+    pub(super) fn gemm<T: 'static>(dst: &mut [T], lhs: &[T], rhs: &[T], g: &Gemm) -> bool {
+        match (as_f32_mut(dst), as_f32(lhs), as_f32(rhs)) {
+            (Some(dst), Some(lhs), Some(rhs)) => imp::gemm(dst, lhs, rhs, g),
             _ => false,
         }
     }
