@@ -1519,7 +1519,7 @@ fn reduce_combine<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size];
         if parallel {
-            crate::threadpool::par_chunks_mut(dst, 4, |c, piece| {
+            crate::threadpool::par_chunks_mut_by(outer_size * dim_size, dst, 4, |c, piece| {
                 for (j, d) in piece.iter_mut().enumerate() {
                     reduce_row(c * 4 + j, d);
                 }
@@ -1585,7 +1585,7 @@ fn reduce_arg<T: WithDType + Copy>(
         };
         let dst = &mut dst[..outer_size];
         if parallel {
-            crate::threadpool::par_chunks_mut(dst, 4, |c, piece| {
+            crate::threadpool::par_chunks_mut_by(outer_size * dim_size, dst, 4, |c, piece| {
                 for (j, d) in piece.iter_mut().enumerate() {
                     arg_row(c * 4 + j, d);
                 }
