@@ -6,7 +6,6 @@ use super::utils::{
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use half::{bf16, f16};
-use rayon::prelude::*;
 
 // Default to QK_K 256 rather than 64.
 pub const QK_K: usize = 256;
@@ -65,18 +64,27 @@ fn matmul_by_row<T: GgmlType>(
         let lhs_row = &lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
         let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
 
-        let result: Result<Vec<_>> = dst_row
-            .into_par_iter()
-            .enumerate()
-            .with_min_len(128)
-            .with_max_len(512)
-            .map(|(col_idx, dst)| {
+        // Through the pool, like every other operator, rather than reaching for rayon.
+        let first_err: std::sync::Mutex<Option<crate::Error>> = std::sync::Mutex::new(None);
+        // `n` columns, each a `k`-deep dot product: the work is `n * k`, not `n`.
+        crate::threadpool::par_chunks_mut_by(n * k, dst_row, 128, |c, piece| {
+            for (j, dst) in piece.iter_mut().enumerate() {
+                let col_idx = c * 128 + j;
                 let rhs_col = &rhs_t[col_idx * k_in_rhs_blocks..(col_idx + 1) * k_in_rhs_blocks];
-                T::vec_dot(k, rhs_col, lhs_row).map(|value| *dst = value)
-            })
-            .collect();
-
-        result?;
+                match T::vec_dot(k, rhs_col, lhs_row) {
+                    Ok(value) => *dst = value,
+                    Err(e) => {
+                        let mut slot = first_err.lock().unwrap_or_else(|p| p.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(e) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -739,10 +747,10 @@ fn matmul_q8_0_sgemm(
     let b_addr = lhs_b.as_ptr() as usize;
     let c_addr = dst.as_mut_ptr() as usize;
     // A single-participant pool runs the closure inline, so a one-worker build still pays no
-    // join here and needs no special case. Gating the fan-out on a work threshold was measured
-    // and rejected: it helps only when the pool is shared with another busy thread, and costs
-    // ~3.4% otherwise.
-    crate::threadpool::dispatch(|ith, nth| {
+    // join here and needs no special case. The threshold is 0 unless an embedder sets one, so
+    // this fans out at every size as it always has; a native gate here was measured once and
+    // rejected.
+    crate::threadpool::dispatch_work(m * n * k, |ith, nth| {
         // SAFETY: tile assignments are disjoint across `ith` values, so
         // writes through `c_addr` do not alias. Bounds were checked
         // above against the slice lengths.
