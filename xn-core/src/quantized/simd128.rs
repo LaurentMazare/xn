@@ -200,6 +200,9 @@ fn dot8_add(a: v128, b: v128, acc: v128) -> v128 {
 // Tile-size dispatch follows the cpp 16-register path used by the AVX
 // port; `v128` accumulators are 128-bit (4 f32 lanes), and engines that
 // lower wasm SIMD to SSE end up with the same 16-register budget.
+//
+// Any blocks are accepted. The 8-bit dot path needs `b` within `±127` (see
+// [`dot8_is_signed`]), so a `b` holding `-128` takes the 16-bit path.
 #[allow(clippy::too_many_arguments)]
 pub fn sgemm_q8_0_q8_0(
     m: usize,
@@ -234,6 +237,7 @@ pub fn sgemm_q8_0_q8_0(
     if c.len() < ldc * (n - 1) + m {
         crate::bail!("sgemm_q8_0_q8_0: c slice too small ({} < {})", c.len(), ldc * (n - 1) + m)
     }
+    let b_within_127 = b.iter().all(|blk| !blk.qs.contains(&i8::MIN));
     unsafe {
         sgemm_q8_0_q8_0_raw(
             m,
@@ -247,6 +251,7 @@ pub fn sgemm_q8_0_q8_0(
             ldc,
             ith,
             nth,
+            b_within_127,
         )
     };
     Ok(())
@@ -254,7 +259,8 @@ pub fn sgemm_q8_0_q8_0(
 
 /// Raw-pointer entry point for `sgemm_q8_0_q8_0` used by the parallel
 /// `BlockQ8_0::matmul` override. The caller is responsible for bounds and
-/// for ensuring different `ith` values write to disjoint output tiles.
+/// for ensuring different `ith` values write to disjoint output tiles, and
+/// says through `b_within_127` whether no value in `b` is `-128`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sgemm_q8_0_q8_0_raw(
     m: usize,
@@ -268,9 +274,10 @@ pub(crate) unsafe fn sgemm_q8_0_q8_0_raw(
     ldc: usize,
     ith: usize,
     nth: usize,
+    b_within_127: bool,
 ) {
     let blas = TinyBlasQ0Simd128 { k, a, lda, b, ldb, c, ldc, ith, nth };
-    unsafe { blas.matmul(m, n) };
+    unsafe { blas.matmul(m, n, b_within_127) };
 }
 
 struct TinyBlasQ0Simd128 {
@@ -287,8 +294,8 @@ struct TinyBlasQ0Simd128 {
 
 impl TinyBlasQ0Simd128 {
     #[inline]
-    unsafe fn matmul(&self, m: usize, n: usize) {
-        if dot8_is_signed() {
+    unsafe fn matmul(&self, m: usize, n: usize, b_within_127: bool) {
+        if b_within_127 && dot8_is_signed() {
             unsafe { self.mnpack::<true>(0, m, 0, n) }
         } else {
             unsafe { self.mnpack::<false>(0, m, 0, n) }
@@ -831,6 +838,43 @@ mod tests {
                     assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "8-bit: got {g}, want {w}");
                 }
             }
+        }
+    }
+
+    /// The largest pair sums the 8-bit path must take: `-128` weights against `±127`
+    /// activations in every lane.
+    #[test]
+    fn dot8_path_handles_extreme_pairs() {
+        if !dot8_is_signed() {
+            return;
+        }
+        let (m, n, kb) = (4, 4, 2);
+        let d = f16::from_f32(0.01);
+        let a = vec![BlockQ8_0 { d, qs: [-128; QK8_0] }; m * kb];
+        for v in [-127i8, 127] {
+            let b = vec![BlockQ8_0 { d, qs: [v; QK8_0] }; n * kb];
+            let want = reference(&a, &b, m, n, kb);
+            let mut got = vec![0f32; m * n];
+            sgemm_q8_0_q8_0(m, n, kb, &a, kb, &b, kb, &mut got, m, 0, 1).unwrap();
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "b={v}: got {g}, want {w}");
+            }
+        }
+    }
+
+    /// A `b` holding `-128` is outside what the 8-bit path supports, so the public entry
+    /// point must still be right for it.
+    #[test]
+    fn minus_128_in_b_is_still_correct() {
+        let (m, n, kb) = (4, 4, 2);
+        let d = f16::from_f32(0.01);
+        let a = vec![BlockQ8_0 { d, qs: [-128; QK8_0] }; m * kb];
+        let b = vec![BlockQ8_0 { d, qs: [-128; QK8_0] }; n * kb];
+        let want = reference(&a, &b, m, n, kb);
+        let mut got = vec![0f32; m * n];
+        sgemm_q8_0_q8_0(m, n, kb, &a, kb, &b, kb, &mut got, m, 0, 1).unwrap();
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "got {g}, want {w}");
         }
     }
 }
