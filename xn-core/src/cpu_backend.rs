@@ -226,16 +226,8 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        if let Some(dst) = as_f32_mut(&mut dst[..len]) {
-            match op {
-                UnaryOp::Elu { alpha } => return Ok(crate::simd128_math::elu_inplace(dst, alpha)),
-                UnaryOp::GeluErf => return Ok(crate::simd128_math::gelu_erf_inplace(dst)),
-                UnaryOp::Exp => return Ok(crate::simd128_math::exp_inplace(dst)),
-                UnaryOp::Silu => return Ok(crate::simd128_math::silu_inplace(dst)),
-                UnaryOp::Sigmoid => return Ok(crate::simd128_math::sigmoid_inplace(dst)),
-                _ => {}
-            }
+        if arch::unary_inplace(&mut dst[..len], op) {
+            return Ok(());
         }
         match op {
             UnaryOp::Cos => apply_inplace_unary(&mut dst[..len], |v| *v = v.cos()),
@@ -281,17 +273,8 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        // Four-lane `exp` on the wasm SIMD target, where the scalar one is a software routine.
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        if let (Some(dst), Some(src)) = (as_f32_mut(&mut dst[..len]), as_f32(&src[..len])) {
-            match op {
-                UnaryOp::Elu { alpha } => return Ok(crate::simd128_math::elu(dst, src, alpha)),
-                UnaryOp::GeluErf => return Ok(crate::simd128_math::gelu_erf(dst, src)),
-                UnaryOp::Exp => return Ok(crate::simd128_math::exp(dst, src)),
-                UnaryOp::Silu => return Ok(crate::simd128_math::silu(dst, src)),
-                UnaryOp::Sigmoid => return Ok(crate::simd128_math::sigmoid(dst, src)),
-                _ => {}
-            }
+        if arch::unary(&mut dst[..len], &src[..len], op) {
+            return Ok(());
         }
         match op {
             UnaryOp::Cos => apply_unary(&mut dst[..len], &src[..len], |s| s.cos()),
@@ -1654,22 +1637,6 @@ where
     }
 }
 
-/// `s` as `f32` when `T` is `f32`, else `None`.
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn as_f32<T: 'static>(s: &[T]) -> Option<&[f32]> {
-    (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>())
-        // SAFETY: `T` is `f32`; length and alignment carry over unchanged.
-        .then(|| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const f32, s.len()) })
-}
-
-/// `s` as `f32` when `T` is `f32`, else `None`.
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-fn as_f32_mut<T: 'static>(s: &mut [T]) -> Option<&mut [f32]> {
-    (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>())
-        // SAFETY: `T` is `f32`; length and alignment carry over unchanged.
-        .then(|| unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut f32, s.len()) })
-}
-
 /// Apply a unary operation: dst[i] = op(src[i])
 #[inline(always)]
 fn apply_unary<T: Copy + Send + Sync, F>(dst: &mut [T], src: &[T], f: F)
@@ -2076,4 +2043,53 @@ fn broadcast_binary_op<T: WithDType>(
     }
 
     Ok(())
+}
+
+mod arch {
+    //! Target-specific kernels for the CPU backend, behind one interface. Each function returns
+    //! whether it did the work; on a target without such a kernel it is a constant `false`, so the
+    //! backend itself carries no `cfg`. Only `f32` has kernels; other dtypes always get `false`.
+
+    use crate::UnaryOp;
+
+    // wasm32: `exp` and `erf` are software routines there, several nanoseconds per element.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    use crate::simd128_math as imp;
+
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    mod imp {
+        #[inline(always)]
+        pub fn unary_inplace(_: &mut [f32], _: crate::UnaryOp) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn unary(_: &mut [f32], _: &[f32], _: crate::UnaryOp) -> bool {
+            false
+        }
+    }
+
+    pub(super) fn unary_inplace<T: 'static>(dst: &mut [T], op: UnaryOp) -> bool {
+        as_f32_mut(dst).is_some_and(|dst| imp::unary_inplace(dst, op))
+    }
+
+    pub(super) fn unary<T: 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -> bool {
+        match (as_f32_mut(dst), as_f32(src)) {
+            (Some(dst), Some(src)) => imp::unary(dst, src, op),
+            _ => false,
+        }
+    }
+
+    /// `s` as `f32` when `T` is `f32`, else `None`.
+    fn as_f32<T: 'static>(s: &[T]) -> Option<&[f32]> {
+        (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>())
+            // SAFETY: `T` is `f32`; length and alignment carry over unchanged.
+            .then(|| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const f32, s.len()) })
+    }
+
+    /// `s` as `f32` when `T` is `f32`, else `None`.
+    fn as_f32_mut<T: 'static>(s: &mut [T]) -> Option<&mut [f32]> {
+        (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>())
+            // SAFETY: `T` is `f32`; length and alignment carry over unchanged.
+            .then(|| unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut f32, s.len()) })
+    }
 }

@@ -6,6 +6,7 @@
 //! produces: about a tenth of a frame in Chrome. `exp` here is a range reduction and a
 //! degree-6 polynomial (about 2 ulp); `erf` is Abramowitz-Stegun 7.1.26 (1.5e-7 absolute).
 
+use crate::UnaryOp;
 use core::arch::wasm32::*;
 
 const LOG2E: f32 = 1.442_695_04;
@@ -102,13 +103,6 @@ pub fn elu_inplace(dst: &mut [f32], alpha: f32) {
     })
 }
 
-/// [`elu_inplace`] from `src` into `dst`.
-pub fn elu(dst: &mut [f32], src: &[f32], alpha: f32) {
-    let n = dst.len().min(src.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    elu_inplace(&mut dst[..n], alpha)
-}
-
 /// `0.5 * x * (1 + erf(x / sqrt 2))`, in place.
 pub fn gelu_erf_inplace(dst: &mut [f32]) {
     let (half, one) = (f32x4_splat(0.5), f32x4_splat(1.0));
@@ -117,13 +111,6 @@ pub fn gelu_erf_inplace(dst: &mut [f32]) {
         let e = erf_f32x4(f32x4_mul(x, inv_sqrt2));
         f32x4_mul(f32x4_mul(x, half), f32x4_add(one, e))
     })
-}
-
-/// [`gelu_erf_inplace`] from `src` into `dst`.
-pub fn gelu_erf(dst: &mut [f32], src: &[f32]) {
-    let n = dst.len().min(src.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    gelu_erf_inplace(&mut dst[..n])
 }
 
 /// Lanes whose `exp` argument lies outside `[EXP_LO, EXP_HI]`, where [`exp_f32x4`] saturates.
@@ -170,13 +157,6 @@ pub fn exp_inplace(dst: &mut [f32]) {
     map_exact_inplace(dst, |x| x, exp_f32x4, f32::exp)
 }
 
-/// [`exp_inplace`] from `src` into `dst`.
-pub fn exp(dst: &mut [f32], src: &[f32]) {
-    let n = dst.len().min(src.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    exp_inplace(&mut dst[..n])
-}
-
 /// `x / (1 + exp(-x))`, in place, with the scalar formula where `-x` is past the clamp.
 pub fn silu_inplace(dst: &mut [f32]) {
     let one = f32x4_splat(1.0);
@@ -186,13 +166,6 @@ pub fn silu_inplace(dst: &mut [f32]) {
         |x| f32x4_div(x, f32x4_add(one, exp_f32x4(f32x4_neg(x)))),
         |x| x / (1.0 + (0.0 - x).exp()),
     )
-}
-
-/// [`silu_inplace`] from `src` into `dst`.
-pub fn silu(dst: &mut [f32], src: &[f32]) {
-    let n = dst.len().min(src.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    silu_inplace(&mut dst[..n])
 }
 
 /// `1 / (1 + exp(-x))`, in place, with the scalar formula where `-x` is past the clamp.
@@ -206,11 +179,28 @@ pub fn sigmoid_inplace(dst: &mut [f32]) {
     )
 }
 
-/// [`sigmoid_inplace`] from `src` into `dst`.
-pub fn sigmoid(dst: &mut [f32], src: &[f32]) {
-    let n = dst.len().min(src.len());
-    dst[..n].copy_from_slice(&src[..n]);
-    sigmoid_inplace(&mut dst[..n])
+/// Runs `op` in place when this module has a kernel for it, and says whether it did. This is
+/// the one list of supported ops.
+pub fn unary_inplace(dst: &mut [f32], op: UnaryOp) -> bool {
+    match op {
+        UnaryOp::Elu { alpha } => elu_inplace(dst, alpha),
+        UnaryOp::GeluErf => gelu_erf_inplace(dst),
+        UnaryOp::Exp => exp_inplace(dst),
+        UnaryOp::Silu => silu_inplace(dst),
+        UnaryOp::Sigmoid => sigmoid_inplace(dst),
+        _ => return false,
+    }
+    true
+}
+
+/// [`unary_inplace`] from `src` into `dst`, which must have the same length.
+pub fn unary(dst: &mut [f32], src: &[f32], op: UnaryOp) -> bool {
+    debug_assert_eq!(dst.len(), src.len());
+    // On an empty slice every kernel is a no-op, so this asks whether there is one.
+    unary_inplace(&mut [], op) && {
+        dst.copy_from_slice(src);
+        unary_inplace(dst, op)
+    }
 }
 
 #[cfg(test)]
@@ -245,21 +235,15 @@ mod tests {
         }
     }
 
-    /// `f` out of place and `f_inplace` must agree bit for bit, and both match `reference`.
-    fn check(
-        name: &str,
-        f: fn(&mut [f32], &[f32]),
-        f_inplace: fn(&mut [f32]),
-        reference: fn(f32) -> f32,
-        tol: f32,
-    ) {
+    /// `op` out of place and in place must agree bit for bit, and both match `reference`.
+    fn check(name: &str, op: UnaryOp, reference: fn(f32) -> f32, tol: f32) {
         let src = sweep();
         for len in [src.len(), src.len() - 1, src.len() - 2, src.len() - 3, 1, 5] {
             let src = &src[..len];
             let mut dst = vec![0f32; len];
-            f(&mut dst, src);
+            assert!(unary(&mut dst, src, op));
             let mut inplace = src.to_vec();
-            f_inplace(&mut inplace);
+            assert!(unary_inplace(&mut inplace, op));
             for (i, &x) in src.iter().enumerate() {
                 assert_matches(dst[i], reference(x), tol, &format!("{name}({x})"));
                 assert_eq!(
@@ -273,17 +257,41 @@ mod tests {
 
     #[test]
     fn exp_matches_the_scalar_reference() {
-        check("exp", exp, exp_inplace, f32::exp, 1e-6);
+        check("exp", UnaryOp::Exp, f32::exp, 1e-6);
     }
 
     #[test]
     fn silu_matches_the_scalar_reference() {
-        check("silu", silu, silu_inplace, |x| x / (1.0 + (0.0 - x).exp()), 1e-6);
+        check("silu", UnaryOp::Silu, |x| x / (1.0 + (0.0 - x).exp()), 1e-6);
     }
 
     #[test]
     fn sigmoid_matches_the_scalar_reference() {
-        check("sigmoid", sigmoid, sigmoid_inplace, |x| 1.0 / (1.0 + (0.0 - x).exp()), 1e-6);
+        check("sigmoid", UnaryOp::Sigmoid, |x| 1.0 / (1.0 + (0.0 - x).exp()), 1e-6);
+    }
+
+    /// ELU and GELU keep the polynomial past the clamp and use A-S 7.1.26 for `erf`, so they
+    /// are held to an absolute `tol` near zero rather than the relative one of [`check`].
+    #[test]
+    fn elu_and_gelu_are_dispatched() {
+        let elu_ref = |x: f32| if x > 0.0 { x } else { x.exp() - 1.0 };
+        let gelu_ref = |x: f32| x * 0.5 * (1.0 + libm::erff(x * core::f32::consts::FRAC_1_SQRT_2));
+        let ops: [(UnaryOp, fn(f32) -> f32, f32); 2] =
+            [(UnaryOp::Elu { alpha: 1.0 }, elu_ref, 2e-6), (UnaryOp::GeluErf, gelu_ref, 4e-7)];
+        let src = sweep();
+        for (op, reference, tol) in ops {
+            let mut dst = vec![0f32; src.len()];
+            assert!(unary(&mut dst, &src, op));
+            let mut inplace = src.clone();
+            assert!(unary_inplace(&mut inplace, op));
+            for ((&x, &got), &ip) in src.iter().zip(&dst).zip(&inplace) {
+                assert_eq!(got.to_bits(), ip.to_bits(), "{op:?}: in place differs at {x}");
+                let want = reference(x);
+                let close = (got - want).abs() <= tol * want.abs().max(1.0);
+                let ok = (got.is_nan() && want.is_nan()) || got == want || close;
+                assert!(ok, "{op:?}({x}): got {got}, want {want}");
+            }
+        }
     }
 
     /// Past the clamp every op is the scalar formula itself, so it matches to the bit: `exp`
@@ -296,15 +304,15 @@ mod tests {
         let exp_ref = |x: f32| x.exp();
         let silu_ref = |x: f32| x / (1.0 + (0.0 - x).exp());
         let sigmoid_ref = |x: f32| 1.0 / (1.0 + (0.0 - x).exp());
-        type Op = (&'static str, fn(&mut [f32], &[f32]), fn(f32) -> f32, fn(f32) -> f32);
+        type Op = (&'static str, UnaryOp, fn(f32) -> f32, fn(f32) -> f32);
         let ops: [Op; 3] = [
-            ("exp", exp, exp_ref, |x| x),
-            ("silu", silu, silu_ref, |x| -x),
-            ("sigmoid", sigmoid, sigmoid_ref, |x| -x),
+            ("exp", UnaryOp::Exp, exp_ref, |x| x),
+            ("silu", UnaryOp::Silu, silu_ref, |x| -x),
+            ("sigmoid", UnaryOp::Sigmoid, sigmoid_ref, |x| -x),
         ];
-        for (name, f, reference, arg) in ops {
+        for (name, op, reference, arg) in ops {
             let mut dst = vec![0f32; edges.len()];
-            f(&mut dst, &edges);
+            assert!(unary(&mut dst, &edges, op));
             for (&x, &got) in edges.iter().zip(&dst) {
                 let a = arg(x);
                 if !(EXP_LO..=EXP_HI).contains(&a) {
