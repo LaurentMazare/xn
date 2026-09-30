@@ -649,6 +649,7 @@ impl GgmlType for BlockQ8_0 {
             for &x in xs.iter() {
                 amax = amax.max(x.abs())
             }
+            // Scaled to `±127`, never `-128`: the wasm 8-bit dot path relies on it.
             let d = amax / ((1 << 7) - 1) as f32;
             let id = if d != 0f32 { 1. / d } else { 0. };
             ys.d = f16::from_f32(d);
@@ -824,6 +825,8 @@ unsafe fn sgemm_q8_0_tile(
             n,
             ith,
             nth,
+            // `lhs_b` comes from `BlockQ8_0::from_float`, which stays within `±127`.
+            true,
         );
     }
 }
