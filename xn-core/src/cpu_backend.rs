@@ -79,6 +79,21 @@ fn gemm_<T: WithDType>(
     let lhs = &lhs[lhs_o..];
     let rhs = &rhs[rhs_o..];
 
+    let layout = arch::Gemm {
+        m,
+        n,
+        k,
+        batch: lhs_b,
+        lhs_b_stride,
+        rhs_b_stride,
+        dst: (dst_cs, dst_rs),
+        lhs: (lhs_cs, lhs_rs),
+        rhs: (rhs_cs, rhs_rs),
+    };
+    if arch::gemm(dst, lhs, rhs, &layout) {
+        return Ok(());
+    }
+
     // Column stripes, run on xn's own pool rather than letting `gemm` reach for rayon.
     //
     // Two pools would otherwise both be live inside a decode step -- this one for the f32
@@ -1196,6 +1211,21 @@ impl crate::Backend for crate::CpuDevice {
         dilation: usize,
         groups: usize,
     ) -> Result<()> {
+        let shape = arch::Conv1d {
+            batch,
+            in_channels,
+            out_channels,
+            length,
+            out_length,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+        };
+        if arch::conv1d(dst, src, kernel, &shape) {
+            return Ok(());
+        }
         if USE_IM2COL_CONV1D && groups == 1 {
             // IM2COL approach: transform conv1d into matrix multiplication
             // 1. Im2Col: transform input [B, C, L] -> [B, L_out, C * K]
@@ -2052,18 +2082,107 @@ mod arch {
 
     use crate::UnaryOp;
 
-    // wasm32: `exp` and `erf` are software routines there, several nanoseconds per element.
+    /// A 1d convolution's shape, as the backend's `conv1d` receives it.
+    // Read only on targets with a kernel.
+    #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+    pub(super) struct Conv1d {
+        pub batch: usize,
+        pub in_channels: usize,
+        pub out_channels: usize,
+        pub length: usize,
+        pub out_length: usize,
+        pub kernel_size: usize,
+        pub stride: usize,
+        pub padding: usize,
+        pub dilation: usize,
+        pub groups: usize,
+    }
+
+    /// A batched matmul's layout, as the backend's `gemm_` receives it: `(col, row)` strides.
+    // Read only on targets with a kernel.
+    #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+    pub(super) struct Gemm {
+        pub m: usize,
+        pub n: usize,
+        pub k: usize,
+        pub batch: usize,
+        pub lhs_b_stride: usize,
+        pub rhs_b_stride: usize,
+        pub dst: (usize, usize),
+        pub lhs: (usize, usize),
+        pub rhs: (usize, usize),
+    }
+
+    // wasm32: `exp` and `erf` are software routines there, and at the Mimi decoder's shapes the
+    // gemm crate's packing, im2col and the transposes cost as much as the arithmetic.
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    use crate::simd128_math as imp;
+    mod imp {
+        use super::{Conv1d, Gemm};
+        use crate::simd128_conv as k;
+        pub use crate::simd128_math::{unary, unary_inplace};
+
+        /// Stride 1, no padding, one group: read the input in place, no im2col or transpose.
+        pub fn conv1d(dst: &mut [f32], src: &[f32], w: &[f32], s: &Conv1d) -> bool {
+            let span = (s.kernel_size.max(1) - 1) * s.dilation;
+            let fits = s.out_length == 0 || s.out_length - 1 + span < s.length;
+            if s.groups != 1 || s.stride != 1 || s.padding != 0 || s.kernel_size == 0 || !fits {
+                return false;
+            }
+            let (l_in, l_out) = (s.length, s.out_length);
+            k::conv1d(
+                dst,
+                src,
+                w,
+                s.batch,
+                s.in_channels,
+                s.out_channels,
+                l_in,
+                l_out,
+                s.kernel_size,
+                s.dilation,
+            );
+            true
+        }
+
+        /// Unit-stride products: `x @ W^T` on a row-major weight is a tile of dot products,
+        /// `x @ W` a broadcast tile, and neither packs anything. A strided `k` axis is refused.
+        pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
+            let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
+            if lhs_cs != 1 || dst_cs != 1 || (rhs_rs != 1 && rhs_cs != 1) {
+                return false;
+            }
+            let (m, n, kk) = (g.m, g.n, g.k);
+            for b in 0..g.batch {
+                let dst = &mut dst[b * m * n..(b + 1) * m * n];
+                let (lhs, rhs) = (&lhs[b * g.lhs_b_stride..], &rhs[b * g.rhs_b_stride..]);
+                if rhs_rs == 1 {
+                    k::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk);
+                } else {
+                    k::gemm_bcast_lhs(dst, dst_rs, lhs, lhs_rs, 1, rhs, rhs_rs, m, n, kk);
+                }
+            }
+            true
+        }
+    }
 
     #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
     mod imp {
+        use super::{Conv1d, Gemm};
+        use crate::UnaryOp;
         #[inline(always)]
-        pub fn unary_inplace(_: &mut [f32], _: crate::UnaryOp) -> bool {
+        pub fn unary_inplace(_: &mut [f32], _: UnaryOp) -> bool {
             false
         }
         #[inline(always)]
-        pub fn unary(_: &mut [f32], _: &[f32], _: crate::UnaryOp) -> bool {
+        pub fn unary(_: &mut [f32], _: &[f32], _: UnaryOp) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn gemm(_: &mut [f32], _: &[f32], _: &[f32], _: &Gemm) -> bool {
             false
         }
     }
@@ -2075,6 +2194,22 @@ mod arch {
     pub(super) fn unary<T: 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -> bool {
         match (as_f32_mut(dst), as_f32(src)) {
             (Some(dst), Some(src)) => imp::unary(dst, src, op),
+            _ => false,
+        }
+    }
+
+    pub(super) fn conv1d<T: 'static>(dst: &mut [T], src: &[T], w: &[T], s: &Conv1d) -> bool {
+        match (as_f32_mut(dst), as_f32(src), as_f32(w)) {
+            (Some(dst), Some(src), Some(w)) => imp::conv1d(dst, src, w, s),
+            _ => false,
+        }
+    }
+
+    /// Also the column matrix of `conv_transpose1d`, whose col2im path multiplies with a
+    /// row-major `[C_in, C_out * K]` weight: that is the broadcast kernel's case.
+    pub(super) fn gemm<T: 'static>(dst: &mut [T], lhs: &[T], rhs: &[T], g: &Gemm) -> bool {
+        match (as_f32_mut(dst), as_f32(lhs), as_f32(rhs)) {
+            (Some(dst), Some(lhs), Some(rhs)) => imp::gemm(dst, lhs, rhs, g),
             _ => false,
         }
     }
