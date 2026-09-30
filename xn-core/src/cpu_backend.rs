@@ -2150,21 +2150,17 @@ mod arch {
             true
         }
 
-        /// Unit-stride products: `x @ W^T` on a row-major weight, or `x @ W`.
+        /// `x @ W^T` on a row-major weight, both operands contiguous along `k`.
         pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
             let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
-            if lhs_cs != 1 || dst_cs != 1 || (rhs_rs != 1 && rhs_cs != 1) {
+            if lhs_cs != 1 || dst_cs != 1 || rhs_rs != 1 {
                 return false;
             }
             let (m, n, kk) = (g.m, g.n, g.k);
             for b in 0..g.batch {
                 let dst = &mut dst[b * m * n..(b + 1) * m * n];
                 let (lhs, rhs) = (&lhs[b * g.lhs_b_stride..], &rhs[b * g.rhs_b_stride..]);
-                if rhs_rs == 1 {
-                    k::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk);
-                } else {
-                    k::gemm_bcast_lhs(dst, dst_rs, lhs, lhs_rs, rhs, rhs_rs, m, n, kk);
-                }
+                k::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk);
             }
             true
         }
@@ -2210,8 +2206,6 @@ mod arch {
         }
     }
 
-    /// Also the column matrix of `conv_transpose1d`, whose col2im path multiplies with a
-    /// row-major `[C_in, C_out * K]` weight: that is the broadcast kernel's case.
     pub(super) fn gemm<T: 'static>(dst: &mut [T], lhs: &[T], rhs: &[T], g: &Gemm) -> bool {
         match (as_f32_mut(dst), as_f32(lhs), as_f32(rhs)) {
             (Some(dst), Some(lhs), Some(rhs)) => imp::gemm(dst, lhs, rhs, g),

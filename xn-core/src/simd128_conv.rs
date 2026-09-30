@@ -6,7 +6,6 @@
 //!
 //! * [`conv1d`] vectorizes over time: with stride 1 a tap's input samples are contiguous, the
 //!   weight is a broadcast, and the output row is written in place.
-//! * [`gemm_bcast_lhs`] is `x @ W` on a row-major weight.
 //! * [`gemm_dot`] is `x @ W^T` on a row-major weight.
 
 use crate::simd128_math::madd;
@@ -121,102 +120,6 @@ pub fn conv1d(
         }
     };
     crate::threadpool::par_units_by(batch * co * l_out * ci * k, co, 4, job);
-}
-
-/// `R` rows by `4 * V` columns of a broadcast-lhs product.
-///
-/// # Safety
-/// Each `lhs[r]` addresses `k` floats, `rhs` addresses `k` rows of at least `4 * V` floats
-/// `ld` apart, and each `out[r]` addresses `4 * V` floats.
-#[inline(always)]
-unsafe fn bcast_tile<const R: usize, const V: usize>(
-    lhs: [*const f32; R],
-    rhs: *const f32,
-    ld: usize,
-    k: usize,
-    out: [*mut f32; R],
-) {
-    unsafe {
-        let mut acc = [[f32x4_splat(0.0); V]; R];
-        for kk in 0..k {
-            let bp = rhs.add(kk * ld);
-            let mut bv = [f32x4_splat(0.0); V];
-            for v in 0..V {
-                bv[v] = v128_load(bp.add(4 * v) as *const v128);
-            }
-            for r in 0..R {
-                let s = v128_load32_splat(lhs[r].add(kk) as *const u32);
-                for v in 0..V {
-                    acc[r][v] = madd(s, bv[v], acc[r][v]);
-                }
-            }
-        }
-        for r in 0..R {
-            for v in 0..V {
-                v128_store(out[r].add(4 * v) as *mut v128, acc[r][v]);
-            }
-        }
-    }
-}
-
-/// `out[i, j] = sum_kk lhs[i * lhs_rs + kk] * rhs[kk * rhs_rs + j]`, `out[i, j]` at
-/// `out[i * out_rs + j]`. The left operand is only ever broadcast; the right one is read
-/// sixteen contiguous floats at a time.
-#[allow(clippy::too_many_arguments)]
-pub fn gemm_bcast_lhs(
-    out: &mut [f32],
-    out_rs: usize,
-    lhs: &[f32],
-    lhs_rs: usize,
-    rhs: &[f32],
-    rhs_rs: usize,
-    m: usize,
-    n: usize,
-    k: usize,
-) {
-    if m == 0 || n == 0 {
-        return;
-    }
-    assert!(rhs.len() >= (k.max(1) - 1) * rhs_rs + n);
-    assert!(out.len() >= (m - 1) * out_rs + n);
-    assert!(lhs.len() >= (m - 1) * lhs_rs + k);
-    let (o, l, r) = (out.as_mut_ptr() as usize, lhs.as_ptr() as usize, rhs.as_ptr() as usize);
-    // Output columns `[j_lo, j_hi)`.
-    let job = move |j_lo: usize, j_hi: usize| {
-        let (out, lhs, rhs) = (o as *mut f32, l as *const f32, r as *const f32);
-        // SAFETY: the bounds asserted above, and units write disjoint columns.
-        unsafe {
-            for j0 in (j_lo..j_hi).step_by(16) {
-                let width = (j_hi - j0).min(16);
-                let lp = |i: usize| lhs.add(i * lhs_rs);
-                let op = |i: usize| out.add(i * out_rs + j0);
-                let rp = rhs.add(j0);
-                for i0 in (0..m).step_by(4) {
-                    let rows = (m - i0).min(4);
-                    if rows == 4 && width == 16 {
-                        let (ls, os) = (from_fn(|t| lp(i0 + t)), from_fn(|t| op(i0 + t)));
-                        bcast_tile::<4, 4>(ls, rp, rhs_rs, k, os);
-                        continue;
-                    }
-                    for i in i0..i0 + rows {
-                        let mut j = 0;
-                        while j + 4 <= width {
-                            bcast_tile::<1, 1>([lp(i)], rp.add(j), rhs_rs, k, [op(i).add(j)]);
-                            j += 4;
-                        }
-                        for j in j..width {
-                            let mut s = 0f32;
-                            for kk in 0..k {
-                                s += *lp(i).add(kk) * *rp.add(kk * rhs_rs + j);
-                            }
-                            *op(i).add(j) = s;
-                        }
-                    }
-                }
-            }
-        }
-    };
-    crate::threadpool::par_units_by(m * n * k, n, 16, job);
 }
 
 /// `R` lhs rows against `C` rhs rows, `k` deep; writes `out[r][0..C]`.
