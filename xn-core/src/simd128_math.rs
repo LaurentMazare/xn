@@ -29,7 +29,7 @@ const ERF_A4: f32 = -1.453_152_027;
 const ERF_A5: f32 = 1.061_405_429;
 
 #[inline(always)]
-fn madd(a: v128, b: v128, c: v128) -> v128 {
+pub(crate) fn madd(a: v128, b: v128, c: v128) -> v128 {
     #[cfg(target_feature = "relaxed-simd")]
     {
         f32x4_relaxed_madd(a, b, c)

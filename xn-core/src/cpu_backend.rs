@@ -2163,7 +2163,7 @@ mod arch {
                 if rhs_rs == 1 {
                     k::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk);
                 } else {
-                    k::gemm_bcast_lhs(dst, dst_rs, lhs, lhs_rs, 1, rhs, rhs_rs, m, n, kk);
+                    k::gemm_bcast_lhs(dst, dst_rs, lhs, lhs_rs, rhs, rhs_rs, m, n, kk);
                 }
             }
             true

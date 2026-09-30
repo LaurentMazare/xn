@@ -6,22 +6,12 @@
 //!
 //! * [`conv1d`] vectorizes over time: with stride 1 a tap's input samples are contiguous, the
 //!   weight is a broadcast, and the output row is written in place.
-//! * [`gemm_bcast_lhs`] is `x @ W` with the left operand read through arbitrary strides.
+//! * [`gemm_bcast_lhs`] is `x @ W` on a row-major weight.
 //! * [`gemm_dot`] is `x @ W^T` on a row-major weight.
 
+use crate::simd128_math::madd;
 use core::arch::wasm32::*;
-
-#[inline(always)]
-fn madd(a: v128, b: v128, c: v128) -> v128 {
-    #[cfg(target_feature = "relaxed-simd")]
-    {
-        f32x4_relaxed_madd(a, b, c)
-    }
-    #[cfg(not(target_feature = "relaxed-simd"))]
-    {
-        f32x4_add(f32x4_mul(a, b), c)
-    }
-}
+use std::array::from_fn;
 
 /// `R` output channels by `4 * V` time steps of a stride-1 convolution.
 ///
@@ -64,77 +54,6 @@ unsafe fn conv_tile<const R: usize, const V: usize>(
     }
 }
 
-/// Output channels `[c_lo, c_hi)` of [`conv1d`].
-///
-/// # Safety
-/// The shape relations [`conv1d`] asserts.
-#[allow(clippy::too_many_arguments)]
-unsafe fn conv1d_channels(
-    dst: *mut f32,
-    src: *const f32,
-    w: *const f32,
-    batch: usize,
-    ci: usize,
-    co: usize,
-    l_in: usize,
-    l_out: usize,
-    k: usize,
-    dilation: usize,
-    c_lo: usize,
-    c_hi: usize,
-) {
-    unsafe {
-        for b in 0..batch {
-            let x = src.add(b * ci * l_in);
-            let y = dst.add(b * co * l_out);
-            // Time outermost so a 16-sample window of every input channel stays in L1 while the
-            // output channels sweep over it.
-            for l0 in (0..l_out).step_by(16) {
-                let width = (l_out - l0).min(16);
-                let xt = x.add(l0);
-                let wp = |c: usize| w.add(c * ci * k);
-                let op = |c: usize| y.add(c * l_out + l0);
-                for c0 in (c_lo..c_hi).step_by(4) {
-                    let rows = (c_hi - c0).min(4);
-                    if rows == 4 && width == 16 {
-                        let (ws, os) = (
-                            [wp(c0), wp(c0 + 1), wp(c0 + 2), wp(c0 + 3)],
-                            [op(c0), op(c0 + 1), op(c0 + 2), op(c0 + 3)],
-                        );
-                        conv_tile::<4, 4>(xt, l_in, ci, k, dilation, ws, os);
-                        continue;
-                    }
-                    for c in c0..c0 + rows {
-                        let mut l = 0;
-                        while l + 4 <= width {
-                            conv_tile::<1, 1>(
-                                xt.add(l),
-                                l_in,
-                                ci,
-                                k,
-                                dilation,
-                                [wp(c)],
-                                [op(c).add(l)],
-                            );
-                            l += 4;
-                        }
-                        for l in l..width {
-                            let mut s = 0f32;
-                            for cc in 0..ci {
-                                for t in 0..k {
-                                    s += *wp(c).add(cc * k + t)
-                                        * *xt.add(cc * l_in + l + t * dilation);
-                                }
-                            }
-                            *op(c).add(l) = s;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// `dst[b, co, l] = sum_{ci, t} w[co, ci, t] * src[b, ci, l + t * dilation]`; stride 1, no
 /// padding, one group. `src` is `[batch, ci, l_in]`, `w` is `[co, ci, k]`, `dst` is
 /// `[batch, co, l_out]`.
@@ -155,23 +74,51 @@ pub fn conv1d(
     assert!(w.len() >= co * ci * k);
     assert!(dst.len() >= batch * co * l_out);
     assert!(l_out == 0 || (l_out - 1) + (k - 1) * dilation < l_in);
-    let (d, s, w) = (dst.as_mut_ptr() as usize, src.as_ptr() as usize, w.as_ptr() as usize);
-    // SAFETY: the shapes asserted above bound every access, and units write disjoint channels.
-    let job = move |c_lo: usize, c_hi: usize| unsafe {
-        conv1d_channels(
-            d as *mut f32,
-            s as *const f32,
-            w as *const f32,
-            batch,
-            ci,
-            co,
-            l_in,
-            l_out,
-            k,
-            dilation,
-            c_lo,
-            c_hi,
-        )
+    let (d, s, wt) = (dst.as_mut_ptr() as usize, src.as_ptr() as usize, w.as_ptr() as usize);
+    // Output channels `[c_lo, c_hi)` of every batch element.
+    let job = move |c_lo: usize, c_hi: usize| {
+        let (dst, src, w) = (d as *mut f32, s as *const f32, wt as *const f32);
+        // SAFETY: the shapes asserted above bound every access, and units write disjoint channels.
+        unsafe {
+            for b in 0..batch {
+                let x = src.add(b * ci * l_in);
+                let y = dst.add(b * co * l_out);
+                // Time outermost so a 16-sample window of every input channel stays in L1 while
+                // the output channels sweep over it.
+                for l0 in (0..l_out).step_by(16) {
+                    let width = (l_out - l0).min(16);
+                    let xt = x.add(l0);
+                    let wp = |c: usize| w.add(c * ci * k);
+                    let op = |c: usize| y.add(c * l_out + l0);
+                    for c0 in (c_lo..c_hi).step_by(4) {
+                        let rows = (c_hi - c0).min(4);
+                        if rows == 4 && width == 16 {
+                            let (ws, os) = (from_fn(|r| wp(c0 + r)), from_fn(|r| op(c0 + r)));
+                            conv_tile::<4, 4>(xt, l_in, ci, k, dilation, ws, os);
+                            continue;
+                        }
+                        for c in c0..c0 + rows {
+                            let mut l = 0;
+                            while l + 4 <= width {
+                                let (ws, os) = ([wp(c)], [op(c).add(l)]);
+                                conv_tile::<1, 1>(xt.add(l), l_in, ci, k, dilation, ws, os);
+                                l += 4;
+                            }
+                            for l in l..width {
+                                let mut s = 0f32;
+                                for cc in 0..ci {
+                                    for t in 0..k {
+                                        s += *wp(c).add(cc * k + t)
+                                            * *xt.add(cc * l_in + l + t * dilation);
+                                    }
+                                }
+                                *op(c).add(l) = s;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     };
     crate::threadpool::par_units_by(batch * co * l_out * ci * k, co, 4, job);
 }
@@ -179,12 +126,11 @@ pub fn conv1d(
 /// `R` rows by `4 * V` columns of a broadcast-lhs product.
 ///
 /// # Safety
-/// Each `lhs[r]` addresses `k` values `lhs_cs` apart, `rhs` addresses `k` rows of at least
-/// `4 * V` floats `ld` apart, and each `out[r]` addresses `4 * V` floats.
+/// Each `lhs[r]` addresses `k` floats, `rhs` addresses `k` rows of at least `4 * V` floats
+/// `ld` apart, and each `out[r]` addresses `4 * V` floats.
 #[inline(always)]
 unsafe fn bcast_tile<const R: usize, const V: usize>(
     lhs: [*const f32; R],
-    lhs_cs: usize,
     rhs: *const f32,
     ld: usize,
     k: usize,
@@ -199,7 +145,7 @@ unsafe fn bcast_tile<const R: usize, const V: usize>(
                 bv[v] = v128_load(bp.add(4 * v) as *const v128);
             }
             for r in 0..R {
-                let s = v128_load32_splat(lhs[r].add(kk * lhs_cs) as *const u32);
+                let s = v128_load32_splat(lhs[r].add(kk) as *const u32);
                 for v in 0..V {
                     acc[r][v] = madd(s, bv[v], acc[r][v]);
                 }
@@ -213,62 +159,8 @@ unsafe fn bcast_tile<const R: usize, const V: usize>(
     }
 }
 
-/// Output columns `[j_lo, j_hi)` of [`gemm_bcast_lhs`].
-///
-/// # Safety
-/// The bounds [`gemm_bcast_lhs`] asserts.
-#[allow(clippy::too_many_arguments)]
-unsafe fn bcast_cols(
-    out: *mut f32,
-    out_rs: usize,
-    lhs: *const f32,
-    lhs_rs: usize,
-    lhs_cs: usize,
-    rhs: *const f32,
-    rhs_rs: usize,
-    m: usize,
-    k: usize,
-    j_lo: usize,
-    j_hi: usize,
-) {
-    unsafe {
-        for j0 in (j_lo..j_hi).step_by(16) {
-            let width = (j_hi - j0).min(16);
-            let lp = |i: usize| lhs.add(i * lhs_rs);
-            let op = |i: usize| out.add(i * out_rs + j0);
-            let rp = rhs.add(j0);
-            for i0 in (0..m).step_by(4) {
-                let rows = (m - i0).min(4);
-                if rows == 4 && width == 16 {
-                    let (ls, os) = (
-                        [lp(i0), lp(i0 + 1), lp(i0 + 2), lp(i0 + 3)],
-                        [op(i0), op(i0 + 1), op(i0 + 2), op(i0 + 3)],
-                    );
-                    bcast_tile::<4, 4>(ls, lhs_cs, rp, rhs_rs, k, os);
-                    continue;
-                }
-                for i in i0..i0 + rows {
-                    let mut j = 0;
-                    while j + 4 <= width {
-                        bcast_tile::<1, 1>([lp(i)], lhs_cs, rp.add(j), rhs_rs, k, [op(i).add(j)]);
-                        j += 4;
-                    }
-                    for j in j..width {
-                        let mut s = 0f32;
-                        for kk in 0..k {
-                            s += *lp(i).add(kk * lhs_cs) * *rp.add(kk * rhs_rs + j);
-                        }
-                        *op(i).add(j) = s;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// `out[i, j] = sum_kk lhs(i, kk) * rhs(kk, j)` with `lhs(i, kk)` at `lhs[i * lhs_rs + kk *
-/// lhs_cs]`, `rhs(kk, j)` at `rhs[kk * rhs_rs + j]` and `out[i, j]` at `out[i * out_rs + j]`.
-/// The left operand is only ever broadcast, so its layout is free; the right one is read
+/// `out[i, j] = sum_kk lhs[i * lhs_rs + kk] * rhs[kk * rhs_rs + j]`, `out[i, j]` at
+/// `out[i * out_rs + j]`. The left operand is only ever broadcast; the right one is read
 /// sixteen contiguous floats at a time.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_bcast_lhs(
@@ -276,7 +168,6 @@ pub fn gemm_bcast_lhs(
     out_rs: usize,
     lhs: &[f32],
     lhs_rs: usize,
-    lhs_cs: usize,
     rhs: &[f32],
     rhs_rs: usize,
     m: usize,
@@ -288,25 +179,42 @@ pub fn gemm_bcast_lhs(
     }
     assert!(rhs.len() >= (k.max(1) - 1) * rhs_rs + n);
     assert!(out.len() >= (m - 1) * out_rs + n);
-    if k > 0 {
-        assert!(lhs.len() > (m - 1) * lhs_rs + (k - 1) * lhs_cs);
-    }
+    assert!(lhs.len() >= (m - 1) * lhs_rs + k);
     let (o, l, r) = (out.as_mut_ptr() as usize, lhs.as_ptr() as usize, rhs.as_ptr() as usize);
-    // SAFETY: the bounds asserted above, and units write disjoint columns.
-    let job = move |j_lo: usize, j_hi: usize| unsafe {
-        bcast_cols(
-            o as *mut f32,
-            out_rs,
-            l as *const f32,
-            lhs_rs,
-            lhs_cs,
-            r as *const f32,
-            rhs_rs,
-            m,
-            k,
-            j_lo,
-            j_hi,
-        )
+    // Output columns `[j_lo, j_hi)`.
+    let job = move |j_lo: usize, j_hi: usize| {
+        let (out, lhs, rhs) = (o as *mut f32, l as *const f32, r as *const f32);
+        // SAFETY: the bounds asserted above, and units write disjoint columns.
+        unsafe {
+            for j0 in (j_lo..j_hi).step_by(16) {
+                let width = (j_hi - j0).min(16);
+                let lp = |i: usize| lhs.add(i * lhs_rs);
+                let op = |i: usize| out.add(i * out_rs + j0);
+                let rp = rhs.add(j0);
+                for i0 in (0..m).step_by(4) {
+                    let rows = (m - i0).min(4);
+                    if rows == 4 && width == 16 {
+                        let (ls, os) = (from_fn(|t| lp(i0 + t)), from_fn(|t| op(i0 + t)));
+                        bcast_tile::<4, 4>(ls, rp, rhs_rs, k, os);
+                        continue;
+                    }
+                    for i in i0..i0 + rows {
+                        let mut j = 0;
+                        while j + 4 <= width {
+                            bcast_tile::<1, 1>([lp(i)], rp.add(j), rhs_rs, k, [op(i).add(j)]);
+                            j += 4;
+                        }
+                        for j in j..width {
+                            let mut s = 0f32;
+                            for kk in 0..k {
+                                s += *lp(i).add(kk) * *rp.add(kk * rhs_rs + j);
+                            }
+                            *op(i).add(j) = s;
+                        }
+                    }
+                }
+            }
+        }
     };
     crate::threadpool::par_units_by(m * n * k, n, 16, job);
 }
@@ -353,70 +261,6 @@ unsafe fn dot_tile<const R: usize, const C: usize>(
     }
 }
 
-/// Output columns `[j_lo, j_hi)` of [`gemm_dot`].
-///
-/// # Safety
-/// The bounds [`gemm_dot`] asserts.
-#[allow(clippy::too_many_arguments)]
-unsafe fn dot_cols(
-    out: *mut f32,
-    out_rs: usize,
-    lhs: *const f32,
-    lhs_rs: usize,
-    rhs: *const f32,
-    rhs_cs: usize,
-    m: usize,
-    k: usize,
-    j_lo: usize,
-    j_hi: usize,
-) {
-    unsafe {
-        let lp = |i: usize| lhs.add(i * lhs_rs);
-        let rp = |j: usize| rhs.add(j * rhs_cs);
-        let op = |i: usize, j: usize| out.add(i * out_rs + j);
-        for i0 in (0..m).step_by(4) {
-            let rows = (m - i0).min(4);
-            let mut j = j_lo;
-            if rows == 4 {
-                while j + 4 <= j_hi {
-                    dot_tile::<4, 4>(
-                        [lp(i0), lp(i0 + 1), lp(i0 + 2), lp(i0 + 3)],
-                        [rp(j), rp(j + 1), rp(j + 2), rp(j + 3)],
-                        k,
-                        [op(i0, j), op(i0 + 1, j), op(i0 + 2, j), op(i0 + 3, j)],
-                    );
-                    j += 4;
-                }
-            }
-            // Leftover rows and columns: one row against eight columns, then single ones.
-            for i in i0..i0 + rows {
-                let mut j = j;
-                while j + 8 <= j_hi {
-                    dot_tile::<1, 8>(
-                        [lp(i)],
-                        [
-                            rp(j),
-                            rp(j + 1),
-                            rp(j + 2),
-                            rp(j + 3),
-                            rp(j + 4),
-                            rp(j + 5),
-                            rp(j + 6),
-                            rp(j + 7),
-                        ],
-                        k,
-                        [op(i, j)],
-                    );
-                    j += 8;
-                }
-                for j in j..j_hi {
-                    dot_tile::<1, 1>([lp(i)], [rp(j)], k, [op(i, j)]);
-                }
-            }
-        }
-    }
-}
-
 /// `out[i, j] = sum_kk lhs[i * lhs_rs + kk] * rhs[j * rhs_cs + kk]`, `out[i, j]` at
 /// `out[i * out_rs + j]`: both operands contiguous along `k`, as `x @ W^T` on a row-major
 /// weight is.
@@ -439,20 +283,37 @@ pub fn gemm_dot(
     assert!(lhs.len() >= (m - 1) * lhs_rs + k);
     assert!(rhs.len() >= (n - 1) * rhs_cs + k);
     let (o, l, r) = (out.as_mut_ptr() as usize, lhs.as_ptr() as usize, rhs.as_ptr() as usize);
-    // SAFETY: the bounds asserted above, and units write disjoint columns.
-    let job = move |j_lo: usize, j_hi: usize| unsafe {
-        dot_cols(
-            o as *mut f32,
-            out_rs,
-            l as *const f32,
-            lhs_rs,
-            r as *const f32,
-            rhs_cs,
-            m,
-            k,
-            j_lo,
-            j_hi,
-        )
+    // Output columns `[j_lo, j_hi)`.
+    let job = move |j_lo: usize, j_hi: usize| {
+        let (out, lhs, rhs) = (o as *mut f32, l as *const f32, r as *const f32);
+        // SAFETY: the bounds asserted above, and units write disjoint columns.
+        unsafe {
+            let lp = |i: usize| lhs.add(i * lhs_rs);
+            let rp = |j: usize| rhs.add(j * rhs_cs);
+            let op = |i: usize, j: usize| out.add(i * out_rs + j);
+            for i0 in (0..m).step_by(4) {
+                let rows = (m - i0).min(4);
+                let mut j = j_lo;
+                if rows == 4 {
+                    while j + 4 <= j_hi {
+                        let (ls, rs) = (from_fn(|t| lp(i0 + t)), from_fn(|c| rp(j + c)));
+                        dot_tile::<4, 4>(ls, rs, k, from_fn(|t| op(i0 + t, j)));
+                        j += 4;
+                    }
+                }
+                // Leftover rows and columns: one row against eight columns, then single ones.
+                for i in i0..i0 + rows {
+                    let mut j = j;
+                    while j + 8 <= j_hi {
+                        dot_tile::<1, 8>([lp(i)], from_fn(|c| rp(j + c)), k, [op(i, j)]);
+                        j += 8;
+                    }
+                    for j in j..j_hi {
+                        dot_tile::<1, 1>([lp(i)], [rp(j)], k, [op(i, j)]);
+                    }
+                }
+            }
+        }
     };
     crate::threadpool::par_units_by(m * n * k, n, 32, job);
 }
