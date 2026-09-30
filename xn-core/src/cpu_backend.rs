@@ -2093,7 +2093,6 @@ mod arch {
     use crate::UnaryOp;
 
     /// A 1d convolution's shape, as the backend's `conv1d` receives it.
-    // Read only on targets with a kernel.
     #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
     pub(super) struct Conv1d {
         pub batch: usize,
@@ -2109,7 +2108,6 @@ mod arch {
     }
 
     /// A batched matmul's layout, as the backend's `gemm_` receives it: `(col, row)` strides.
-    // Read only on targets with a kernel.
     #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
     pub(super) struct Gemm {
         pub m: usize,
@@ -2123,8 +2121,6 @@ mod arch {
         pub rhs: (usize, usize),
     }
 
-    // wasm32: `exp` and `erf` are software routines there, and at the Mimi decoder's shapes the
-    // gemm crate's packing, im2col and the transposes cost as much as the arithmetic.
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     mod imp {
         use super::{Conv1d, Gemm};
@@ -2154,8 +2150,7 @@ mod arch {
             true
         }
 
-        /// Unit-stride products: `x @ W^T` on a row-major weight is a tile of dot products,
-        /// `x @ W` a broadcast tile, and neither packs anything. A strided `k` axis is refused.
+        /// Unit-stride products: `x @ W^T` on a row-major weight, or `x @ W`.
         pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
             let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
             if lhs_cs != 1 || dst_cs != 1 || (rhs_rs != 1 && rhs_cs != 1) {

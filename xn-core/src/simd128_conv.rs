@@ -1,17 +1,13 @@
 //! Direct convolution and gemm kernels for the wasm SIMD target.
 //!
-//! The generic path turns a `conv1d` into im2col, a packed gemm and a transpose, and a
-//! `conv_transpose1d` into a transpose, a packed gemm and col2im; in V8 the gemm crate's
-//! 12-accumulator microkernel plus that packing reached 26-46 GMAC/s at the Mimi decoder's
-//! shapes, where a plain 4x16 fmla tile reaches 52. These kernels read the operands where
-//! they are, with a 4x16 register tile (16 accumulators: an ARM engine gives a wasm function
-//! 32 vector registers) and a narrow tile for the rows and columns left over.
+//! The generic path turns a `conv1d` into im2col, a packed gemm and a transpose. These
+//! kernels read the operands where they are, with a 4x16 register tile and a narrow tile for
+//! the rows and columns left over.
 //!
 //! * [`conv1d`] vectorizes over time: with stride 1 a tap's input samples are contiguous, the
 //!   weight is a broadcast, and the output row is written in place.
-//! * [`gemm_bcast_lhs`] is `x @ W` with the left operand read through arbitrary strides,
-//!   which is also a transposed convolution's column matrix.
-//! * [`gemm_dot`] is `x @ W^T` on a row-major weight, the layout every `Linear` holds.
+//! * [`gemm_bcast_lhs`] is `x @ W` with the left operand read through arbitrary strides.
+//! * [`gemm_dot`] is `x @ W^T` on a row-major weight.
 
 use core::arch::wasm32::*;
 
@@ -159,8 +155,6 @@ pub fn conv1d(
     assert!(w.len() >= co * ci * k);
     assert!(dst.len() >= batch * co * l_out);
     assert!(l_out == 0 || (l_out - 1) + (k - 1) * dilation < l_in);
-    // Units of four output channels, handed out on demand so a fast core absorbs more of
-    // them than a slow one; each unit re-reads the shared input window, which is small.
     let (d, s, w) = (dst.as_mut_ptr() as usize, src.as_ptr() as usize, w.as_ptr() as usize);
     // SAFETY: the shapes asserted above bound every access, and units write disjoint channels.
     let job = move |c_lo: usize, c_hi: usize| unsafe {
@@ -297,8 +291,6 @@ pub fn gemm_bcast_lhs(
     if k > 0 {
         assert!(lhs.len() > (m - 1) * lhs_rs + (k - 1) * lhs_cs);
     }
-    // Column blocks of sixteen are the unit: each owns disjoint output columns and
-    // streams its own slice of the right operand.
     let (o, l, r) = (out.as_mut_ptr() as usize, lhs.as_ptr() as usize, rhs.as_ptr() as usize);
     // SAFETY: the bounds asserted above, and units write disjoint columns.
     let job = move |j_lo: usize, j_hi: usize| unsafe {
@@ -396,8 +388,7 @@ unsafe fn dot_cols(
                     j += 4;
                 }
             }
-            // Leftover rows, and leftover columns of a full row block: one row against eight
-            // columns keeps eight accumulators in flight, then single dot products.
+            // Leftover rows and columns: one row against eight columns, then single ones.
             for i in i0..i0 + rows {
                 let mut j = j;
                 while j + 8 <= j_hi {
@@ -447,9 +438,6 @@ pub fn gemm_dot(
     assert!(out.len() >= (m - 1) * out_rs + n);
     assert!(lhs.len() >= (m - 1) * lhs_rs + k);
     assert!(rhs.len() >= (n - 1) * rhs_cs + k);
-    // Units of 32 output columns: each streams its own rows of the right operand (the
-    // weight) and writes disjoint columns, enough of them to balance a fast core against a
-    // slow one.
     let (o, l, r) = (out.as_mut_ptr() as usize, lhs.as_ptr() as usize, rhs.as_ptr() as usize);
     // SAFETY: the bounds asserted above, and units write disjoint columns.
     let job = move |j_lo: usize, j_hi: usize| unsafe {

@@ -1,10 +1,9 @@
 //! Four-lane `exp` and `erf` for the wasm SIMD target, and the ELU, GELU, SiLU and sigmoid
 //! built on them.
 //!
-//! On wasm32 the scalar `f32::exp` and `libm::erff` are software routines costing several
-//! nanoseconds per element, and the Mimi decoder applies ELU to every activation it
-//! produces: about a tenth of a frame in Chrome. `exp` here is a range reduction and a
-//! degree-6 polynomial (about 2 ulp); `erf` is Abramowitz-Stegun 7.1.26 (1.5e-7 absolute).
+//! On wasm32 the scalar `f32::exp` and `libm::erff` are software routines. `exp` here is a
+//! range reduction and a degree-6 polynomial (about 2 ulp); `erf` is Abramowitz-Stegun 7.1.26
+//! (1.5e-7 absolute).
 
 use crate::UnaryOp;
 use core::arch::wasm32::*;

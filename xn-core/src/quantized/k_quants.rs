@@ -748,8 +748,7 @@ fn matmul_q8_0_sgemm(
     let c_addr = dst.as_mut_ptr() as usize;
     // A single-participant pool runs the closure inline, so a one-worker build still pays no
     // join here and needs no special case. The threshold is 0 unless an embedder sets one, so
-    // this fans out at every size as it always has; a native gate here was measured once and
-    // rejected.
+    // this fans out at every size as it always has.
     crate::threadpool::dispatch_work(m * n * k, |ith, nth| {
         // SAFETY: tile assignments are disjoint across `ith` values, so
         // writes through `c_addr` do not alias. Bounds were checked
