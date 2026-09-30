@@ -220,3 +220,116 @@ pub fn gemm_dot(
     };
     crate::threadpool::par_units_by(m * n * k, n, 32, job);
 }
+
+#[cfg(test)]
+mod tests {
+    //! Run under wasmtime: `cargo test -p xn --lib --target wasm32-wasip1 -- simd128` with
+    //! `-C target-feature=+simd128`. Shapes are chosen to hit every tile and tail branch.
+    use super::*;
+
+    fn data(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{what}[{i}]: got {g}, want {w}");
+        }
+    }
+
+    #[test]
+    fn conv1d_matches_the_scalar_reference() {
+        for batch in [1, 2] {
+            for (ci, co) in [(1, 1), (3, 5), (5, 4), (2, 17)] {
+                for (k, dilation) in [(1, 1), (3, 1), (3, 2), (7, 1)] {
+                    for l_out in [1, 5, 16, 17, 33, 48] {
+                        let l_in = l_out + (k - 1) * dilation;
+                        let x = data(batch * ci * l_in, 1);
+                        let w = data(co * ci * k, 2);
+                        let mut got = vec![0f32; batch * co * l_out];
+                        conv1d(&mut got, &x, &w, batch, ci, co, l_in, l_out, k, dilation);
+                        let mut want = vec![0f32; batch * co * l_out];
+                        for b in 0..batch {
+                            for o in 0..co {
+                                for l in 0..l_out {
+                                    let mut acc = 0f32;
+                                    for c in 0..ci {
+                                        for t in 0..k {
+                                            acc += w[o * ci * k + c * k + t]
+                                                * x[b * ci * l_in + c * l_in + l + t * dilation];
+                                        }
+                                    }
+                                    want[b * co * l_out + o * l_out + l] = acc;
+                                }
+                            }
+                        }
+                        assert_close(
+                            &got,
+                            &want,
+                            &format!("conv {batch}x{ci}->{co} k{k} d{dilation} L{l_out}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gemm_dot_matches_the_scalar_reference() {
+        // `k == 0` writes zeros; `k % 4 != 0` exercises the scalar tail of each dot product.
+        for (m, n, k) in [
+            (3, 5, 0),
+            (1, 1, 1),
+            (1, 8, 4),
+            (1, 9, 5),
+            (3, 3, 3),
+            (4, 4, 4),
+            (5, 7, 6),
+            (4, 17, 33),
+            (16, 12, 7),
+            (9, 40, 16),
+        ] {
+            let lhs = data(m * k, 5);
+            let rhs = data(n * k, 6);
+            let mut got = vec![0f32; m * n];
+            gemm_dot(&mut got, n, &lhs, k, &rhs, k, m, n, k);
+            let mut want = vec![0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    want[i * n + j] = (0..k).map(|t| lhs[i * k + t] * rhs[j * k + t]).sum();
+                }
+            }
+            assert_close(&got, &want, &format!("dot {m}x{n}x{k}"));
+        }
+    }
+
+    /// A batched input against one 2-D weight, through the backend: the weight's batch
+    /// stride is 0, which the kernels only see from `gemm_`.
+    #[test]
+    fn batched_matmul_with_a_broadcast_weight() {
+        use crate::{CPU, CpuDevice, Tensor};
+        let (batch, m, n, k) = (3, 5, 20, 9);
+        let (xv, wv) = (data(batch * m * k, 7), data(n * k, 8));
+        let x = Tensor::<f32, CpuDevice>::from_vec(xv.clone(), (batch, m, k), &CPU).unwrap();
+        let w = Tensor::<f32, CpuDevice>::from_vec(wv.clone(), (n, k), &CPU).unwrap();
+        let got = x.matmul_t(&w).unwrap().to_vec().unwrap();
+        let mut want = vec![0f32; batch * m * n];
+        for b in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    let x_row = &xv[(b * m + i) * k..(b * m + i + 1) * k];
+                    let w_row = &wv[j * k..(j + 1) * k];
+                    want[(b * m + i) * n + j] = x_row.iter().zip(w_row).map(|(a, c)| a * c).sum();
+                }
+            }
+        }
+        assert_close(&got, &want, "batched matmul_t");
+    }
+}
