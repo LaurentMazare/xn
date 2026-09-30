@@ -127,8 +127,12 @@ fn new_shared() -> &'static Shared {
 ///
 /// Asked rather than assumed, by spawning one and looking at the result: `std::thread` exists
 /// on every target, but on some -- a wasm build for the browser, say -- it cannot start one
-/// and says so. The probe costs one thread, once.
+/// and says so. The probe costs one thread, once, and only on wasm.
 fn can_spawn_threads() -> bool {
+    // Only wasm has targets where `std::thread` exists but cannot start one.
+    if !cfg!(target_family = "wasm") {
+        return true;
+    }
     static CAN: OnceLock<bool> = OnceLock::new();
     *CAN.get_or_init(|| std::thread::Builder::new().name("xn-probe".into()).spawn(|| {}).is_ok())
 }
@@ -159,15 +163,25 @@ fn pool() -> Option<&'static Pool> {
     }))
 }
 
-/// Build the pool on threads the caller provides, rather than on `std::thread`s of its own,
-/// which is how a target that cannot spawn any gets one.
+/// Build the pool on threads the caller provides, rather than on `std::thread`s of its own.
 ///
-/// `spawn` must put each job on a thread of its own and let it run forever: a worker never
-/// returns, so whatever `spawn` draws on is committed to this pool. With `rayon::spawn` that
-/// is rayon's threads, and nothing may go through rayon afterwards, including this module's
-/// own fallback. The calling thread is participant 0 and must be one that may block.
+/// This is how an embedder that owns its threads, or a target that cannot spawn any, gets a
+/// pool: a wasm build in a browser has no `std::thread`, but the page can hand over Web
+/// Workers through a runtime that schedules them.
 ///
-/// Returns the pool's width, `workers + 1`; a second call is a no-op returning it.
+/// `spawn` must run each job on a thread of its own and let it run for the life of the
+/// process: a worker never returns, so a `spawn` that queues onto a bounded executor needs
+/// room for all `workers` of them at once, or the first dispatch waits forever for the ones
+/// that never started. The calling thread is participant 0, and it must be a thread that may
+/// block, since a dispatch can wait on a mutex.
+///
+/// Whatever `spawn` draws on is then committed to this pool for good. With `rayon::spawn`
+/// that is rayon's threads, so nothing else may be put through rayon afterwards: a
+/// `par_iter` would queue behind workers that never finish. That includes this module's own
+/// fallback, which is why an embedder starts the pool before the first operator runs.
+///
+/// Returns the pool's width, `workers + 1`. A second call is a no-op returning the width the
+/// first one built, so the threads and the configuration are whatever it chose.
 pub fn start_pool_with(
     cfg: PoolConfig,
     spawn: impl Fn(Box<dyn FnOnce() + Send + 'static>),
@@ -249,7 +263,8 @@ static MIN_PARALLEL_WORK: AtomicUsize = AtomicUsize::new(0);
 /// pool's own dispatch costs microseconds, so once it is running every size is worth
 /// splitting; it is the fallback path, a rayon fork/join, that can cost far more than a small
 /// operator takes. An embedder on such a runtime sets this, and lowers it once its pool is
-/// running.
+/// running. Helpers that are not told the work (`par_chunks_mut`, `par_chunks_zip`,
+/// `par_range`) count output elements, which understates operators that do more per element.
 pub fn set_min_parallel_work(work: usize) {
     MIN_PARALLEL_WORK.store(work, Ordering::Relaxed);
 }
@@ -548,4 +563,46 @@ pub fn par_range<F: Fn(usize) + Sync>(n: usize, f: F) {
         return;
     }
     par_units(n, f);
+}
+
+#[cfg(test)]
+mod tests {
+    /// The pool decides at run time whether it can build itself, so a target without threads
+    /// takes the same code path as `XN_THREADPOOL=0` rather than a compiled-out one.
+    #[test]
+    fn the_pool_is_there_when_the_platform_has_threads() {
+        // Only one direction is a fact everywhere: a target with threads must find them.
+        // Some wasm targets have them (wasip1-threads, Emscripten) and some do not.
+        if !cfg!(target_family = "wasm") {
+            assert!(super::can_spawn_threads());
+        }
+        assert_eq!(super::pool().is_some(), super::can_spawn_threads() && super::use_own_threads());
+        // With the pool off (`XN_THREADPOOL=0`) the width is rayon's, not the pool's.
+        if let Some(pool) = super::pool() {
+            assert_eq!(super::size(), pool.size);
+        }
+    }
+
+    /// Below the threshold an operator runs on the calling thread, above it on the pool.
+    #[test]
+    fn work_below_the_threshold_does_not_fan_out() {
+        // The threshold is process-wide, so put it back even if an assertion below fails.
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::set_min_parallel_work(0);
+            }
+        }
+        let _restore = Restore;
+        super::set_min_parallel_work(1 << 20);
+        assert_eq!(super::threads_for(1), 1);
+        assert_eq!(super::threads_for(1 << 20), super::size());
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        super::dispatch_work(1, |_, nth| {
+            seen.store(nth, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+        super::set_min_parallel_work(0);
+        assert_eq!(super::threads_for(1), super::size());
+    }
 }
