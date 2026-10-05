@@ -1426,19 +1426,10 @@ impl crate::Backend for crate::CpuDevice {
         output_padding: usize,
         groups: usize,
     ) -> Result<()> {
-        // COL2IM approach can be used when:
-        // - groups == 1
-        // - padding == 0
-        // - output_padding == 0
-        let can_use_col2im = groups == 1 && padding == 0 && output_padding == 0;
-
-        if USE_COL2IM_CONV1D_TR && can_use_col2im {
-            // COL2IM approach: matmul + col2im transformation
-            // 1. Matmul: [B, L_in, C_in] @ [C_in, C_out * K] -> [B, L_in, C_out * K]
-            // 2. Col2Im: [B, L_in, C_out, K] -> [B, C_out, L_out]
-
-            // The gemm reads the input [B, C_in, L_in] transposed through its strides rather
-            // than through a copy.
+        if USE_COL2IM_CONV1D_TR && groups == 1 {
+            // [B, L_in, C_in] @ [C_in, C_out * K] -> [B, L_in, C_out * K], then col2im
+            // overlap-adds the taps into [B, C_out, L_out]. The input is [B, C_in, L_in]; the
+            // gemm reads it transposed through its strides rather than through a copy.
             let n = out_channels * kernel_size;
             // SAFETY: the gemm writes every element.
             let mut col = unsafe { Self::alloc_uninit(batch * length * n, &crate::CPU)? };
@@ -1456,15 +1447,10 @@ impl crate::Backend for crate::CpuDevice {
                 (length, 1),
                 (1, n),
             )?;
-
-            // Step 2: Col2Im transformation
-            // col is [B, L_in, C_out * K] = [B, L_in, C_out, K]
-            // output is [B, C_out, L_out]
-            col2im1d(dst, &col, batch, length, out_channels, kernel_size, stride);
-
+            col2im1d(dst, &col, length, out_channels, kernel_size, stride, padding, out_length);
             Ok(())
         } else {
-            // Fallback: original implementation for grouped convolutions or with padding
+            // Fallback for grouped convolutions.
             conv_transpose1d_direct(
                 dst,
                 src,
@@ -1915,43 +1901,76 @@ fn conv1d_direct<T: WithDTypeF>(
     Ok(())
 }
 
-/// Col2Im transformation for 1D transposed convolution.
-/// Transforms col from [B, L_in, C_out, K] to output [B, C_out, L_out].
-/// Following the reference implementation closely.
+/// Col2im for [`crate::CpuDevice::conv_transpose1d`]: overlap-adds `col`, laid out as
+/// `[B, L_in, C_out, K]`, into the output `[B, C_out, L_out]`.
+///
+/// Input position `l` and tap `k` land on output `l * stride + k - padding`; taps that fall
+/// outside `0..L_out` are cropped, and output positions no tap reaches stay zero.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 fn col2im1d<T: WithDTypeF>(
     dst: &mut [T],
     col: &[T],
-    _b_size: usize,
     l_in: usize,
     c_out: usize,
     k_size: usize,
     stride: usize,
+    padding: usize,
+    l_out: usize,
 ) {
-    let l_out = (l_in - 1) * stride + k_size;
-
-    // Strides for source [B, L_in, C_out, K] stored as [B, L_in, C_out * K]
-    let (src_s0, src_s1, src_s2) = (c_out * k_size * l_in, c_out * k_size, k_size);
-
-    // Each (b, c) pair owns a contiguous l_out-sized slice of dst, so the accumulation can
-    // run in parallel over those slices with contiguous reads from col.
-    let accumulate = |bc: usize, dst: &mut [T]| {
-        let b_i = bc / c_out;
-        let c_i = bc % c_out;
+    // A block of output rows, (b, c) pairs, starting at row `r0`. The loop runs over input
+    // positions outside and rows inside: col is then read front to back, and a row is added
+    // to again only a block's worth of rows later. With the rows inside, consecutive adds
+    // would each wait on the store of the one before, since their spans overlap.
+    let accumulate = |r0: usize, dst: &mut [T]| {
         dst.fill(T::zero());
-        for l_in_i in 0..l_in {
-            let src_base = b_i * src_s0 + l_in_i * src_s1 + c_i * src_s2;
-            let dst_base = l_in_i * stride;
-            for k_i in 0..k_size {
-                dst[dst_base + k_i] += col[src_base + k_i];
+        let rows = dst.len() / l_out;
+        let mut done = 0;
+        while done < rows {
+            // The rows left in this batch entry: consecutive channels, whose taps for one input
+            // position sit next to each other in col.
+            let (b_i, c_i) = ((r0 + done) / c_out, (r0 + done) % c_out);
+            let n = (c_out - c_i).min(rows - done);
+            let block = &mut dst[done * l_out..(done + n) * l_out];
+            for l_in_i in 0..l_in {
+                let start = (l_in_i * stride) as isize - padding as isize;
+                let k0 = start.min(0).unsigned_abs().min(k_size);
+                let k1 = (l_out as isize - start).clamp(k0 as isize, k_size as isize) as usize;
+                if k0 == k1 {
+                    continue;
+                }
+                let o = start.wrapping_add_unsigned(k0) as usize;
+                let base = ((b_i * l_in + l_in_i) * c_out + c_i) * k_size;
+                let taps = col[base..base + n * k_size].chunks_exact(k_size);
+                for (row, taps) in block.chunks_exact_mut(l_out).zip(taps) {
+                    add_assign(&mut row[o..o + k1 - k0], &taps[k0..k1]);
+                }
             }
+            done += n;
         }
     };
+    let rows = dst.len() / l_out.max(1);
     if use_parallelism(dst.len().max(col.len())) {
-        crate::threadpool::par_chunks_mut(dst, l_out, |bc, dst| accumulate(bc, dst));
-    } else {
-        dst.chunks_mut(l_out).enumerate().for_each(|(bc, dst)| accumulate(bc, dst));
+        let per = rows.div_ceil(crate::threadpool::size());
+        crate::threadpool::par_chunks_mut(dst, per * l_out, |i, dst| accumulate(i * per, dst));
+    } else if rows > 0 {
+        accumulate(0, dst);
+    }
+}
+
+/// `dst += src`, elementwise, in fixed blocks of four so that even a short span is added
+/// with vector instructions.
+#[inline(always)]
+fn add_assign<T: WithDType>(dst: &mut [T], src: &[T]) {
+    let (dst4, dst_tail) = dst.as_chunks_mut::<4>();
+    let (src4, src_tail) = src.as_chunks::<4>();
+    for (d, s) in dst4.iter_mut().zip(src4) {
+        for i in 0..4 {
+            d[i] += s[i];
+        }
+    }
+    for (d, s) in dst_tail.iter_mut().zip(src_tail) {
+        *d += *s;
     }
 }
 
