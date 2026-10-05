@@ -24,8 +24,9 @@ fn main() {
 }
 
 /// Compile the vendored KleidiAI kernels in `third_party/kleidiai` and set `xn_kai`, on the
-/// targets that can run them: AArch64 on Apple platforms, Linux and Android. Anywhere else the
-/// feature compiles nothing and `quantized::kai` does not exist.
+/// targets that can run them: AArch64 on Apple platforms, Linux and Android. Anywhere else, or
+/// with a C toolchain that cannot build them, the feature compiles nothing and
+/// `quantized::kai` does not exist.
 ///
 /// The flags are the ones KleidiAI's own CMake uses. The packing routines are plain NEON. The
 /// kernels' C wrappers refuse to build without SVE2, and their SME2 code is `.inst`-encoded,
@@ -52,23 +53,33 @@ fn build_kai() {
         b
     };
 
-    build(&["-march=armv8-a"])
+    let packing = build(&["-march=armv8-a"])
         .file(pack.join("kai_lhs_quant_pack_qai8dxp_f32.c"))
         .file(pack.join("kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c"))
-        .compile("xn_kai_pack");
+        .try_compile("xn_kai_pack");
 
     let kernels = [
         "kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa",
         "kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme2_dot",
     ];
-    build(&["-march=armv8.2-a+sve+sve2", "-fno-tree-vectorize", "-fno-tree-slp-vectorize"])
-        .file(root.join("kai/kai_common_sme_asm.S"))
-        .files(
-            kernels.iter().flat_map(|k| [q8.join(format!("{k}.c")), q8.join(format!("{k}_asm.S"))]),
-        )
-        .compile("xn_kai_sme2");
+    let sme2 =
+        build(&["-march=armv8.2-a+sve+sve2", "-fno-tree-vectorize", "-fno-tree-slp-vectorize"])
+            .file(root.join("kai/kai_common_sme_asm.S"))
+            .files(
+                kernels
+                    .iter()
+                    .flat_map(|k| [q8.join(format!("{k}.c")), q8.join(format!("{k}_asm.S"))]),
+            )
+            .try_compile("xn_kai_sme2");
 
-    println!("cargo:rustc-cfg=xn_kai");
+    // A C toolchain too old for SVE2 turns the feature off with a warning rather than failing
+    // the build, so the feature does nothing there, as on any other unsupported target.
+    match packing.and(sme2) {
+        Ok(()) => println!("cargo:rustc-cfg=xn_kai"),
+        Err(e) => println!(
+            "cargo:warning=kai: the KleidiAI kernels did not build, so the feature is off: {e}"
+        ),
+    }
 }
 
 /// Compile every `vulkan-kernels/*.comp` GLSL compute shader to SPIR-V using

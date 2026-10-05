@@ -347,7 +347,7 @@ impl Q8_0Kai {
     }
 
     /// `dst = lhs x self^T` for `m` activation rows, in one kernel call.
-    #[tracing::instrument(name = "q-matmul-kai", skip_all, fields(m, n = self.n, k = self.k))]
+    #[tracing::instrument(name = "q-matmul-kai", skip_all, fields(m = m, n = self.n, k = self.k))]
     fn matmul(&self, m: usize, lhs: &[f32], dst: &mut [f32]) {
         let (gemm, gemv) = kernels();
         let kern = if m == 1 { gemv } else { gemm };
@@ -410,8 +410,9 @@ impl super::QuantizedType for Q8_0Kai {
         self.n * self.k / QK8_0 * std::mem::size_of::<BlockQ8_0>()
     }
 
-    /// The packed layout, valid for `size` bytes, not for
-    /// `storage_size_in_bytes`.
+    /// The packed layout, valid for `size` bytes only. Unlike the other storages, this is not
+    /// `storage_size_in_bytes` long, and for `k > 192` it is shorter, so reading that many bytes
+    /// from here reads past the end. `raw_data` gives the `q8_0` bytes.
     fn as_ptr(&self) -> *const u8 {
         self.packed.as_ptr()
     }
@@ -437,6 +438,9 @@ impl super::QuantizedType for Q8_0Kai {
     }
 
     fn from_float(&mut self, xs: &[f32]) -> Result<()> {
+        if xs.len() != self.n * self.k {
+            crate::bail!("kai: {} values for a [{}, {}] weight", xs.len(), self.n, self.k)
+        }
         let mut blocks = vec![BlockQ8_0::zeros(); xs.len() / QK8_0];
         BlockQ8_0::from_float(xs, &mut blocks)?;
         *self = Self::from_q8_0(&blocks, self.n, self.k)?;

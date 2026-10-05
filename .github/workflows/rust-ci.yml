@@ -24,6 +24,9 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: check
+      # Builds the KleidiAI kernels on the arm64 macOS runner, and nothing on x86.
+      - name: Check the kai feature
+        run: cargo check -p xn --features kai
 
   test:
     name: Test Suite
@@ -56,6 +59,27 @@ jobs:
         run: |
           rustup component add clippy
           cargo clippy -p xn --features kai --all-targets -- -D warnings
+
+  # The only place CI builds the kai feature with gcc and runs its Linux SME2 check. The runner
+  # has no SME2, so the kernels themselves do not run.
+  kai-linux-arm64:
+    name: kai on Linux arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      # xn-gemm's f16 kernels need fp16, which generic aarch64 Linux does not assume.
+      RUSTFLAGS: -C target-feature=+fp16
+    steps:
+      - uses: actions/checkout@v2
+      - name: Remove local cargo config
+        run: rm -f .cargo/config.toml
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: rustup component add clippy
+      - run: cargo test -p xn --features kai
+      - run: cargo clippy -p xn --features kai --all-targets -- -D warnings
 
   fmt:
     name: Rustfmt
