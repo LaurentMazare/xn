@@ -2,8 +2,9 @@
 //!
 //! The arithmetic is f32 multiply-adds like the NEON path's, so the results differ from it
 //! only by the order of the sums. Both operands are packed into KleidiAI's layout on every
-//! call, into buffers kept per thread. Used when [`crate::quantized::kai::active`] holds and
-//! `accelerate` is off, which already runs f32 matmuls on the same unit.
+//! call, into buffers kept per thread. Used when [`crate::quantized::kai::active`] holds. With
+//! `accelerate` on, Accelerate takes the f32 matmuls it supports, and only the layouts it
+//! hands back to the generic gemm reach this.
 //!
 //! A one-row matmul stays on the NEON path: it reads each weight once, so packing the weight
 //! first would cost as much as the matmul itself.
@@ -93,6 +94,8 @@ enum Rhs {
     NxK(usize),
 }
 
+/// Packed operands, reused across calls. Each buffer keeps the size of the largest matmul its
+/// thread has run, for the life of the thread.
 #[derive(Default)]
 struct Scratch {
     lhs: Vec<f32>,
@@ -149,6 +152,10 @@ pub(crate) fn gemm(
         };
     let dst_end = (batch - 1) * m * n + (m - 1) * dst_rs + n;
     if lhs.len() < lhs_end || rhs.len() < rhs_end || dst.len() < dst_end || dst_rs < n {
+        return false;
+    }
+    // Batches of `dst` are `m * n` apart, so padded rows would run into the next batch.
+    if batch > 1 && dst_rs != n {
         return false;
     }
 
@@ -234,8 +241,11 @@ pub(crate) fn gemm(
                     dst.as_mut_ptr().add(b * m * n).cast(),
                     dst_rs * f,
                     f,
-                    f32::NEG_INFINITY,
-                    f32::INFINITY,
+                    // The kernel clamps with `fclamp`, which keeps the number when one side is
+                    // NaN. NaN bounds therefore clamp nothing, and a NaN result stays NaN;
+                    // infinite bounds would turn it into -inf.
+                    f32::NAN,
+                    f32::NAN,
                 );
             }
         }
@@ -341,6 +351,22 @@ mod tests {
         }
     }
 
+    /// A NaN in a row of the lhs gives NaN in that row of the output, as on the NEON path,
+    /// and leaves the other rows alone.
+    #[test]
+    fn keeps_nan() {
+        let (m, n, k) = (4, 40, 8);
+        let mut lhs = vec![1f32; m * k];
+        lhs[0] = f32::NAN;
+        let rhs = vec![1f32; k * n];
+        let mut dst = vec![0f32; m * n];
+        if !gemm(&mut dst, &lhs, &rhs, (m, n, k), 1, (0, 0), (1, n), (1, k), (1, n)) {
+            return;
+        }
+        assert!(dst[..n].iter().all(|x| x.is_nan()), "{:?}", &dst[..n]);
+        assert!(dst[n..].iter().all(|&x| x == k as f32));
+    }
+
     #[test]
     fn declines_what_it_does_not_take() {
         let (lhs, rhs, mut dst) = (vec![1f32; 64], vec![1f32; 64], vec![0f32; 64]);
@@ -353,6 +379,8 @@ mod tests {
         assert!(!run(&mut dst, 4, (2, 8), (1, 4), (1, 4)));
         // A dst too short for the rows.
         assert!(!run(&mut dst[..10], 4, (1, 4), (1, 4), (1, 4)));
+        // Padded dst rows in a batch.
+        assert!(!gemm(&mut dst, &lhs, &rhs, (4, 4, 4), 2, (16, 0), (1, 5), (1, 4), (1, 4)));
         assert!(!dst.iter().any(|&x| x != 0.0));
     }
 }
