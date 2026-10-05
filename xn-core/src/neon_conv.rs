@@ -340,4 +340,81 @@ mod tests {
         assert_eq!(takes(64, 32, 1922, 1920), cfg!(not(feature = "accelerate")));
         assert_eq!(takes(512, 512, 22, 16), cfg!(not(feature = "accelerate")));
     }
+
+    /// Times every convolution of a streaming decoder frame, direct against im2col and a gemm,
+    /// through the backend. Run it alone, at a fixed thread count:
+    /// `RAYON_NUM_THREADS=1 cargo test -p xn --release --lib conv1d_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn conv1d_bench() {
+        use crate::backend::Backend;
+        use std::time::Instant;
+        // (ci, co, k, l_out)
+        let shapes = [
+            (32, 512, 1, 1),
+            (32, 512, 1, 2),
+            (32, 512, 1, 4),
+            (32, 512, 1, 8),
+            (32, 512, 1, 16),
+            (512, 512, 7, 4),
+            (512, 512, 7, 8),
+            (512, 512, 7, 16),
+            (256, 128, 3, 96),
+            (128, 256, 1, 96),
+            (128, 64, 3, 480),
+            (64, 128, 1, 480),
+            (64, 32, 3, 1920),
+            (32, 64, 1, 1920),
+            (64, 1, 3, 1920),
+            (64, 2, 3, 1920),
+            (64, 4, 3, 1920),
+            (64, 8, 3, 1920),
+            (64, 16, 3, 1920),
+        ];
+        println!("threads {}", crate::threadpool::size());
+        println!("microseconds, best and median of 40; ratio is im2col over direct, best of each");
+        println!("{:>16} {:>7} {:>15} {:>15} {:>6}", "shape", "MMAC", "direct", "im2col", "ratio");
+        for (ci, co, k, l_out) in shapes {
+            let l_in = l_out + k - 1;
+            let (x, w) = (data(ci * l_in, 7), data(co * ci * k, 8));
+            let mut y = vec![0f32; co * l_out];
+            let mut run = |path: u8| {
+                FORCE.set(path);
+                CpuDevice::conv1d(&mut y, &x, &w, 1, ci, co, l_in, l_out, k, 1, 0, 1, 1).unwrap();
+            };
+            let macs = ci * co * k * l_out;
+            // About 2 ms a sample.
+            let reps = (2_000_000_000 / (macs * 10).max(1)).clamp(1, 2000);
+            let mut times = [vec![], vec![]];
+            for round in 0..41 {
+                for i in 0..2 {
+                    let path = if round % 2 == 0 { i } else { 1 - i };
+                    let t = Instant::now();
+                    for _ in 0..reps {
+                        run(path as u8 + 1);
+                    }
+                    if round > 0 {
+                        times[path].push(t.elapsed().as_secs_f64() * 1e6 / reps as f64);
+                    }
+                }
+            }
+            let best = |v: &mut Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (v[0], v[v.len() / 2])
+            };
+            let (d, d_med) = best(&mut times[0]);
+            let (i, i_med) = best(&mut times[1]);
+            println!(
+                "{:>16} {:>7.2} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>6.2}",
+                format!("{ci}->{co} k{k} L{l_out}"),
+                macs as f64 / 1e6,
+                d,
+                d_med,
+                i,
+                i_med,
+                i / d
+            );
+        }
+        FORCE.set(0);
+    }
 }
