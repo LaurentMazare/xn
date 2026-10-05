@@ -11,6 +11,8 @@ pub mod inplace_ops;
 pub mod models;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub(crate) mod neon_conv;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(crate) mod neon_gemm;
 pub mod nn;
 pub mod ops;
 pub mod quantized;

@@ -719,6 +719,9 @@ impl crate::Backend for crate::CpuDevice {
         (lhs_cs, lhs_rs): (usize, usize),
         (rhs_cs, rhs_rs): (usize, usize),
     ) -> Result<()> {
+        // Accelerate comes before the target kernels of `gemm_`, even for one row: it runs on
+        // the matrix unit, which beats the direct `x @ W^T` kernel at every shape but the
+        // tiniest. Only the layouts it cannot take reach them.
         let lhs = &lhs[lhs_o..];
         let rhs = &rhs[rhs_o..];
         let (lda, transa) = if (rhs_cs == 1 || n == 1) && (rhs_rs == n || k == 1) {
@@ -2211,7 +2214,13 @@ mod arch {
     }
 
     /// A batched matmul's layout, as the backend's `gemm_` receives it: `(col, row)` strides.
-    #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(
+            target_arch = "aarch64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )),
+        allow(dead_code)
+    )]
     pub(super) struct Gemm {
         pub m: usize,
         pub n: usize,
@@ -2301,9 +2310,23 @@ mod arch {
             true
         }
 
-        #[inline(always)]
-        pub fn gemm(_: &mut [f32], _: &[f32], _: &[f32], _: &Gemm) -> bool {
-            false
+        /// `x @ W^T` on a row-major weight, both operands contiguous along `k`, for up to
+        /// `MAX_ROWS` rows. Skipping the packing pays for a handful of rows; past a few dozen,
+        /// xn-gemm's packed kernel, which loads fewer operands per multiply-add, catches up and
+        /// then wins.
+        pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
+            const MAX_ROWS: usize = 64;
+            let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
+            if lhs_cs != 1 || dst_cs != 1 || rhs_rs != 1 || g.m > MAX_ROWS {
+                return false;
+            }
+            let (m, n, kk) = (g.m, g.n, g.k);
+            for b in 0..g.batch {
+                let dst = &mut dst[b * m * n..(b + 1) * m * n];
+                let (lhs, rhs) = (&lhs[b * g.lhs_b_stride..], &rhs[b * g.rhs_b_stride..]);
+                crate::neon_gemm::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk);
+            }
+            true
         }
     }
 
@@ -2383,3 +2406,4 @@ mod arch {
             .then(|| unsafe { std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut f32, s.len()) })
     }
 }
+
