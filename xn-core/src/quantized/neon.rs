@@ -41,12 +41,15 @@ unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
     acc
 }
 
+/// `sdot` without dotprod, with the same lanes: lane `i` holds the products of bytes
+/// `4i..4i + 4`. The callers here sum all four lanes, so only the total matters to them today,
+/// but the lanes match the instruction so that a caller that reads one gets the right value.
 #[cfg(not(all(target_arch = "aarch64", target_feature = "dotprod")))]
 #[inline(always)]
 unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
     let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
     let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
-    vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
+    vpaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
 }
 
 // Ternary `acc + dot(a, b)` form, matching the 3-arg `vdotq_s32(acc, a, b)`
