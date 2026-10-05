@@ -1,5 +1,5 @@
-//! Four-lane `exp` and `erf`, and the ELU, GELU, SiLU and sigmoid built on them, for the
-//! targets with 128-bit SIMD: wasm `simd128` and aarch64 NEON.
+//! Four-lane `exp` and `erf`, and the ELU, GELU, SiLU, sigmoid and softmax built on them, for
+//! the targets with 128-bit SIMD: wasm `simd128` and aarch64 NEON.
 //!
 //! The scalar `f32::exp` and `libm::erff` cost a call per element, and on wasm32 they are
 //! software routines. `exp` here is a range reduction and a degree-6 polynomial (about 2 ulp);
@@ -33,6 +33,8 @@ const EXP_LO: f32 = -87.336_54;
 // Below `127.5 * ln 2`, so `round(x * LOG2E)` never reaches 128, whose exponent field would
 // read as infinity. Inputs above it saturate near 1.65e38.
 const EXP_HI: f32 = 88.0;
+// `exp` of anything below this is under half the smallest subnormal, so it rounds to zero.
+const EXP_ZERO: f32 = -104.0;
 const ERF_P: f32 = 0.327_591_1;
 const ERF_A1: f32 = 0.254_829_6;
 const ERF_A2: f32 = -0.284_496_72;
@@ -64,6 +66,8 @@ pub(crate) trait F32x4: Copy {
     fn madd(a: Self, b: Self, c: Self) -> Self;
     /// Clamped to `[lo, hi]`, with NaN left as NaN.
     fn clamp(self, lo: Self, hi: Self) -> Self;
+    /// The larger of each pair of lanes. With a NaN it may return either.
+    fn max(self, b: Self) -> Self;
     /// Rounded to the nearest integer, ties to even.
     fn round(self) -> Self;
     /// `2^n` for integral lanes `n` in `[-126, 127]`, built directly in the exponent field.
@@ -73,10 +77,16 @@ pub(crate) trait F32x4: Copy {
     fn gt(self, b: Self) -> Self::Mask;
     fn lt(self, b: Self) -> Self::Mask;
     fn or_mask(a: Self::Mask, b: Self::Mask) -> Self::Mask;
+    /// `a & !b`.
+    fn and_not(a: Self::Mask, b: Self::Mask) -> Self::Mask;
     fn any(m: Self::Mask) -> bool;
     fn mask_lanes(m: Self::Mask) -> [bool; 4];
     /// `a` where `m` is set, else `b`.
     fn select(m: Self::Mask, a: Self, b: Self) -> Self;
+    /// The largest lane. With a NaN it may return either.
+    fn reduce_max(self) -> f32;
+    /// `(l0 + l1) + (l2 + l3)`.
+    fn reduce_sum(self) -> f32;
 }
 
 #[inline(always)]
@@ -262,6 +272,70 @@ pub fn unary_inplace(dst: &mut [f32], op: UnaryOp) -> bool {
 /// [`unary_inplace`] from `src` into `dst`, which must have the same length.
 pub fn unary(dst: &mut [f32], src: &[f32], op: UnaryOp) -> bool {
     run(dst, Some(src), op)
+}
+
+/// `exp(a)` for a softmax's arguments, which are at most zero or NaN. Below `EXP_ZERO`, which
+/// takes in the `-inf` of a masked position, it is zero, as the scalar `exp` is; the rare lanes
+/// between that and the clamp take the scalar `f32::exp`.
+#[inline(always)]
+fn exp_nonpositive(a: Lanes) -> Lanes {
+    let y = exp(a);
+    let low = a.lt(splat(EXP_LO));
+    if !Lanes::any(low) {
+        return y;
+    }
+    let zero = a.lt(splat(EXP_ZERO));
+    exact(a, Lanes::select(zero, splat(0.0), y), Lanes::and_not(low, zero), f32::exp)
+}
+
+/// One softmax row, `dst = exp(src - max) / sum`, with `dst` and `src` of the same length.
+/// Always does the work.
+///
+/// The exponentials are summed in four lanes, which are then added pairwise, and the tail after
+/// them, so a row's sum depends only on its contents. Masked (`-inf`) positions come out as
+/// exactly zero.
+pub fn softmax_row(dst: &mut [f32], src: &[f32]) -> bool {
+    assert_eq!(dst.len(), src.len());
+    let (chunks, tail) = src.as_chunks::<4>();
+    let mut m = splat(f32::NEG_INFINITY);
+    for c in chunks {
+        // SAFETY: a chunk is four floats.
+        m = m.max(unsafe { Lanes::load(c.as_ptr()) });
+    }
+    let max = tail.iter().fold(m.reduce_max(), |m, &v| m.max(v));
+
+    let shift = splat(max);
+    let exp_shifted = |x: Lanes| exp_nonpositive(x.sub(shift));
+    let (dst_chunks, dst_tail) = dst.as_chunks_mut::<4>();
+    let mut acc = splat(0.0);
+    for (d, s) in dst_chunks.iter_mut().zip(chunks) {
+        // SAFETY: each chunk is four floats.
+        let e = exp_shifted(unsafe { Lanes::load(s.as_ptr()) });
+        unsafe { e.store(d.as_mut_ptr()) };
+        acc = acc.add(e);
+    }
+    let mut sum = acc.reduce_sum();
+    if !tail.is_empty() {
+        // Padded with `max`, an argument of zero, so the unused lanes stay off the scalar path.
+        let mut buf = [max; 4];
+        buf[..tail.len()].copy_from_slice(tail);
+        // SAFETY: the buffer is four floats.
+        unsafe { exp_shifted(Lanes::load(buf.as_ptr())).store(buf.as_mut_ptr()) };
+        for (d, &e) in dst_tail.iter_mut().zip(&buf) {
+            *d = e;
+            sum += e;
+        }
+    }
+
+    let s = splat(sum);
+    for d in dst_chunks {
+        // SAFETY: a chunk is four floats.
+        unsafe { Lanes::load(d.as_ptr()).div(s).store(d.as_mut_ptr()) };
+    }
+    for d in dst_tail {
+        *d /= sum;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -556,5 +630,85 @@ mod tests {
             assert!(abs <= max_abs, "{name}: abs error {abs:e} at {abs_at:e}");
         }
         eprint!("{report}");
+    }
+
+    /// The scalar softmax, in `f64` after the shift by the maximum, which is in `f32` like
+    /// the backend's: rounding `x - max` moves `exp` far more than any of the kernel's error.
+    fn softmax_ref(src: &[f32]) -> Vec<f64> {
+        let max = src.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+        let e: Vec<f64> = src.iter().map(|&v| ((v - max) as f64).exp()).collect();
+        let sum: f64 = e.iter().sum();
+        e.iter().map(|v| v / sum).collect()
+    }
+
+    fn xorshift(seed: &mut u32) -> f32 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 17;
+        *seed ^= *seed << 5;
+        *seed as f32 / u32::MAX as f32
+    }
+
+    /// Rows of every length up to a few vectors and some longer, with and without masked
+    /// (`-inf`) positions: within a few ulp of the exact softmax, exactly zero where masked.
+    #[test]
+    fn softmax_rows() {
+        let mut seed = 0x2545_f491u32;
+        let lens = (1..=19).chain([31, 32, 33, 64, 65, 250, 266, 1000]);
+        for len in lens {
+            for (masked, scale) in [(false, 4.0), (true, 4.0), (false, 400.0), (true, 400.0)] {
+                let mut src: Vec<f32> =
+                    (0..len).map(|_| (xorshift(&mut seed) - 0.5) * scale).collect();
+                if masked {
+                    // Mask a run at the end, as a causal mask does, and a scattered few.
+                    for v in src.iter_mut().skip(len / 2 + 1) {
+                        *v = f32::NEG_INFINITY;
+                    }
+                    for i in (0..len).step_by(5).skip(1) {
+                        src[i] = f32::NEG_INFINITY;
+                    }
+                }
+                let mut dst = vec![f32::NAN; len];
+                assert!(softmax_row(&mut dst, &src));
+                let want = softmax_ref(&src);
+                for (i, ((&g, &w), &x)) in dst.iter().zip(&want).zip(&src).enumerate() {
+                    if x == f32::NEG_INFINITY {
+                        assert_eq!(g.to_bits(), 0, "len {len}: masked {i} is {g:e}");
+                    }
+                    let err = (g as f64 - w).abs();
+                    assert!(
+                        err <= 4e-7 * w + 1e-44,
+                        "len {len} masked {masked} scale {scale} [{i}]: got {g:e}, want {w:e}"
+                    );
+                }
+                let total: f64 = dst.iter().map(|&v| v as f64).sum();
+                assert!((total - 1.0).abs() < 1e-5, "len {len}: row sums to {total}");
+            }
+        }
+    }
+
+    /// The degenerate rows give what the scalar softmax gives: one finite entry among masked
+    /// ones is a one-hot, an all-masked row is NaN, and so is a row holding a NaN.
+    #[test]
+    fn softmax_degenerate_rows() {
+        let ninf = f32::NEG_INFINITY;
+        for len in [1, 3, 4, 5, 9] {
+            for hot in 0..len {
+                let mut src = vec![ninf; len];
+                src[hot] = -3.0;
+                let mut dst = vec![f32::NAN; len];
+                assert!(softmax_row(&mut dst, &src));
+                for (i, &g) in dst.iter().enumerate() {
+                    assert_eq!(g, if i == hot { 1.0 } else { 0.0 }, "len {len} hot {hot}");
+                }
+                let mut nan = vec![0.5f32; len];
+                nan[hot] = f32::NAN;
+                assert!(softmax_row(&mut dst, &nan));
+                assert!(dst.iter().all(|v| v.is_nan()), "len {len}: NaN at {hot} gave {dst:?}");
+            }
+            let mut dst = vec![0f32; len];
+            assert!(softmax_row(&mut dst, &vec![ninf; len]));
+            assert!(dst.iter().all(|v| v.is_nan()), "len {len}: all masked gave {dst:?}");
+        }
+        assert!(softmax_row(&mut [], &[]));
     }
 }

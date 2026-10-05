@@ -54,6 +54,10 @@ impl F32x4 for float32x4_t {
         unsafe { vminq_f32(vmaxq_f32(self, lo), hi) }
     }
     #[inline(always)]
+    fn max(self, b: Self) -> Self {
+        unsafe { vmaxq_f32(self, b) }
+    }
+    #[inline(always)]
     fn round(self) -> Self {
         unsafe { vrndnq_f32(self) }
     }
@@ -84,6 +88,10 @@ impl F32x4 for float32x4_t {
         unsafe { vorrq_u32(a, b) }
     }
     #[inline(always)]
+    fn and_not(a: Self::Mask, b: Self::Mask) -> Self::Mask {
+        unsafe { vbicq_u32(a, b) }
+    }
+    #[inline(always)]
     fn any(m: Self::Mask) -> bool {
         unsafe { vmaxvq_u32(m) != 0 }
     }
@@ -101,5 +109,16 @@ impl F32x4 for float32x4_t {
     #[inline(always)]
     fn select(m: Self::Mask, a: Self, b: Self) -> Self {
         unsafe { vbslq_f32(m, a, b) }
+    }
+    #[inline(always)]
+    fn reduce_max(self) -> f32 {
+        unsafe { vmaxvq_f32(self) }
+    }
+    #[inline(always)]
+    fn reduce_sum(self) -> f32 {
+        unsafe {
+            // Two pairwise adds: `(l0 + l1) + (l2 + l3)`.
+            vaddvq_f32(self)
+        }
     }
 }

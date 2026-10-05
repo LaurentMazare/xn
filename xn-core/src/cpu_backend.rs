@@ -1008,6 +1008,9 @@ impl crate::Backend for crate::CpuDevice {
         // autoregressive decode a row is a single short attention vector, and the fork/join
         // cost dominates the handful of exps it saves.
         let softmax_row = |src: &[T], dst: &mut [T]| {
+            if arch::softmax_row(dst, src) {
+                return;
+            }
             let mut max = T::neg_infinity();
             for &v in src.iter() {
                 max = T::max(v, max)
@@ -2155,7 +2158,7 @@ mod arch {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     mod imp {
         use super::{Conv1d, Gemm};
-        pub use crate::simd_math::{unary, unary_inplace};
+        pub use crate::simd_math::{softmax_row, unary, unary_inplace};
         use crate::simd128_conv as k;
 
         /// Stride 1, no padding, one group: read the input in place, no im2col or transpose.
@@ -2200,7 +2203,7 @@ mod arch {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     mod imp {
         use super::{Conv1d, Gemm};
-        pub use crate::simd_math::{unary, unary_inplace};
+        pub use crate::simd_math::{softmax_row, unary, unary_inplace};
         #[inline(always)]
         pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
             false
@@ -2227,6 +2230,10 @@ mod arch {
             false
         }
         #[inline(always)]
+        pub fn softmax_row(_: &mut [f32], _: &[f32]) -> bool {
+            false
+        }
+        #[inline(always)]
         pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
             false
         }
@@ -2243,6 +2250,14 @@ mod arch {
     pub(super) fn unary<T: 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -> bool {
         match (as_f32_mut(dst), as_f32(src)) {
             (Some(dst), Some(src)) => imp::unary(dst, src, op),
+            _ => false,
+        }
+    }
+
+    /// One row of a softmax over the last dimension.
+    pub(super) fn softmax_row<T: 'static>(dst: &mut [T], src: &[T]) -> bool {
+        match (as_f32_mut(dst), as_f32(src)) {
+            (Some(dst), Some(src)) => imp::softmax_row(dst, src),
             _ => false,
         }
     }

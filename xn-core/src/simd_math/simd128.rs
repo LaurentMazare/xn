@@ -64,6 +64,10 @@ impl F32x4 for v128 {
         f32x4_pmin(f32x4_pmax(self, lo), hi)
     }
     #[inline(always)]
+    fn max(self, b: Self) -> Self {
+        f32x4_pmax(self, b)
+    }
+    #[inline(always)]
     fn round(self) -> Self {
         f32x4_nearest(self)
     }
@@ -88,6 +92,10 @@ impl F32x4 for v128 {
         v128_or(a, b)
     }
     #[inline(always)]
+    fn and_not(a: Self::Mask, b: Self::Mask) -> Self::Mask {
+        v128_andnot(a, b)
+    }
+    #[inline(always)]
     fn any(m: Self::Mask) -> bool {
         v128_any_true(m)
     }
@@ -104,4 +112,24 @@ impl F32x4 for v128 {
     fn select(m: Self::Mask, a: Self, b: Self) -> Self {
         v128_bitselect(a, b, m)
     }
+    #[inline(always)]
+    fn reduce_max(self) -> f32 {
+        let [a, b, c, d] = to_array(self);
+        a.max(b).max(c.max(d))
+    }
+    #[inline(always)]
+    fn reduce_sum(self) -> f32 {
+        let [a, b, c, d] = to_array(self);
+        (a + b) + (c + d)
+    }
+}
+
+#[inline(always)]
+fn to_array(v: v128) -> [f32; 4] {
+    [
+        f32x4_extract_lane::<0>(v),
+        f32x4_extract_lane::<1>(v),
+        f32x4_extract_lane::<2>(v),
+        f32x4_extract_lane::<3>(v),
+    ]
 }
