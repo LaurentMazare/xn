@@ -66,8 +66,10 @@ jobs:
     name: kai on Linux arm64
     runs-on: ubuntu-24.04-arm
     env:
-      # xn-gemm's f16 kernels need fp16, which generic aarch64 Linux does not assume.
-      RUSTFLAGS: -C target-feature=+fp16
+      # xn-gemm's f16 kernels need fp16, which generic aarch64 Linux does not assume. Every
+      # SME2 CPU also has dotprod, so this builds the NEON code the way such a CPU runs it;
+      # #103 covers the fallback used without dotprod.
+      RUSTFLAGS: -C target-feature=+fp16,+dotprod
     steps:
       - uses: actions/checkout@v2
       - name: Remove local cargo config
