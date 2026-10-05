@@ -46,6 +46,16 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
+      # The macOS runners are arm64, so this builds the vendored KleidiAI kernels. They have
+      # no SME2, so the kernels themselves do not run here, only the fallback.
+      - name: Test the kai feature
+        if: matrix.os == 'macOS-latest'
+        run: cargo test -p xn --features kai
+      - name: Lint the kai feature
+        if: matrix.os == 'macOS-latest' && matrix.rust == 'stable'
+        run: |
+          rustup component add clippy
+          cargo clippy -p xn --features kai --all-targets -- -D warnings
 
   fmt:
     name: Rustfmt

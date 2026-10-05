@@ -1,5 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Set by `build_kai` when it compiled the KleidiAI kernels; `quantized::kai` is gated on it.
+    println!("cargo::rustc-check-cfg=cfg(xn_kai)");
     #[cfg(feature = "accelerate")]
     {
         println!("cargo:rustc-link-lib=framework=Accelerate");
@@ -17,6 +19,56 @@ fn main() {
     }
     #[cfg(feature = "vulkan")]
     build_vulkan_shaders();
+    #[cfg(feature = "kai")]
+    build_kai();
+}
+
+/// Compile the vendored KleidiAI kernels in `third_party/kleidiai` and set `xn_kai`, on the
+/// targets that can run them: AArch64 on Apple platforms, Linux and Android. Anywhere else the
+/// feature compiles nothing and `quantized::kai` does not exist.
+///
+/// The flags are the ones KleidiAI's own CMake uses. The packing routines are plain NEON. The
+/// kernels' C wrappers refuse to build without SVE2, and their SME2 code is `.inst`-encoded,
+/// so SVE2 is all the assembler needs. Auto-vectorization is off so the compiler puts no SVE
+/// into the wrappers: Apple's cores only run SVE inside streaming mode.
+#[cfg(feature = "kai")]
+fn build_kai() {
+    let var = |name| std::env::var(name).unwrap_or_default();
+    let supported = var("CARGO_CFG_TARGET_VENDOR") == "apple"
+        || matches!(var("CARGO_CFG_TARGET_OS").as_str(), "linux" | "android");
+    if var("CARGO_CFG_TARGET_ARCH") != "aarch64" || !supported {
+        return;
+    }
+    let root = std::path::Path::new("third_party/kleidiai");
+    println!("cargo:rerun-if-changed={}", root.display());
+    let pack = root.join("kai/ukernels/matmul/pack");
+    let q8 = root.join("kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp");
+    let build = |flags: &[&str]| {
+        let mut b = cc::Build::new();
+        b.include(root).opt_level(3).warnings(false);
+        for flag in flags {
+            b.flag(flag);
+        }
+        b
+    };
+
+    build(&["-march=armv8-a"])
+        .file(pack.join("kai_lhs_quant_pack_qai8dxp_f32.c"))
+        .file(pack.join("kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c"))
+        .compile("xn_kai_pack");
+
+    let kernels = [
+        "kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa",
+        "kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme2_dot",
+    ];
+    build(&["-march=armv8.2-a+sve+sve2", "-fno-tree-vectorize", "-fno-tree-slp-vectorize"])
+        .file(root.join("kai/kai_common_sme_asm.S"))
+        .files(
+            kernels.iter().flat_map(|k| [q8.join(format!("{k}.c")), q8.join(format!("{k}_asm.S"))]),
+        )
+        .compile("xn_kai_sme2");
+
+    println!("cargo:rustc-cfg=xn_kai");
 }
 
 /// Compile every `vulkan-kernels/*.comp` GLSL compute shader to SPIR-V using
