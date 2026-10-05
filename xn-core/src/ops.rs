@@ -434,6 +434,9 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     /// Input: (batch, in_channels, length)
     /// Kernel: (out_channels, in_channels/groups, kernel_size)
     /// Output: (batch, out_channels, out_length)
+    ///
+    /// The kernel is treated as a model parameter: on the CPU, the gemm keeps it packed between
+    /// calls. Do not write it in place once it has been used.
     #[tracing::instrument(skip_all)]
     pub fn conv1d(
         &self,
@@ -488,6 +491,9 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
     /// Input: (batch, in_channels, length)
     /// Kernel: (in_channels, out_channels/groups, kernel_size)
     /// Output: (batch, out_channels, out_length)
+    ///
+    /// The kernel is treated as a model parameter: on the CPU, the gemm keeps it packed between
+    /// calls. Do not write it in place once it has been used.
     #[tracing::instrument(skip_all)]
     pub fn conv_transpose1d(
         &self,

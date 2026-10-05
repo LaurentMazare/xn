@@ -113,6 +113,9 @@ fn gemm_<T: WithDType>(
     // the usual case.
     let by_rows = worth && m > n && m >= nth * 16;
     let stripes = if by_rows || (worth && n >= nth * 4) { nth } else { 1 };
+    // A parameter the caller declared (see `parameter`) is declared per thread, so each stripe
+    // declares it again wherever it runs.
+    let parameter = gemm::packed_cache::constant();
 
     for b_idx in 0..lhs_b {
         let dst = &mut dst[b_idx * m * n..(b_idx + 1) * m * n];
@@ -137,7 +140,7 @@ fn gemm_<T: WithDType>(
                 };
                 // SAFETY: stripes own disjoint output rows or columns, and every offset stays
                 // inside the slices borrowed above, which outlive the dispatch.
-                unsafe {
+                gemm::packed_cache::with_constant(parameter, || unsafe {
                     gemm::gemm(
                         rows,
                         cols,
@@ -159,7 +162,7 @@ fn gemm_<T: WithDType>(
                         false,
                         gemm::Parallelism::None,
                     )
-                }
+                })
             });
             continue;
         }
@@ -188,6 +191,24 @@ fn gemm_<T: WithDType>(
         }
     }
     Ok(())
+}
+
+/// The first `len` elements of `storage`, as a span to declare to `gemm`'s packed operand cache
+/// with `gemm::packed_cache::with_constant`. A gemm made inside the declaration whose packed
+/// operand is this span keeps the packed copy and reuses it on later calls, rather than
+/// packing it on every call; any other operand is packed per call as before. Empty for a
+/// storage that is not on the CPU.
+///
+/// Only a model parameter may be declared: its contents must never change afterwards, since a
+/// later call reads the copy. A key/value cache or streaming state written in place must not.
+pub(crate) fn parameter<T: WithDType, S: Any>(
+    storage: &S,
+    len: usize,
+) -> gemm::packed_cache::Constant {
+    match (storage as &dyn Any).downcast_ref::<Vec<T>>() {
+        Some(v) => gemm::packed_cache::Constant::new(v.as_ptr(), len.min(v.len())),
+        None => gemm::packed_cache::Constant::default(),
+    }
 }
 
 impl crate::Backend for crate::CpuDevice {
