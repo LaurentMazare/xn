@@ -2407,3 +2407,123 @@ mod arch {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::{CPU, CpuDevice, Tensor};
+
+    fn data(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn tensor(v: &[f32], dims: &[usize]) -> Tensor<f32, CpuDevice> {
+        Tensor::from_vec(v.to_vec(), dims.to_vec(), &CPU).unwrap()
+    }
+
+    /// `want[b, i, j] = sum_t x(b, i, t) * w(b, j, t)`.
+    fn reference(
+        (batch, m, n, k): (usize, usize, usize, usize),
+        x: impl Fn(usize, usize, usize) -> f32,
+        w: impl Fn(usize, usize, usize) -> f32,
+    ) -> Vec<f32> {
+        let mut want = vec![0f32; batch * m * n];
+        for b in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    want[(b * m + i) * n + j] = (0..k).map(|t| x(b, i, t) * w(b, j, t)).sum();
+                }
+            }
+        }
+        want
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: length");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() <= 1e-4 * w.abs().max(1.0), "{what}[{i}]: got {g}, want {w}");
+        }
+    }
+
+    /// A batched input against one 2-D weight: the weight's batch stride is 0, which the
+    /// kernels only see from `gemm_`.
+    #[test]
+    fn batched_matmul_t_with_a_broadcast_weight() {
+        for (batch, m, n, k) in [(3, 5, 20, 9), (2, 16, 72, 64), (1, 1, 300, 256)] {
+            let (xv, wv) = (data(batch * m * k, 7), data(n * k, 8));
+            let got = tensor(&xv, &[batch, m, k]).matmul_t(&tensor(&wv, &[n, k])).unwrap();
+            let want = reference(
+                (batch, m, n, k),
+                |b, i, t| xv[(b * m + i) * k + t],
+                |_, j, t| wv[j * k + t],
+            );
+            assert_close(&got.to_vec().unwrap(), &want, &format!("{batch}x{m}x{n}x{k}"));
+        }
+    }
+
+    /// One weight per batch entry, as attention's `q @ k^T` has.
+    #[test]
+    fn batched_matmul_t_with_a_weight_per_entry() {
+        let (batch, m, n, k) = (8, 16, 37, 64);
+        let (xv, wv) = (data(batch * m * k, 9), data(batch * n * k, 10));
+        let got = tensor(&xv, &[batch, m, k]).matmul_t(&tensor(&wv, &[batch, n, k])).unwrap();
+        let want = reference(
+            (batch, m, n, k),
+            |b, i, t| xv[(b * m + i) * k + t],
+            |b, j, t| wv[(b * n + j) * k + t],
+        );
+        assert_close(&got.to_vec().unwrap(), &want, "per-entry weight");
+    }
+
+    /// Layouts the direct kernel does not take must still come out right: a transposed lhs,
+    /// and a weight that is contiguous along `n` rather than `k`.
+    #[test]
+    fn matmul_layouts_that_fall_back() {
+        let (m, n, k) = (6, 10, 12);
+        let (xv, wv) = (data(m * k, 11), data(n * k, 12));
+        // `x` stored as `[k, m]` and transposed: lhs columns are strided.
+        let xt = tensor(&xv, &[k, m]);
+        let got = xt.t().unwrap().matmul_t(&tensor(&wv, &[n, k])).unwrap();
+        let want = reference((1, m, n, k), |_, i, t| xv[t * m + i], |_, j, t| wv[j * k + t]);
+        assert_close(&got.to_vec().unwrap(), &want, "transposed lhs");
+        // `w` stored as `[k, n]`: `x @ w`.
+        let got = tensor(&xv, &[m, k]).matmul(&tensor(&wv, &[k, n])).unwrap();
+        let want = reference((1, m, n, k), |_, i, t| xv[i * k + t], |_, j, t| wv[t * n + j]);
+        assert_close(&got.to_vec().unwrap(), &want, "x @ w");
+    }
+
+    /// Which matmuls the target kernel takes: `f32` only, with `lhs` and the output contiguous
+    /// along their rows and `rhs` along `k`, and on aarch64 only up to 64 rows.
+    #[test]
+    fn arch_gemm_guards() {
+        use super::arch::{Gemm, gemm};
+        let (n, k) = (8, 16);
+        let layout = |m, dst, lhs, rhs| Gemm {
+            m,
+            n,
+            k,
+            batch: 1,
+            lhs_b_stride: m * k,
+            rhs_b_stride: 0,
+            dst,
+            lhs,
+            rhs,
+        };
+        let (lhs, rhs) = (data(65 * k, 13), data(n * k, 14));
+        let mut dst = vec![0f32; 65 * n];
+        let wasm = cfg!(all(target_arch = "wasm32", target_feature = "simd128"));
+        let x_wt = |m| layout(m, (1, n), (1, k), (k, 1));
+        assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(4)), wasm || cfg!(target_arch = "aarch64"));
+        assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(65)), wasm, "65 rows");
+        let (lhs64, rhs64): (Vec<f64>, Vec<f64>) =
+            (lhs.iter().map(|&v| v as f64).collect(), rhs.iter().map(|&v| v as f64).collect());
+        assert!(!gemm(&mut vec![0f64; 4 * n], &lhs64, &rhs64, &x_wt(4)), "f64");
+        assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (4, 1), (k, 1))), "strided lhs");
+        assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (1, k), (1, n))), "x @ w");
+        assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (4, 1), (1, k), (k, 1))), "strided dst");
+    }
+}
