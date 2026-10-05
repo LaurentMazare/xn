@@ -529,6 +529,11 @@ mod tests {
         assert!(!active() || sme2());
     }
 
+    #[test]
+    fn the_build_reports_it() {
+        assert!(crate::with_kleidi_ai());
+    }
+
     /// Against an f32 matmul over the weights the kernels actually hold, so the only error
     /// left is the activations' int8 rounding. Covers the gemv, partial tiles, and an `n`
     /// below the tile width.

@@ -80,6 +80,12 @@ pub fn with_f16c() -> bool {
     cfg!(target_feature = "f16c")
 }
 
+/// Whether xn was built with KleidiAI's kernels: the `kai` feature, on a target they support.
+/// They run only on a CPU with SME2, and not when `XN_KAI` is `0`.
+pub fn with_kleidi_ai() -> bool {
+    cfg!(xn_kai)
+}
+
 pub trait Module {
     fn forward<T: WithDType, B: Backend>(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>>;
 }
