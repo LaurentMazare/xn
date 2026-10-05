@@ -101,10 +101,18 @@ fn gemm_<T: WithDType>(
     // anyway; the cost is that each stripe re-packs the lhs panel, which is negligible at the
     // batch sizes decode uses.
     let nth = crate::threadpool::size();
+    let worth = nth > 1 && m * n * k >= 1 << 14;
     // One stripe per participant. Measured against 0.25x, 0.5x, 2x and 4x that count: 1x and
     // 2x tie, everything else is worse. Splitting the rows instead when the output is too
-    // narrow to stripe was also tried and nets nothing, so narrow outputs stay serial.
-    let stripes = if nth > 1 && n >= nth * 4 && m * n * k >= 1 << 14 { nth } else { 1 };
+    // narrow to stripe was also tried and nets nothing for outputs with few rows, so those
+    // stay serial.
+    //
+    // A tall output, with more rows than columns and at least a microkernel tile of rows per
+    // participant, splits its rows: a column stripe there would be a sliver of a tile wide and
+    // still read the whole lhs. A convolution's `[out_channels, L_out]` over a short window is
+    // the usual case.
+    let by_rows = worth && m > n && m >= nth * 16;
+    let stripes = if by_rows || (worth && n >= nth * 4) { nth } else { 1 };
 
     for b_idx in 0..lhs_b {
         let dst = &mut dst[b_idx * m * n..(b_idx + 1) * m * n];
@@ -115,27 +123,33 @@ fn gemm_<T: WithDType>(
             let lhs_p = lhs.as_ptr() as usize;
             let rhs_p = rhs.as_ptr() as usize;
             crate::threadpool::par_units(stripes, |s| {
-                let per = n.div_ceil(stripes);
-                let n0 = (s * per).min(n);
-                let n1 = (n0 + per).min(n);
-                if n0 == n1 {
+                let len = if by_rows { m } else { n };
+                let per = len.div_ceil(stripes);
+                let i0 = (s * per).min(len);
+                let i1 = (i0 + per).min(len);
+                if i0 == i1 {
                     return;
                 }
-                // SAFETY: stripes own disjoint output columns, and every offset stays inside
-                // the slices borrowed above, which outlive the dispatch.
+                let (rows, cols, dst_o, lhs_o, rhs_o) = if by_rows {
+                    (i1 - i0, n, i0 * dst_rs, i0 * lhs_rs, 0)
+                } else {
+                    (m, i1 - i0, i0 * dst_cs, 0, i0 * rhs_cs)
+                };
+                // SAFETY: stripes own disjoint output rows or columns, and every offset stays
+                // inside the slices borrowed above, which outlive the dispatch.
                 unsafe {
                     gemm::gemm(
-                        m,
-                        n1 - n0,
+                        rows,
+                        cols,
                         k,
-                        (dst_p as *mut T).add(n0 * dst_cs),
+                        (dst_p as *mut T).add(dst_o),
                         dst_cs as isize,
                         dst_rs as isize,
                         false,
-                        lhs_p as *const T,
+                        (lhs_p as *const T).add(lhs_o),
                         lhs_cs as isize,
                         lhs_rs as isize,
-                        (rhs_p as *const T).add(n0 * rhs_cs),
+                        (rhs_p as *const T).add(rhs_o),
                         rhs_cs as isize,
                         rhs_rs as isize,
                         T::zero(),
