@@ -2515,6 +2515,8 @@ fn conv_transpose1d_matches_naive_reference() -> Result<()> {
         conv_case(3, 16,  7,    300, 8,  4,  0, 0, 1), // thread blocks across batch entries
         conv_case(1, 16,  16,   1,   32, 16, 0, 0, 16), // depthwise upsampling
         conv_case(2, 16,  16,   3,   32, 16, 0, 0, 16),
+        conv_case(2, 6,   6,    7,   7,  2,  2, 1, 6), // depthwise, padded, taps overlapping 4 deep
+        conv_case(1, 4,   8,    5,   5,  2,  1, 0, 4), // depthwise, two outputs per input
         conv_case(1, 3,   5,    9,   4,  2,  0, 0, 1),
         conv_case(2, 4,   6,    11,  12, 6,  0, 0, 1),
         conv_case(1, 2,   3,    7,   3,  1,  0, 0, 1),

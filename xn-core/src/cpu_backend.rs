@@ -1974,7 +1974,7 @@ fn add_assign<T: WithDType>(dst: &mut [T], src: &[T]) {
     }
 }
 
-/// Direct conv_transpose1d implementation (fallback for grouped convolutions or with padding).
+/// Direct conv_transpose1d implementation (fallback for grouped convolutions).
 #[allow(clippy::too_many_arguments)]
 fn conv_transpose1d_direct<T: WithDTypeF>(
     dst: &mut [T],
@@ -1996,14 +1996,18 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
 
     dst.fill(T::zero());
 
-    // Reorder input from [B, C, L] to [B, L, C] for contiguous memory access
-    let mut src_reordered = vec![T::zero(); batch * length * in_channels];
-    for b in 0..batch {
-        for l in 0..length {
-            for c in 0..in_channels {
-                let src_idx = b * in_channels * length + c * length + l;
-                let dst_idx = b * length * in_channels + l * in_channels + c;
-                src_reordered[dst_idx] = src[src_idx];
+    // Reorder input from [B, C, L] to [B, L, C] for contiguous memory access. A depthwise
+    // convolution reads one channel at a time, which is contiguous already.
+    let mut src_reordered = vec![];
+    if in_c_per_group > 1 {
+        src_reordered = vec![T::zero(); batch * length * in_channels];
+        for b in 0..batch {
+            for l in 0..length {
+                for c in 0..in_channels {
+                    let src_idx = b * in_channels * length + c * length + l;
+                    let dst_idx = b * length * in_channels + l * in_channels + c;
+                    src_reordered[dst_idx] = src[src_idx];
+                }
             }
         }
     }
@@ -2020,24 +2024,29 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
         let g = out_c / out_c_per_group;
         let oc_in_group = out_c % out_c_per_group;
         let in_c_start = g * in_c_per_group;
-        let src_row = &src_reordered[b * length * in_channels..(b + 1) * length * in_channels];
         // Kernel layout: [in_channels, out_channels/groups, kernel_size]
         let k_base = in_c_start * out_c_per_group * kernel_size + oc_in_group * kernel_size;
 
         if in_c_per_group == 1 {
             // Depthwise: the dot product over input channels collapses to a single multiply,
-            // and this channel's kernel taps are contiguous.
+            // so each input position adds its value times this channel's taps, which are
+            // contiguous, to a contiguous span of the output. Walking the input backwards adds
+            // into each output position in increasing tap order, as the general loop below does.
+            let x = &src[(b * in_channels + in_c_start) * length..][..length];
             let w = &kernel[k_base..k_base + kernel_size];
-            for (k_offset, &wk) in w.iter().enumerate() {
-                for il in 0..length {
-                    let out_pos_raw = il * stride + k_offset;
-                    if out_pos_raw < padding || out_pos_raw >= out_length + padding {
-                        continue;
+            for (il, &xv) in x.iter().enumerate().rev() {
+                let start = (il * stride) as isize - padding as isize;
+                let k0 = start.min(0).unsigned_abs().min(kernel_size);
+                let k1 = (out_length as isize - start).clamp(k0 as isize, kernel_size as isize);
+                let (k1, o) = (k1 as usize, start.wrapping_add_unsigned(k0) as usize);
+                if k0 < k1 {
+                    for (d, &wk) in dst_row[o..o + k1 - k0].iter_mut().zip(&w[k0..k1]) {
+                        *d += xv * wk;
                     }
-                    dst_row[out_pos_raw - padding] += src_row[il * in_channels + in_c_start] * wk;
                 }
             }
         } else {
+            let src_row = &src_reordered[b * length * in_channels..(b + 1) * length * in_channels];
             // This channel's taps for a given k_offset sit `out_c_per_group * kernel_size`
             // apart in `kernel`, so gather them once per offset rather than reading them
             // strided inside the `il` loop: the dot product below then walks two contiguous
