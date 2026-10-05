@@ -8,7 +8,7 @@
 //!   weight is a broadcast, and the output row is written in place.
 //! * [`gemm_dot`] is `x @ W^T` on a row-major weight.
 
-use crate::simd128_math::madd;
+use crate::simd_math::simd128::madd;
 use core::arch::wasm32::*;
 use std::array::from_fn;
 

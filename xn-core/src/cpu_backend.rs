@@ -2126,8 +2126,8 @@ mod arch {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     mod imp {
         use super::{Conv1d, Gemm};
+        pub use crate::simd_math::{unary, unary_inplace};
         use crate::simd128_conv as k;
-        pub use crate::simd128_math::{unary, unary_inplace};
 
         /// Stride 1, no padding, one group: read the input in place, no im2col or transpose.
         pub fn conv1d(dst: &mut [f32], src: &[f32], w: &[f32], s: &Conv1d) -> bool {
