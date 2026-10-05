@@ -359,12 +359,15 @@ unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     acc
 }
 
+/// `sdot` without dotprod. Lane `i` must hold the products of bytes `4i..4i + 4`, because the
+/// tile reads lanes 0 and 1 as one column and lanes 2 and 3 as the next. `vpaddlq_s16` gives
+/// sums of adjacent pairs, so the two halves are combined pairwise, not lane by lane.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(target_feature = "dotprod")))]
 #[inline(always)]
 unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     let p0 = unsafe { vmull_s8(vget_low_s8(a), vget_low_s8(b)) };
     let p1 = unsafe { vmull_s8(vget_high_s8(a), vget_high_s8(b)) };
-    unsafe { vaddq_s32(acc, vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))) }
+    unsafe { vaddq_s32(acc, vpaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))) }
 }
 
 /// One `RM x NCOLS` output tile.

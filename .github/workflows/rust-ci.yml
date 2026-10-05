@@ -83,6 +83,25 @@ jobs:
       - run: cargo test -p xn --features kai
       - run: cargo clippy -p xn --features kai --all-targets -- -D warnings
 
+  # Generic aarch64 Linux, with no target-cpu, is the only job that builds the NEON fallbacks
+  # used when dotprod is off.
+  linux-arm64:
+    name: Linux arm64
+    runs-on: ubuntu-24.04-arm
+    env:
+      # xn-gemm's f16 kernels need fp16, which generic aarch64 Linux does not assume.
+      RUSTFLAGS: -C target-feature=+fp16
+    steps:
+      - uses: actions/checkout@v2
+      - name: Remove local cargo config
+        run: rm -f .cargo/config.toml
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: cargo test -p xn
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
