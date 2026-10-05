@@ -2248,3 +2248,70 @@ fn rope_matches_the_reference_on_both_sides_of_the_gate() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// exp-based activations across the parallelism threshold
+// =============================================================================
+
+type CpuT = Tensor<f32, xn::CpuDevice>;
+type CpuV = TensorView<f32, xn::CpuDevice>;
+
+struct Activation {
+    name: &'static str,
+    tensor: fn(&CpuT) -> Result<CpuT>,
+    view: fn(&CpuV) -> Result<CpuT>,
+    reference: fn(f32) -> f32,
+}
+
+/// The exp and erf activations, out of place and in place (a view goes through the in-place
+/// kernel), below and above the elementwise parallelism threshold: within float noise of the
+/// scalar formulas, and the two paths identical to the bit.
+#[test]
+fn activations_match_the_scalar_formulas_on_both_sides_of_the_gate() -> Result<()> {
+    let dev = &xn::CPU;
+    let ops = [
+        Activation { name: "exp", tensor: |t| t.exp(), view: |v| v.exp(), reference: f32::exp },
+        Activation {
+            name: "silu",
+            tensor: |t| t.silu(),
+            view: |v| v.silu(),
+            reference: |x| x / (1.0 + (-x).exp()),
+        },
+        Activation {
+            name: "sigmoid",
+            tensor: |t| t.sigmoid(),
+            view: |v| v.sigmoid(),
+            reference: |x| 1.0 / (1.0 + (-x).exp()),
+        },
+        Activation {
+            name: "elu",
+            tensor: |t| t.elu(1.0),
+            view: |v| v.elu(1.0),
+            reference: |x| if x > 0.0 { x } else { x.exp() - 1.0 },
+        },
+        Activation {
+            name: "gelu",
+            tensor: |t| t.gelu_erf(),
+            view: |v| v.gelu_erf(),
+            reference: |x| x * 0.5 * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2)),
+        },
+    ];
+    for n in [7, 4099, 300_001] {
+        let src: Vec<f32> = conv_test_values(0xe1 + n as u64, n).iter().map(|v| v * 12.0).collect();
+        let t: CpuT = Tensor::from_vec(src.clone(), n, dev)?;
+        for op in &ops {
+            let got = (op.tensor)(&t)?.to_vec()?;
+            // A view of a whole tensor runs the in-place kernel on that tensor's own storage,
+            // so it gets a copy.
+            let copy: CpuT = Tensor::from_vec(src.clone(), n, dev)?;
+            let in_place = (op.view)(&TensorView::from(&copy))?.to_vec()?;
+            for (i, ((&x, &g), &v)) in src.iter().zip(&got).zip(&in_place).enumerate() {
+                let name = op.name;
+                assert_eq!(g.to_bits(), v.to_bits(), "{name} n={n} [{i}]: {g} vs in place {v}");
+                let w = (op.reference)(x);
+                assert!((g - w).abs() <= 4e-7 * w.abs().max(1.0), "{name}({x}) n={n}: {g} vs {w}");
+            }
+        }
+    }
+    Ok(())
+}

@@ -240,7 +240,7 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        if arch::unary_inplace(&mut dst[..len], op) {
+        if arch_unary_inplace(&mut dst[..len], op) {
             return Ok(());
         }
         match op {
@@ -287,7 +287,7 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        if arch::unary(&mut dst[..len], &src[..len], op) {
+        if arch_unary(&mut dst[..len], &src[..len], op) {
             return Ok(());
         }
         match op {
@@ -1660,6 +1660,35 @@ where
     }
 }
 
+/// [`arch::unary_inplace`], split across the pool like [`apply_inplace_unary`] when the work is
+/// large enough. Says whether there is a kernel for `op`.
+fn arch_unary_inplace<T: Send + Sync + 'static>(dst: &mut [T], op: UnaryOp) -> bool {
+    if !use_parallelism(dst.len()) {
+        return arch::unary_inplace(dst, op);
+    }
+    // On an empty slice a kernel is a no-op, so this asks whether there is one.
+    arch::unary_inplace::<T>(&mut [], op) && {
+        crate::threadpool::par_chunks_mut(dst, ELEMWISE_CHUNK, |_, d| {
+            arch::unary_inplace(d, op);
+        });
+        true
+    }
+}
+
+/// [`arch::unary`], split across the pool like [`apply_unary`] when the work is large enough.
+/// Says whether there is a kernel for `op`.
+fn arch_unary<T: Send + Sync + 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -> bool {
+    if !use_parallelism(dst.len()) {
+        return arch::unary(dst, src, op);
+    }
+    arch::unary_inplace::<T>(&mut [], op) && {
+        crate::threadpool::par_chunks_zip(dst, ELEMWISE_CHUNK, src, ELEMWISE_CHUNK, |_, d, s| {
+            arch::unary(d, s, op);
+        });
+        true
+    }
+}
+
 /// Apply a unary operation in-place: dst[i] = op(dst[i])
 #[inline(always)]
 fn apply_inplace_unary<T: Copy + Send + Sync, F>(dst: &mut [T], f: F)
@@ -2168,7 +2197,24 @@ mod arch {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    mod imp {
+        use super::{Conv1d, Gemm};
+        pub use crate::simd_math::{unary, unary_inplace};
+        #[inline(always)]
+        pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn gemm(_: &mut [f32], _: &[f32], _: &[f32], _: &Gemm) -> bool {
+            false
+        }
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "wasm32", target_feature = "simd128"),
+        all(target_arch = "aarch64", target_feature = "neon")
+    )))]
     mod imp {
         use super::{Conv1d, Gemm};
         use crate::UnaryOp;

@@ -1,16 +1,20 @@
-//! Four-lane `exp` and `erf` for the wasm SIMD target, and the ELU, GELU, SiLU and sigmoid
-//! built on them.
+//! Four-lane `exp` and `erf`, and the ELU, GELU, SiLU and sigmoid built on them, for the
+//! targets with 128-bit SIMD: wasm `simd128` and aarch64 NEON.
 //!
-//! On wasm32 the scalar `f32::exp` and `libm::erff` are software routines. `exp` here is a
-//! range reduction and a degree-6 polynomial (about 2 ulp); `erf` is Abramowitz-Stegun 7.1.26
-//! (1.5e-7 absolute). The kernels are written once against [`F32x4`], which a target
-//! implements with its own instructions.
+//! The scalar `f32::exp` and `libm::erff` cost a call per element, and on wasm32 they are
+//! software routines. `exp` here is a range reduction and a degree-6 polynomial (about 2 ulp);
+//! `erf` is Abramowitz-Stegun 7.1.26 (1.5e-7 absolute). The kernels are written once against
+//! [`F32x4`], which each target implements with its own instructions.
 
 use crate::UnaryOp;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod neon;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub(crate) mod simd128;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+type Lanes = core::arch::aarch64::float32x4_t;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 type Lanes = core::arch::wasm32::v128;
 type Mask = <Lanes as F32x4>::Mask;
@@ -295,6 +299,14 @@ mod tests {
         v
     }
 
+    /// A dense sweep: every thousandth of a unit over `[-100, 100]`, and a stride through all
+    /// bit patterns, which visits every exponent of both signs.
+    fn dense() -> Vec<f32> {
+        let mut v: Vec<f32> = (-100_000..=100_000).map(|i| i as f32 * 1e-3).collect();
+        v.extend((0..=u32::MAX / 16_411).map(|i| f32::from_bits(i * 16_411)));
+        v
+    }
+
     /// NaN for NaN; zeros (with their sign) and infinities exactly; relative error `tol`
     /// everywhere else, down to the subnormals, which get `tol * f32::MIN_POSITIVE`.
     fn assert_matches(got: f32, want: f32, tol: f32, what: &str) {
@@ -401,5 +413,148 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The values the ops must get exactly right: signed zeros, subnormals, both sides of
+    /// `exp`'s range, infinities and NaN.
+    #[test]
+    fn edge_values() {
+        let tiny = f32::from_bits(1);
+        let inf = f32::INFINITY;
+        let nan = f32::NAN;
+        #[rustfmt::skip]
+        let cases: &[(UnaryOp, f32, f32)] = &[
+            (UnaryOp::Exp, 0.0, 1.0), (UnaryOp::Exp, -0.0, 1.0), (UnaryOp::Exp, tiny, 1.0),
+            (UnaryOp::Exp, -tiny, 1.0), (UnaryOp::Exp, 89.0, inf), (UnaryOp::Exp, 200.0, inf),
+            (UnaryOp::Exp, inf, inf), (UnaryOp::Exp, -110.0, 0.0), (UnaryOp::Exp, -200.0, 0.0),
+            (UnaryOp::Exp, -inf, 0.0), (UnaryOp::Exp, -89.0, (-89f32).exp()),
+            (UnaryOp::Exp, -88.0, (-88f32).exp()), (UnaryOp::Exp, nan, nan),
+            (UnaryOp::Sigmoid, 0.0, 0.5), (UnaryOp::Sigmoid, -0.0, 0.5),
+            (UnaryOp::Sigmoid, tiny, 0.5), (UnaryOp::Sigmoid, 200.0, 1.0),
+            (UnaryOp::Sigmoid, inf, 1.0), (UnaryOp::Sigmoid, -200.0, 0.0),
+            (UnaryOp::Sigmoid, -inf, 0.0), (UnaryOp::Sigmoid, nan, nan),
+            (UnaryOp::Silu, 0.0, 0.0), (UnaryOp::Silu, -0.0, -0.0), (UnaryOp::Silu, 200.0, 200.0),
+            (UnaryOp::Silu, inf, inf), (UnaryOp::Silu, -200.0, -0.0), (UnaryOp::Silu, -inf, nan),
+            (UnaryOp::Silu, nan, nan),
+            (UnaryOp::Elu { alpha: 1.0 }, 0.0, 0.0), (UnaryOp::Elu { alpha: 1.0 }, -0.0, 0.0),
+            (UnaryOp::Elu { alpha: 1.0 }, tiny, tiny), (UnaryOp::Elu { alpha: 1.0 }, -tiny, 0.0),
+            (UnaryOp::Elu { alpha: 1.0 }, 200.0, 200.0), (UnaryOp::Elu { alpha: 1.0 }, inf, inf),
+            (UnaryOp::Elu { alpha: 1.0 }, -89.0, -1.0), (UnaryOp::Elu { alpha: 1.0 }, -200.0, -1.0),
+            (UnaryOp::Elu { alpha: 1.0 }, -inf, -1.0), (UnaryOp::Elu { alpha: 1.0 }, nan, nan),
+            (UnaryOp::GeluErf, 0.0, 0.0), (UnaryOp::GeluErf, -0.0, -0.0),
+            (UnaryOp::GeluErf, 200.0, 200.0), (UnaryOp::GeluErf, inf, inf),
+            (UnaryOp::GeluErf, -200.0, -0.0), (UnaryOp::GeluErf, -inf, nan),
+            (UnaryOp::GeluErf, nan, nan),
+        ];
+        for &(op, x, want) in cases {
+            // Each value in every lane position, among ordinary neighbours.
+            for pos in 0..5 {
+                let mut src = [0.25f32, -1.5, 3.0, -0.75, 0.5];
+                src[pos] = x;
+                let mut dst = [0f32; 5];
+                assert!(unary(&mut dst, &src, op));
+                let got = dst[pos];
+                let ok = if want.is_nan() { got.is_nan() } else { got.to_bits() == want.to_bits() };
+                assert!(ok, "{op:?}({x:e}) at lane {pos}: got {got:e}, want {want:e}");
+            }
+        }
+        // Subnormal inputs to GELU come out as half of themselves, to within an ulp.
+        for x in [tiny, -tiny, 1e-40, -1e-40, -f32::MIN_POSITIVE] {
+            let mut dst = [0f32; 1];
+            assert!(unary(&mut dst, &[x], UnaryOp::GeluErf));
+            assert!((dst[0] - 0.5 * x).abs() <= tiny, "gelu({x:e}) = {:e}", dst[0]);
+        }
+    }
+
+    /// Distance in units in the last place, counting across zero.
+    fn ulps(a: f32, b: f32) -> u32 {
+        let key = |x: f32| {
+            let b = x.to_bits() as i32;
+            if b < 0 { i32::MIN - b } else { b }
+        };
+        key(a).abs_diff(key(b))
+    }
+
+    /// Max ulp and max absolute error of every op over a dense sweep, against the scalar
+    /// formula (libm's `expf` and `erff`) and against the same formula in `f64`. Ulp only for
+    /// the ops whose error is relative; ELU's `exp(x) - 1` cancels near zero and A-S 7.1.26 is
+    /// an absolute bound, so GELU and ELU get an absolute error, scaled by `max(1, |want|)` so
+    /// that it reads as relative where results are large. The `f64` column leaves out results
+    /// outside the normal `f32` range, exact or scalar, where the scalar formula is the
+    /// reference and is matched to the bit. Printed with `--nocapture`.
+    #[test]
+    fn accuracy_against_libm() {
+        let xs = dense();
+        type Op = (&'static str, UnaryOp, fn(f32) -> f32, fn(f64) -> f64, Option<u32>, f32);
+        let ops: [Op; 5] = [
+            ("exp", UnaryOp::Exp, exp_ref, f64::exp, Some(2), 2.4e-7),
+            (
+                "sigmoid",
+                UnaryOp::Sigmoid,
+                sigmoid_ref,
+                |x| 1.0 / (1.0 + (-x).exp()),
+                Some(4),
+                2.4e-7,
+            ),
+            ("silu", UnaryOp::Silu, silu_ref, |x| x / (1.0 + (-x).exp()), Some(4), 3e-7),
+            (
+                "elu",
+                UnaryOp::Elu { alpha: 1.0 },
+                elu_ref,
+                |x| if x > 0.0 { x } else { x.exp_m1() },
+                None,
+                1.2e-7,
+            ),
+            (
+                "gelu",
+                UnaryOp::GeluErf,
+                gelu_ref,
+                |x| x * 0.5 * (1.0 + libm::erf(x * core::f64::consts::FRAC_1_SQRT_2)),
+                None,
+                4e-7,
+            ),
+        ];
+        let mut report = String::new();
+        for (name, op, reference, exact, max_ulp, max_abs) in ops {
+            let mut got = vec![0f32; xs.len()];
+            assert!(unary(&mut got, &xs, op));
+            // (ulp, at, abs, at), against libm and against f64.
+            let mut worst = [(0u32, 0f32, 0f32, 0f32); 2];
+            for (&x, &g) in xs.iter().zip(&got) {
+                let w = reference(x);
+                if w.is_nan() {
+                    assert!(g.is_nan(), "{name}({x:e}): got {g:e}, want NaN");
+                    continue;
+                }
+                let e = exact(x as f64);
+                let normal =
+                    |v: f64| (f32::MIN_POSITIVE as f64..=f32::MAX as f64).contains(&v.abs());
+                let wants = [Some(w), (normal(e) && normal(w as f64)).then_some(e as f32)];
+                for (worst, w) in worst.iter_mut().zip(wants) {
+                    let Some(w) = w else { continue };
+                    let u = ulps(g, w);
+                    if u > worst.0 {
+                        (worst.0, worst.1) = (u, x);
+                    }
+                    let a = if g == w { 0.0 } else { (g - w).abs() / w.abs().max(1.0) };
+                    if a > worst.2 {
+                        (worst.2, worst.3) = (a, x);
+                    }
+                }
+            }
+            for ((ulp, ulp_at, abs, abs_at), vs) in worst.into_iter().zip(["libm", "f64"]) {
+                let ulp = match max_ulp {
+                    Some(_) => format!("{ulp:>2} ulp at {ulp_at:>10.3e}, "),
+                    None => String::new(),
+                };
+                report += &format!("{name:>8} vs {vs:<4}: {ulp}abs {abs:.2e} at {abs_at:>10.3e}\n");
+            }
+            let (ulp, ulp_at, abs, abs_at) = worst[0];
+            if let Some(max_ulp) = max_ulp {
+                assert!(ulp <= max_ulp, "{name}: {ulp} ulp at {ulp_at:e}");
+            }
+            assert!(abs <= max_abs, "{name}: abs error {abs:e} at {abs_at:e}");
+        }
+        eprint!("{report}");
     }
 }
