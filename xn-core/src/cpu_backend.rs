@@ -2190,7 +2190,13 @@ mod arch {
     use crate::UnaryOp;
 
     /// A 1d convolution's shape, as the backend's `conv1d` receives it.
-    #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(
+            all(target_arch = "wasm32", target_feature = "simd128"),
+            target_arch = "aarch64"
+        )),
+        allow(dead_code)
+    )]
     pub(super) struct Conv1d {
         pub batch: usize,
         pub in_channels: usize,
@@ -2266,11 +2272,35 @@ mod arch {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     mod imp {
         use super::{Conv1d, Gemm};
+        use crate::neon_conv as k;
         pub use crate::simd_math::{softmax_row, unary, unary_inplace};
-        #[inline(always)]
-        pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
-            false
+
+        /// Stride 1, no padding, one group, and a shape `neon_conv::takes`: read the input in
+        /// place, no im2col or transpose.
+        pub fn conv1d(dst: &mut [f32], src: &[f32], w: &[f32], s: &Conv1d) -> bool {
+            let span = (s.kernel_size.max(1) - 1) * s.dilation;
+            let fits = s.out_length == 0 || s.out_length - 1 + span < s.length;
+            if s.groups != 1 || s.stride != 1 || s.padding != 0 || s.kernel_size == 0 || !fits {
+                return false;
+            }
+            if !k::takes(s.in_channels, s.out_channels, s.length, s.out_length) {
+                return false;
+            }
+            k::conv1d(
+                dst,
+                src,
+                w,
+                s.batch,
+                s.in_channels,
+                s.out_channels,
+                s.length,
+                s.out_length,
+                s.kernel_size,
+                s.dilation,
+            );
+            true
         }
+
         #[inline(always)]
         pub fn gemm(_: &mut [f32], _: &[f32], _: &[f32], _: &Gemm) -> bool {
             false
