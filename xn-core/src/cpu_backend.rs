@@ -1246,49 +1246,44 @@ impl crate::Backend for crate::CpuDevice {
             return Ok(());
         }
         if USE_IM2COL_CONV1D && groups == 1 {
-            // IM2COL approach: transform conv1d into matrix multiplication
-            // 1. Im2Col: transform input [B, C, L] -> [B, L_out, C * K]
-            // 2. Matmul: [B, L_out, C*K] x [C*K, out_channels] -> [B, L_out, out_channels]
-            // 3. Transpose result to [B, out_channels, L_out]
-
+            // im2col, laid out as [B, C * K, L_out]: row (c, k) is the input channel `c`
+            // shifted by tap `k`, which for a stride-1 convolution is one contiguous copy.
+            // The kernel [out, in, K] read as [out, C * K] then multiplies it straight into
+            // the output layout, [B, out, L_out], with no transpose on either side.
             let k = in_channels * kernel_size;
-
-            // Step 1: Im2Col transformation
-            let col = im2col1d(
-                src,
-                batch,
-                in_channels,
-                length,
-                out_length,
-                kernel_size,
-                stride,
-                padding,
-                dilation,
-            );
-
-            // Step 2: Matrix multiplication
-            // col is [B, L_out, K] where K = in_channels * kernel_size
-            // kernel is [out_channels, in_channels, kernel_size] = [out_channels, K]
-            // We want [B, L_out, out_channels]
-            let mut result = vec![T::zero(); batch * out_length * out_channels];
-
+            // A pointwise convolution's columns are the input itself.
+            let pointwise = kernel_size == 1 && stride == 1 && padding == 0;
+            let col_buf;
+            let col: &Self::Storage<T> = if pointwise {
+                src
+            } else {
+                col_buf = im2col1d(
+                    src,
+                    batch,
+                    in_channels,
+                    length,
+                    out_length,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                )?;
+                &col_buf
+            };
             Self::gemm(
-                &mut result,
-                (&col, 0),
+                dst,
                 (kernel, 0),
-                /* m */ out_length,
-                /* n */ out_channels,
+                (col, 0),
+                /* m */ out_channels,
+                /* n */ out_length,
                 /* k */ k,
                 batch,
-                out_length * k,
                 0,
-                (1, out_channels),
+                k * out_length,
+                (1, out_length),
                 (1, k),
-                (k, 1),
-            )?;
-
-            // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out]
-            Self::transpose(dst, &result, 1, 2, &[batch, out_length, out_channels])
+                (1, out_length),
+            )
         } else {
             // Fallback: original implementation for grouped convolutions
             conv1d_direct(
@@ -1439,24 +1434,17 @@ impl crate::Backend for crate::CpuDevice {
 
         if USE_COL2IM_CONV1D_TR && can_use_col2im {
             // COL2IM approach: matmul + col2im transformation
-            // 1. Transpose input from [B, C_in, L_in] to [B, L_in, C_in]
-            // 2. Matmul: [B, L_in, C_in] @ [C_in, C_out * K] -> [B, L_in, C_out * K]
-            // 3. Col2Im: [B, L_in, C_out, K] -> [B, C_out, L_out]
+            // 1. Matmul: [B, L_in, C_in] @ [C_in, C_out * K] -> [B, L_in, C_out * K]
+            // 2. Col2Im: [B, L_in, C_out, K] -> [B, C_out, L_out]
 
-            // Step 1: Transpose input to [B, L_in, C_in]
-            let mut src_transposed = vec![T::zero(); batch * length * in_channels];
-            Self::transpose(&mut src_transposed, src, 1, 2, &[batch, in_channels, length])?;
-
-            // Step 2: Matrix multiplication
-            // src_transposed: [B, L_in, C_in]
-            // kernel: [C_in, C_out, K] stored row-major, treat as [C_in, C_out * K]
-            // result: [B, L_in, C_out * K]
+            // The gemm reads the input [B, C_in, L_in] transposed through its strides rather
+            // than through a copy.
             let n = out_channels * kernel_size;
-            let mut col = vec![T::zero(); batch * length * n];
-
+            // SAFETY: the gemm writes every element.
+            let mut col = unsafe { Self::alloc_uninit(batch * length * n, &crate::CPU)? };
             Self::gemm(
                 &mut col,
-                (&src_transposed, 0),
+                (src, 0),
                 (kernel, 0),
                 /* m */ length,
                 /* n */ n,
@@ -1465,11 +1453,11 @@ impl crate::Backend for crate::CpuDevice {
                 length * in_channels,
                 0,
                 (1, n),
-                (1, in_channels),
+                (length, 1),
                 (1, n),
             )?;
 
-            // Step 3: Col2Im transformation
+            // Step 2: Col2Im transformation
             // col is [B, L_in, C_out * K] = [B, L_in, C_out, K]
             // output is [B, C_out, L_out]
             col2im1d(dst, &col, batch, length, out_channels, kernel_size, stride);
@@ -1783,8 +1771,12 @@ where
     }
 }
 
-/// Im2Col transformation for 1D convolution.
-/// Transforms input from [B, C, L] to [B, L_out, C * K] for matrix multiplication.
+/// The `[B, C * K, L_out]` im2col buffer for [`crate::CpuDevice::conv1d`].
+///
+/// Row `(c, k)` holds input channel `c` sampled at `l * stride + k * dilation - padding` for
+/// every output position `l`, zero where that falls outside the input. The positions inside
+/// the input are one contiguous range of `l`, so a row is that range copied (a single
+/// `copy_from_slice` at stride 1) with zeros on either side, and no bounds test per element.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 fn im2col1d<T: WithDTypeF>(
@@ -1797,40 +1789,47 @@ fn im2col1d<T: WithDTypeF>(
     stride: usize,
     padding: usize,
     dilation: usize,
-) -> Vec<T> {
-    let k = in_channels * l_k;
-    let mut dst = vec![T::zero(); batch * l_out * k];
+) -> Result<Vec<T>> {
+    let rows = batch * in_channels * l_k;
+    // SAFETY: `fill_row` writes every element of its row.
+    let mut dst =
+        unsafe { <crate::CpuDevice as crate::Backend>::alloc_uninit(rows * l_out, &crate::CPU)? };
 
-    let fill_row = |bl: usize, dst_row: &mut [T]| {
-        let b_idx = bl / l_out;
-        let l_idx = bl % l_out;
-        let src_b_offset = b_idx * in_channels * length;
-
-        for c_idx in 0..in_channels {
-            let src_c_offset = src_b_offset + c_idx * length;
-            let dst_c_offset = c_idx * l_k;
-
-            for (l_k_idx, dst) in dst_row[dst_c_offset..dst_c_offset + l_k].iter_mut().enumerate() {
-                let src_l = l_idx * stride + l_k_idx * dilation;
-
-                // Handle padding
-                if src_l < padding || src_l >= length + padding {
-                    // Zero padding - already initialized to zero
-                    continue;
+    let fill_row = |row: usize, dst_row: &mut [T]| {
+        let k_idx = row % l_k;
+        let c_idx = (row / l_k) % in_channels;
+        let b_idx = row / (l_k * in_channels);
+        let src_c = &src[(b_idx * in_channels + c_idx) * length..][..length];
+        // Output `l` reads input position `l * stride + shift`, which is inside the input
+        // for `l` in `l0..l1`.
+        let shift = (k_idx * dilation) as isize - padding as isize;
+        let first_inside = |pos: isize| match pos {
+            ..=0 => 0,
+            pos => (pos as usize).div_ceil(stride),
+        };
+        let l0 = first_inside(-shift).min(l_out);
+        let l1 = first_inside(length as isize - shift).clamp(l0, l_out);
+        let (before, rest) = dst_row.split_at_mut(l0);
+        let (inside, after) = rest.split_at_mut(l1 - l0);
+        before.fill(T::zero());
+        after.fill(T::zero());
+        if !inside.is_empty() {
+            let src_c = &src_c[(l0 * stride).wrapping_add_signed(shift)..];
+            if stride == 1 {
+                inside.copy_from_slice(&src_c[..inside.len()]);
+            } else {
+                for (d, s) in inside.iter_mut().zip(src_c.iter().step_by(stride)) {
+                    *d = *s;
                 }
-                let src_l = src_l - padding;
-                let src_idx = src_c_offset + src_l;
-                *dst = src[src_idx];
             }
         }
     };
-    if use_parallelism(batch * l_out * k) {
-        crate::threadpool::par_chunks_mut(&mut dst, k, |bl, dst_row| fill_row(bl, dst_row));
+    if use_parallelism(rows * l_out) {
+        crate::threadpool::par_chunks_mut(&mut dst, l_out, |row, dst_row| fill_row(row, dst_row));
     } else {
-        dst.chunks_mut(k).enumerate().for_each(|(bl, dst_row)| fill_row(bl, dst_row));
+        dst.chunks_mut(l_out).enumerate().for_each(|(row, dst_row)| fill_row(row, dst_row));
     }
-
-    dst
+    Ok(dst)
 }
 
 /// Direct conv1d implementation (fallback for grouped convolutions).
