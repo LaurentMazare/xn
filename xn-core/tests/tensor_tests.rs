@@ -2354,3 +2354,293 @@ fn softmax_with_masked_rows_on_both_sides_of_the_gate() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// conv1d / conv_transpose1d against a naive reference
+// =============================================================================
+
+/// One conv1d or conv_transpose1d case: `b` batches of `c_in` channels of length `l`, a kernel
+/// of `k` taps, and the remaining parameters as the ops take them (`extra` is the dilation for
+/// conv1d and the output padding for conv_transpose1d).
+#[derive(Clone, Copy, Debug)]
+struct ConvCase {
+    b: usize,
+    c_in: usize,
+    c_out: usize,
+    l: usize,
+    k: usize,
+    stride: usize,
+    padding: usize,
+    extra: usize,
+    groups: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn conv_case(
+    b: usize,
+    c_in: usize,
+    c_out: usize,
+    l: usize,
+    k: usize,
+    stride: usize,
+    padding: usize,
+    extra: usize,
+    groups: usize,
+) -> ConvCase {
+    ConvCase { b, c_in, c_out, l, k, stride, padding, extra, groups }
+}
+
+/// The definition, accumulated in f64. Kernel `[c_out, c_in / groups, k]`.
+fn naive_conv1d(x: &[f32], w: &[f32], c: ConvCase) -> (Vec<f32>, usize) {
+    let ConvCase { b, c_in, c_out, l, k, stride, padding, extra: dilation, groups } = c;
+    let (cin_g, cout_g) = (c_in / groups, c_out / groups);
+    let l_out = (l + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
+    let mut out = vec![0f32; b * c_out * l_out];
+    for bi in 0..b {
+        for co in 0..c_out {
+            let g = co / cout_g;
+            for lo in 0..l_out {
+                let mut acc = 0f64;
+                for ci in 0..cin_g {
+                    for ki in 0..k {
+                        let li = (lo * stride + ki * dilation) as isize - padding as isize;
+                        if li >= 0 && (li as usize) < l {
+                            let xv = x[(bi * c_in + g * cin_g + ci) * l + li as usize];
+                            acc += xv as f64 * w[(co * cin_g + ci) * k + ki] as f64;
+                        }
+                    }
+                }
+                out[(bi * c_out + co) * l_out + lo] = acc as f32;
+            }
+        }
+    }
+    (out, l_out)
+}
+
+/// The definition, accumulated in f64. Kernel `[c_in, c_out / groups, k]`.
+fn naive_conv_transpose1d(x: &[f32], w: &[f32], c: ConvCase) -> (Vec<f32>, usize) {
+    let ConvCase { b, c_in, c_out, l, k, stride, padding, extra: output_padding, groups } = c;
+    let (cin_g, cout_g) = (c_in / groups, c_out / groups);
+    let l_out = (l - 1) * stride + k + output_padding - 2 * padding;
+    let mut acc = vec![0f64; b * c_out * l_out];
+    for bi in 0..b {
+        for ci in 0..c_in {
+            let g = ci / cin_g;
+            for li in 0..l {
+                let xv = x[(bi * c_in + ci) * l + li] as f64;
+                for j in 0..cout_g {
+                    let co = g * cout_g + j;
+                    for ki in 0..k {
+                        let lo = (li * stride + ki) as isize - padding as isize;
+                        if lo >= 0 && (lo as usize) < l_out {
+                            acc[(bi * c_out + co) * l_out + lo as usize] +=
+                                xv * w[(ci * cout_g + j) * k + ki] as f64;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (acc.into_iter().map(|v| v as f32).collect(), l_out)
+}
+
+/// The streaming decoder's convolutions (stride 1, no padding: the state carries the
+/// context), the encoder's strided downsampling, and the general cases around them: padding,
+/// some of it wider than the input, dilation, batch, groups and odd sizes. Channel counts are
+/// smaller than a real model's where the reference would be slow in a debug build; the
+/// lengths are real, so the im2col and gemm splits across threads are exercised.
+#[test]
+fn conv1d_matches_naive_reference() -> Result<()> {
+    let dev = &xn::CPU;
+    #[rustfmt::skip]
+    let cases = [
+        //        b  c_in c_out  l     k  s  p  d  g
+        conv_case(1, 64,  64,   22,    7, 1, 0, 1, 1), // first decoder conv
+        conv_case(1, 16,  512,  18,    3, 1, 0, 1, 1), // tall output: rows split over threads
+        conv_case(1, 32,  16,   98,    3, 1, 0, 1, 1), // residual convs
+        conv_case(1, 16,  8,    482,   3, 1, 0, 1, 1),
+        conv_case(1, 64,  32,   1922,  3, 1, 0, 1, 1),
+        conv_case(1, 16,  32,   96,    1, 1, 0, 1, 1), // pointwise: no im2col
+        conv_case(1, 32,  64,   1920,  1, 1, 0, 1, 1),
+        conv_case(1, 64,  1,    1922,  3, 1, 0, 1, 1), // last decoder conv
+        conv_case(2, 16,  32,   485,   8, 4, 0, 1, 1), // encoder downsampling
+        conv_case(1, 8,   16,   487,   10, 5, 0, 1, 1),
+        conv_case(1, 8,   16,   491,   12, 6, 0, 1, 1),
+        conv_case(1, 8,   8,    205,   16, 8, 0, 1, 1),
+        conv_case(1, 16,  16,   97,    32, 16, 0, 1, 1),
+        conv_case(1, 16,  16,   97,    32, 16, 0, 1, 16), // depthwise
+        conv_case(3, 7,   5,    66,    7, 1, 3, 1, 1), // same padding, odd sizes
+        conv_case(1, 3,   5,    17,    7, 1, 0, 1, 1),
+        conv_case(2, 4,   6,    23,    3, 1, 2, 1, 1),
+        conv_case(1, 5,   4,    31,    3, 1, 0, 2, 1), // dilation
+        conv_case(2, 3,   7,    20,    5, 1, 4, 3, 1),
+        conv_case(1, 6,   4,    40,    5, 3, 2, 2, 1),
+        conv_case(1, 3,   2,    9,     3, 1, 5, 1, 1), // padding wider than the input
+        conv_case(1, 3,   2,    4,     3, 2, 6, 1, 1),
+        conv_case(1, 2,   3,    19,    4, 2, 1, 1, 1),
+        conv_case(1, 3,   2,    25,    3, 3, 0, 2, 1),
+        conv_case(2, 1,   1,    6,     1, 1, 0, 1, 1),
+        conv_case(1, 4,   3,    11,    1, 2, 0, 1, 1), // strided pointwise
+        conv_case(2, 5,   4,    13,    1, 1, 2, 1, 1), // padded pointwise
+        conv_case(2, 6,   4,    29,    3, 2, 1, 1, 2), // groups
+        conv_case(1, 6,   9,    17,    5, 1, 2, 2, 3),
+    ];
+    for c in cases {
+        let x = conv_test_values(0x1234 + c.l as u64, c.b * c.c_in * c.l);
+        let w = conv_test_values(0x5678 + c.k as u64, c.c_out * (c.c_in / c.groups) * c.k);
+        let (want, l_out) = naive_conv1d(&x, &w, c);
+        let input: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (c.b, c.c_in, c.l), dev)?;
+        let kernel: Tensor<f32, xn::CpuDevice> =
+            Tensor::from_vec(w, (c.c_out, c.c_in / c.groups, c.k), dev)?;
+        let out = input.conv1d(&kernel, None, c.stride, c.padding, c.extra, c.groups)?;
+        assert_eq!(out.dims(), &[c.b, c.c_out, l_out], "conv1d {c:?}");
+        assert_close(&out.to_vec()?, &want, &format!("conv1d {c:?}"));
+    }
+    Ok(())
+}
+
+/// The decoder's upsampling (kernel twice the stride, no padding: the state carries the
+/// overlap) at real lengths, its depthwise variant, and the general cases: padding, output
+/// padding, kernels shorter than or not a multiple of the stride, batch and groups.
+#[test]
+fn conv_transpose1d_matches_naive_reference() -> Result<()> {
+    let dev = &xn::CPU;
+    #[rustfmt::skip]
+    let cases = [
+        //        b  c_in c_out  l    k   s   p  op  g
+        conv_case(1, 64,  32,   16,  12, 6,  0, 0, 1), // decoder upsampling
+        conv_case(1, 32,  16,   96,  10, 5,  0, 0, 1),
+        conv_case(1, 16,  8,    480, 8,  4,  0, 0, 1),
+        conv_case(2, 16,  8,    480, 8,  4,  0, 0, 1),
+        conv_case(3, 16,  7,    300, 8,  4,  0, 0, 1), // thread blocks across batch entries
+        conv_case(1, 16,  16,   1,   32, 16, 0, 0, 16), // depthwise upsampling
+        conv_case(2, 16,  16,   3,   32, 16, 0, 0, 16),
+        conv_case(2, 6,   6,    7,   7,  2,  2, 1, 6), // depthwise, padded, taps overlapping 4 deep
+        conv_case(1, 4,   8,    5,   5,  2,  1, 0, 4), // depthwise, two outputs per input
+        conv_case(1, 3,   5,    9,   4,  2,  0, 0, 1),
+        conv_case(2, 4,   6,    11,  12, 6,  0, 0, 1),
+        conv_case(1, 2,   3,    7,   3,  1,  0, 0, 1),
+        conv_case(2, 5,   4,    13,  10, 5,  0, 0, 1),
+        conv_case(1, 1,   1,    5,   8,  4,  0, 0, 1),
+        conv_case(1, 3,   2,    8,   2,  3,  0, 0, 1), // kernel shorter than the stride
+        conv_case(1, 3,   4,    9,   7,  3,  0, 0, 1), // not a multiple of the stride
+        conv_case(1, 4,   3,    10,  6,  2,  2, 0, 1), // padding
+        conv_case(2, 3,   5,    12,  5,  3,  1, 2, 1), // output padding
+        conv_case(1, 2,   2,    6,   4,  2,  3, 1, 1), // padding past the first input
+        conv_case(1, 3,   3,    1,   5,  1,  2, 0, 1), // one input position
+        conv_case(2, 6,   4,    9,   4,  2,  0, 0, 2), // groups
+        conv_case(1, 6,   9,    7,   5,  3,  1, 1, 3),
+    ];
+    for c in cases {
+        let x = conv_test_values(0x9abc + c.l as u64, c.b * c.c_in * c.l);
+        let w = conv_test_values(0xdef0 + c.k as u64, c.c_in * (c.c_out / c.groups) * c.k);
+        let (want, l_out) = naive_conv_transpose1d(&x, &w, c);
+        let input: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (c.b, c.c_in, c.l), dev)?;
+        let kernel: Tensor<f32, xn::CpuDevice> =
+            Tensor::from_vec(w, (c.c_in, c.c_out / c.groups, c.k), dev)?;
+        let out = input.conv_transpose1d(&kernel, None, c.stride, c.padding, c.extra, c.groups)?;
+        assert_eq!(out.dims(), &[c.b, c.c_out, l_out], "conv_transpose1d {c:?}");
+        assert_close(&out.to_vec()?, &want, &format!("conv_transpose1d {c:?}"));
+    }
+    Ok(())
+}
+
+/// Tall, narrow products, which the CPU backend splits by rows across threads, and a wide one,
+/// which it splits by columns, against the definition.
+#[test]
+fn matmul_tall_and_wide_match_naive_reference() -> Result<()> {
+    let dev = &xn::CPU;
+    for (b, m, k, n) in [(1, 600, 40, 12), (2, 300, 33, 5), (1, 12, 40, 600)] {
+        let x = conv_test_values(0x7a11 + m as u64, b * m * k);
+        let y = conv_test_values(0x7a12 + n as u64, b * k * n);
+        let mut want = vec![0f32; b * m * n];
+        for bi in 0..b {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f64;
+                    for kk in 0..k {
+                        acc += x[(bi * m + i) * k + kk] as f64 * y[(bi * k + kk) * n + j] as f64;
+                    }
+                    want[(bi * m + i) * n + j] = acc as f32;
+                }
+            }
+        }
+        let xt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(x, (b, m, k), dev)?;
+        let yt: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(y, (b, k, n), dev)?;
+        assert_close(&xt.matmul(&yt)?.to_vec()?, &want, &format!("matmul {b}x{m}x{k}x{n}"));
+    }
+    Ok(())
+}
+
+/// With no input channels there is nothing to sum: both convolutions give zeros, on whichever
+/// path (im2col, col2im) they take. The gemm then has a zero-length reduction and must still
+/// write its whole output.
+#[test]
+fn convolutions_over_zero_input_channels_give_zeros() -> Result<()> {
+    let dev = &xn::CPU;
+    let x: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(vec![], (2, 0, 10), dev)?;
+    let w: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(vec![], (4, 0, 3), dev)?;
+    let y = x.conv1d(&w, None, 1, 0, 1, 1)?;
+    assert_eq!(y.dims(), &[2, 4, 8]);
+    assert!(y.to_vec()?.iter().all(|&v| v == 0.0), "conv1d");
+    let w: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(vec![], (0, 4, 3), dev)?;
+    let y = x.conv_transpose1d(&w, None, 2, 1, 1, 1)?;
+    assert_eq!(y.dims(), &[2, 4, 20]);
+    assert!(y.to_vec()?.iter().all(|&v| v == 0.0), "conv_transpose1d");
+    Ok(())
+}
+
+/// The im2col and col2im paths are generic over the float type: one strided, padded case of
+/// each convolution in f16, against the f32 reference, within f16's precision. (bf16 has no
+/// gemm on this backend.)
+#[test]
+fn convolutions_in_half_precision_match_the_reference() -> Result<()> {
+    fn run<T: xn::WithDTypeF>(tol: f32) -> Result<()> {
+        let dev = &xn::CPU;
+        let half =
+            |v: Vec<f32>, shape: (usize, usize, usize)| -> Result<Tensor<T, xn::CpuDevice>> {
+                Tensor::<f32, xn::CpuDevice>::from_vec(v, shape, dev)?.to()
+            };
+        // Inputs rounded to T first, so the reference sees what the half-precision op sees.
+        let round = |v: Vec<f32>| {
+            v.into_iter().map(|x| xn::WithDTypeF::to_f32(T::from_f32(x))).collect::<Vec<_>>()
+        };
+        let c = conv_case(2, 12, 10, 41, 4, 2, 3, 1, 1);
+        let x = round(conv_test_values(0x91, c.b * c.c_in * c.l));
+        let w = round(conv_test_values(0x92, c.c_out * c.c_in * c.k));
+        let (want, l_out) = naive_conv1d(&x, &w, c);
+        let out = half(x.clone(), (c.b, c.c_in, c.l))?.conv1d(
+            &half(w, (c.c_out, c.c_in, c.k))?,
+            None,
+            c.stride,
+            c.padding,
+            c.extra,
+            1,
+        )?;
+        assert_eq!(out.dims(), &[c.b, c.c_out, l_out]);
+        let got: Vec<f32> = out.to_vec()?.into_iter().map(xn::WithDTypeF::to_f32).collect();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= tol * scale, "conv1d {:?}: {g} vs {w}", T::DTYPE);
+        }
+        let c = conv_case(2, 12, 10, 41, 6, 3, 2, 1, 1);
+        let w = round(conv_test_values(0x93, c.c_in * c.c_out * c.k));
+        let (want, l_out) = naive_conv_transpose1d(&x, &w, c);
+        let out = half(x, (c.b, c.c_in, c.l))?.conv_transpose1d(
+            &half(w, (c.c_in, c.c_out, c.k))?,
+            None,
+            c.stride,
+            c.padding,
+            c.extra,
+            1,
+        )?;
+        assert_eq!(out.dims(), &[c.b, c.c_out, l_out]);
+        let got: Vec<f32> = out.to_vec()?.into_iter().map(xn::WithDTypeF::to_f32).collect();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= tol * scale, "conv_transpose1d {:?}: {g} vs {w}", T::DTYPE);
+        }
+        Ok(())
+    }
+    run::<half::f16>(1e-2)
+}

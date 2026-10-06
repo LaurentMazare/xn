@@ -101,10 +101,18 @@ fn gemm_<T: WithDType>(
     // anyway; the cost is that each stripe re-packs the lhs panel, which is negligible at the
     // batch sizes decode uses.
     let nth = crate::threadpool::size();
+    let worth = nth > 1 && m * n * k >= 1 << 14;
     // One stripe per participant. Measured against 0.25x, 0.5x, 2x and 4x that count: 1x and
     // 2x tie, everything else is worse. Splitting the rows instead when the output is too
-    // narrow to stripe was also tried and nets nothing, so narrow outputs stay serial.
-    let stripes = if nth > 1 && n >= nth * 4 && m * n * k >= 1 << 14 { nth } else { 1 };
+    // narrow to stripe was also tried and nets nothing for outputs with few rows, so those
+    // stay serial.
+    //
+    // A tall output, with more rows than columns and at least a microkernel tile of rows per
+    // participant, splits its rows: a column stripe there would be a sliver of a tile wide and
+    // still read the whole lhs. A convolution's `[out_channels, L_out]` over a short window is
+    // the usual case.
+    let by_rows = worth && m > n && m >= nth * 16;
+    let stripes = if by_rows || (worth && n >= nth * 4) { nth } else { 1 };
 
     for b_idx in 0..lhs_b {
         let dst = &mut dst[b_idx * m * n..(b_idx + 1) * m * n];
@@ -115,27 +123,33 @@ fn gemm_<T: WithDType>(
             let lhs_p = lhs.as_ptr() as usize;
             let rhs_p = rhs.as_ptr() as usize;
             crate::threadpool::par_units(stripes, |s| {
-                let per = n.div_ceil(stripes);
-                let n0 = (s * per).min(n);
-                let n1 = (n0 + per).min(n);
-                if n0 == n1 {
+                let len = if by_rows { m } else { n };
+                let per = len.div_ceil(stripes);
+                let i0 = (s * per).min(len);
+                let i1 = (i0 + per).min(len);
+                if i0 == i1 {
                     return;
                 }
-                // SAFETY: stripes own disjoint output columns, and every offset stays inside
-                // the slices borrowed above, which outlive the dispatch.
+                let (rows, cols, dst_o, lhs_o, rhs_o) = if by_rows {
+                    (i1 - i0, n, i0 * dst_rs, i0 * lhs_rs, 0)
+                } else {
+                    (m, i1 - i0, i0 * dst_cs, 0, i0 * rhs_cs)
+                };
+                // SAFETY: stripes own disjoint output rows or columns, and every offset stays
+                // inside the slices borrowed above, which outlive the dispatch.
                 unsafe {
                     gemm::gemm(
-                        m,
-                        n1 - n0,
+                        rows,
+                        cols,
                         k,
-                        (dst_p as *mut T).add(n0 * dst_cs),
+                        (dst_p as *mut T).add(dst_o),
                         dst_cs as isize,
                         dst_rs as isize,
                         false,
-                        lhs_p as *const T,
+                        (lhs_p as *const T).add(lhs_o),
                         lhs_cs as isize,
                         lhs_rs as isize,
-                        (rhs_p as *const T).add(n0 * rhs_cs),
+                        (rhs_p as *const T).add(rhs_o),
                         rhs_cs as isize,
                         rhs_rs as isize,
                         T::zero(),
@@ -1216,6 +1230,12 @@ impl crate::Backend for crate::CpuDevice {
         dilation: usize,
         groups: usize,
     ) -> Result<()> {
+        if in_channels == 0 {
+            // Nothing to sum, so every output is zero. The gemm paths below would be handed an
+            // empty reduction, which BLAS rejects.
+            dst.fill(T::zero());
+            return Ok(());
+        }
         let shape = arch::Conv1d {
             batch,
             in_channels,
@@ -1232,49 +1252,44 @@ impl crate::Backend for crate::CpuDevice {
             return Ok(());
         }
         if USE_IM2COL_CONV1D && groups == 1 {
-            // IM2COL approach: transform conv1d into matrix multiplication
-            // 1. Im2Col: transform input [B, C, L] -> [B, L_out, C * K]
-            // 2. Matmul: [B, L_out, C*K] x [C*K, out_channels] -> [B, L_out, out_channels]
-            // 3. Transpose result to [B, out_channels, L_out]
-
+            // im2col, laid out as [B, C * K, L_out]: row (c, k) is the input channel `c`
+            // shifted by tap `k`, which for a stride-1 convolution is one contiguous copy.
+            // The kernel [out, in, K] read as [out, C * K] then multiplies it straight into
+            // the output layout, [B, out, L_out], with no transpose on either side.
             let k = in_channels * kernel_size;
-
-            // Step 1: Im2Col transformation
-            let col = im2col1d(
-                src,
-                batch,
-                in_channels,
-                length,
-                out_length,
-                kernel_size,
-                stride,
-                padding,
-                dilation,
-            );
-
-            // Step 2: Matrix multiplication
-            // col is [B, L_out, K] where K = in_channels * kernel_size
-            // kernel is [out_channels, in_channels, kernel_size] = [out_channels, K]
-            // We want [B, L_out, out_channels]
-            let mut result = vec![T::zero(); batch * out_length * out_channels];
-
+            // A pointwise convolution's columns are the input itself.
+            let pointwise = kernel_size == 1 && stride == 1 && padding == 0;
+            let col_buf;
+            let col: &Self::Storage<T> = if pointwise {
+                src
+            } else {
+                col_buf = im2col1d(
+                    src,
+                    batch,
+                    in_channels,
+                    length,
+                    out_length,
+                    kernel_size,
+                    stride,
+                    padding,
+                    dilation,
+                )?;
+                &col_buf
+            };
             Self::gemm(
-                &mut result,
-                (&col, 0),
+                dst,
                 (kernel, 0),
-                /* m */ out_length,
-                /* n */ out_channels,
+                (col, 0),
+                /* m */ out_channels,
+                /* n */ out_length,
                 /* k */ k,
                 batch,
-                out_length * k,
                 0,
-                (1, out_channels),
+                k * out_length,
+                (1, out_length),
                 (1, k),
-                (k, 1),
-            )?;
-
-            // Step 3: Transpose from [B, L_out, out_channels] to [B, out_channels, L_out]
-            Self::transpose(dst, &result, 1, 2, &[batch, out_length, out_channels])
+                (1, out_length),
+            )
         } else {
             // Fallback: original implementation for grouped convolutions
             conv1d_direct(
@@ -1417,32 +1432,23 @@ impl crate::Backend for crate::CpuDevice {
         output_padding: usize,
         groups: usize,
     ) -> Result<()> {
-        // COL2IM approach can be used when:
-        // - groups == 1
-        // - padding == 0
-        // - output_padding == 0
-        let can_use_col2im = groups == 1 && padding == 0 && output_padding == 0;
-
-        if USE_COL2IM_CONV1D_TR && can_use_col2im {
-            // COL2IM approach: matmul + col2im transformation
-            // 1. Transpose input from [B, C_in, L_in] to [B, L_in, C_in]
-            // 2. Matmul: [B, L_in, C_in] @ [C_in, C_out * K] -> [B, L_in, C_out * K]
-            // 3. Col2Im: [B, L_in, C_out, K] -> [B, C_out, L_out]
-
-            // Step 1: Transpose input to [B, L_in, C_in]
-            let mut src_transposed = vec![T::zero(); batch * length * in_channels];
-            Self::transpose(&mut src_transposed, src, 1, 2, &[batch, in_channels, length])?;
-
-            // Step 2: Matrix multiplication
-            // src_transposed: [B, L_in, C_in]
-            // kernel: [C_in, C_out, K] stored row-major, treat as [C_in, C_out * K]
-            // result: [B, L_in, C_out * K]
+        if in_channels == 0 {
+            // Nothing to sum, so every output is zero. The gemm paths below would be handed an
+            // empty reduction, which BLAS rejects.
+            dst.fill(T::zero());
+            return Ok(());
+        }
+        if USE_COL2IM_CONV1D_TR && groups == 1 {
+            // [B, L_in, C_in] @ [C_in, C_out * K] -> [B, L_in, C_out * K], then col2im
+            // overlap-adds the taps into [B, C_out, L_out]. The input is [B, C_in, L_in]; the
+            // gemm reads it transposed through its strides rather than through a copy.
             let n = out_channels * kernel_size;
-            let mut col = vec![T::zero(); batch * length * n];
-
+            // SAFETY: the gemm writes every element; its reduction is not empty, since
+            // `in_channels > 0` here.
+            let mut col = unsafe { Self::alloc_uninit(batch * length * n, &crate::CPU)? };
             Self::gemm(
                 &mut col,
-                (&src_transposed, 0),
+                (src, 0),
                 (kernel, 0),
                 /* m */ length,
                 /* n */ n,
@@ -1451,18 +1457,13 @@ impl crate::Backend for crate::CpuDevice {
                 length * in_channels,
                 0,
                 (1, n),
-                (1, in_channels),
+                (length, 1),
                 (1, n),
             )?;
-
-            // Step 3: Col2Im transformation
-            // col is [B, L_in, C_out * K] = [B, L_in, C_out, K]
-            // output is [B, C_out, L_out]
-            col2im1d(dst, &col, batch, length, out_channels, kernel_size, stride);
-
+            col2im1d(dst, &col, length, out_channels, kernel_size, stride, padding, out_length);
             Ok(())
         } else {
-            // Fallback: original implementation for grouped convolutions or with padding
+            // Fallback for grouped convolutions.
             conv_transpose1d_direct(
                 dst,
                 src,
@@ -1769,8 +1770,12 @@ where
     }
 }
 
-/// Im2Col transformation for 1D convolution.
-/// Transforms input from [B, C, L] to [B, L_out, C * K] for matrix multiplication.
+/// The `[B, C * K, L_out]` im2col buffer for [`crate::CpuDevice::conv1d`].
+///
+/// Row `(c, k)` holds input channel `c` sampled at `l * stride + k * dilation - padding` for
+/// every output position `l`, zero where that falls outside the input. The positions inside
+/// the input are one contiguous range of `l`, so a row is that range copied (a single
+/// `copy_from_slice` at stride 1) with zeros on either side, and no bounds test per element.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 fn im2col1d<T: WithDTypeF>(
@@ -1783,40 +1788,47 @@ fn im2col1d<T: WithDTypeF>(
     stride: usize,
     padding: usize,
     dilation: usize,
-) -> Vec<T> {
-    let k = in_channels * l_k;
-    let mut dst = vec![T::zero(); batch * l_out * k];
+) -> Result<Vec<T>> {
+    let rows = batch * in_channels * l_k;
+    // SAFETY: `fill_row` writes every element of its row.
+    let mut dst =
+        unsafe { <crate::CpuDevice as crate::Backend>::alloc_uninit(rows * l_out, &crate::CPU)? };
 
-    let fill_row = |bl: usize, dst_row: &mut [T]| {
-        let b_idx = bl / l_out;
-        let l_idx = bl % l_out;
-        let src_b_offset = b_idx * in_channels * length;
-
-        for c_idx in 0..in_channels {
-            let src_c_offset = src_b_offset + c_idx * length;
-            let dst_c_offset = c_idx * l_k;
-
-            for (l_k_idx, dst) in dst_row[dst_c_offset..dst_c_offset + l_k].iter_mut().enumerate() {
-                let src_l = l_idx * stride + l_k_idx * dilation;
-
-                // Handle padding
-                if src_l < padding || src_l >= length + padding {
-                    // Zero padding - already initialized to zero
-                    continue;
+    let fill_row = |row: usize, dst_row: &mut [T]| {
+        let k_idx = row % l_k;
+        let c_idx = (row / l_k) % in_channels;
+        let b_idx = row / (l_k * in_channels);
+        let src_c = &src[(b_idx * in_channels + c_idx) * length..][..length];
+        // Output `l` reads input position `l * stride + shift`, which is inside the input
+        // for `l` in `l0..l1`.
+        let shift = (k_idx * dilation) as isize - padding as isize;
+        let first_inside = |pos: isize| match pos {
+            ..=0 => 0,
+            pos => (pos as usize).div_ceil(stride),
+        };
+        let l0 = first_inside(-shift).min(l_out);
+        let l1 = first_inside(length as isize - shift).clamp(l0, l_out);
+        let (before, rest) = dst_row.split_at_mut(l0);
+        let (inside, after) = rest.split_at_mut(l1 - l0);
+        before.fill(T::zero());
+        after.fill(T::zero());
+        if !inside.is_empty() {
+            let src_c = &src_c[(l0 * stride).wrapping_add_signed(shift)..];
+            if stride == 1 {
+                inside.copy_from_slice(&src_c[..inside.len()]);
+            } else {
+                for (d, s) in inside.iter_mut().zip(src_c.iter().step_by(stride)) {
+                    *d = *s;
                 }
-                let src_l = src_l - padding;
-                let src_idx = src_c_offset + src_l;
-                *dst = src[src_idx];
             }
         }
     };
-    if use_parallelism(batch * l_out * k) {
-        crate::threadpool::par_chunks_mut(&mut dst, k, |bl, dst_row| fill_row(bl, dst_row));
+    if use_parallelism(rows * l_out) {
+        crate::threadpool::par_chunks_mut(&mut dst, l_out, |row, dst_row| fill_row(row, dst_row));
     } else {
-        dst.chunks_mut(k).enumerate().for_each(|(bl, dst_row)| fill_row(bl, dst_row));
+        dst.chunks_mut(l_out).enumerate().for_each(|(row, dst_row)| fill_row(row, dst_row));
     }
-
-    dst
+    Ok(dst)
 }
 
 /// Direct conv1d implementation (fallback for grouped convolutions).
@@ -1902,47 +1914,84 @@ fn conv1d_direct<T: WithDTypeF>(
     Ok(())
 }
 
-/// Col2Im transformation for 1D transposed convolution.
-/// Transforms col from [B, L_in, C_out, K] to output [B, C_out, L_out].
-/// Following the reference implementation closely.
+/// Col2im for [`crate::CpuDevice::conv_transpose1d`]: overlap-adds `col`, laid out as
+/// `[B, L_in, C_out, K]`, into the output `[B, C_out, L_out]`.
+///
+/// Input position `l` and tap `k` land on output `l * stride + k - padding`; taps that fall
+/// outside `0..L_out` are cropped, and output positions no tap reaches stay zero.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all)]
 fn col2im1d<T: WithDTypeF>(
     dst: &mut [T],
     col: &[T],
-    _b_size: usize,
     l_in: usize,
     c_out: usize,
     k_size: usize,
     stride: usize,
+    padding: usize,
+    l_out: usize,
 ) {
-    let l_out = (l_in - 1) * stride + k_size;
-
-    // Strides for source [B, L_in, C_out, K] stored as [B, L_in, C_out * K]
-    let (src_s0, src_s1, src_s2) = (c_out * k_size * l_in, c_out * k_size, k_size);
-
-    // Each (b, c) pair owns a contiguous l_out-sized slice of dst, so the accumulation can
-    // run in parallel over those slices with contiguous reads from col.
-    let accumulate = |bc: usize, dst: &mut [T]| {
-        let b_i = bc / c_out;
-        let c_i = bc % c_out;
+    // A block of output rows, (b, c) pairs, starting at row `r0`. The loop runs over input
+    // positions outside and rows inside: col is then read front to back, and a row is added
+    // to again only a block's worth of rows later. With the rows inside, consecutive adds
+    // would each wait on the store of the one before, since their spans overlap.
+    let accumulate = |r0: usize, dst: &mut [T]| {
         dst.fill(T::zero());
-        for l_in_i in 0..l_in {
-            let src_base = b_i * src_s0 + l_in_i * src_s1 + c_i * src_s2;
-            let dst_base = l_in_i * stride;
-            for k_i in 0..k_size {
-                dst[dst_base + k_i] += col[src_base + k_i];
+        let rows = dst.len() / l_out;
+        let mut done = 0;
+        while done < rows {
+            // The rows left in this batch entry: consecutive channels, whose taps for one input
+            // position sit next to each other in col.
+            let (b_i, c_i) = ((r0 + done) / c_out, (r0 + done) % c_out);
+            let n = (c_out - c_i).min(rows - done);
+            let block = &mut dst[done * l_out..(done + n) * l_out];
+            for l_in_i in 0..l_in {
+                let start = (l_in_i * stride) as isize - padding as isize;
+                let k0 = start.min(0).unsigned_abs().min(k_size);
+                let k1 = (l_out as isize - start).clamp(k0 as isize, k_size as isize) as usize;
+                if k0 == k1 {
+                    continue;
+                }
+                let o = start.wrapping_add_unsigned(k0) as usize;
+                let base = ((b_i * l_in + l_in_i) * c_out + c_i) * k_size;
+                let taps = col[base..base + n * k_size].chunks_exact(k_size);
+                for (row, taps) in block.chunks_exact_mut(l_out).zip(taps) {
+                    add_assign(&mut row[o..o + k1 - k0], &taps[k0..k1]);
+                }
             }
+            done += n;
         }
     };
-    if use_parallelism(dst.len().max(col.len())) {
-        crate::threadpool::par_chunks_mut(dst, l_out, |bc, dst| accumulate(bc, dst));
-    } else {
-        dst.chunks_mut(l_out).enumerate().for_each(|(bc, dst)| accumulate(bc, dst));
+    let rows = dst.len() / l_out.max(1);
+    // The work is the larger of the two buffers, for the pool's decision as for this one.
+    let work = dst.len().max(col.len());
+    if use_parallelism(work) {
+        let per = rows.div_ceil(crate::threadpool::size());
+        crate::threadpool::par_chunks_mut_by(work, dst, per * l_out, |i, dst| {
+            accumulate(i * per, dst)
+        });
+    } else if rows > 0 {
+        accumulate(0, dst);
     }
 }
 
-/// Direct conv_transpose1d implementation (fallback for grouped convolutions or with padding).
+/// `dst += src`, elementwise, in fixed blocks of four so that even a short span is added
+/// with vector instructions.
+#[inline(always)]
+fn add_assign<T: WithDType>(dst: &mut [T], src: &[T]) {
+    let (dst4, dst_tail) = dst.as_chunks_mut::<4>();
+    let (src4, src_tail) = src.as_chunks::<4>();
+    for (d, s) in dst4.iter_mut().zip(src4) {
+        for i in 0..4 {
+            d[i] += s[i];
+        }
+    }
+    for (d, s) in dst_tail.iter_mut().zip(src_tail) {
+        *d += *s;
+    }
+}
+
+/// Direct conv_transpose1d implementation (fallback for grouped convolutions).
 #[allow(clippy::too_many_arguments)]
 fn conv_transpose1d_direct<T: WithDTypeF>(
     dst: &mut [T],
@@ -1964,14 +2013,18 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
 
     dst.fill(T::zero());
 
-    // Reorder input from [B, C, L] to [B, L, C] for contiguous memory access
-    let mut src_reordered = vec![T::zero(); batch * length * in_channels];
-    for b in 0..batch {
-        for l in 0..length {
-            for c in 0..in_channels {
-                let src_idx = b * in_channels * length + c * length + l;
-                let dst_idx = b * length * in_channels + l * in_channels + c;
-                src_reordered[dst_idx] = src[src_idx];
+    // Reorder input from [B, C, L] to [B, L, C] for contiguous memory access. A depthwise
+    // convolution reads one channel at a time, which is contiguous already.
+    let mut src_reordered = vec![];
+    if in_c_per_group > 1 {
+        src_reordered = vec![T::zero(); batch * length * in_channels];
+        for b in 0..batch {
+            for l in 0..length {
+                for c in 0..in_channels {
+                    let src_idx = b * in_channels * length + c * length + l;
+                    let dst_idx = b * length * in_channels + l * in_channels + c;
+                    src_reordered[dst_idx] = src[src_idx];
+                }
             }
         }
     }
@@ -1988,24 +2041,29 @@ fn conv_transpose1d_direct<T: WithDTypeF>(
         let g = out_c / out_c_per_group;
         let oc_in_group = out_c % out_c_per_group;
         let in_c_start = g * in_c_per_group;
-        let src_row = &src_reordered[b * length * in_channels..(b + 1) * length * in_channels];
         // Kernel layout: [in_channels, out_channels/groups, kernel_size]
         let k_base = in_c_start * out_c_per_group * kernel_size + oc_in_group * kernel_size;
 
         if in_c_per_group == 1 {
             // Depthwise: the dot product over input channels collapses to a single multiply,
-            // and this channel's kernel taps are contiguous.
+            // so each input position adds its value times this channel's taps, which are
+            // contiguous, to a contiguous span of the output. Walking the input backwards adds
+            // into each output position in increasing tap order, as the general loop below does.
+            let x = &src[(b * in_channels + in_c_start) * length..][..length];
             let w = &kernel[k_base..k_base + kernel_size];
-            for (k_offset, &wk) in w.iter().enumerate() {
-                for il in 0..length {
-                    let out_pos_raw = il * stride + k_offset;
-                    if out_pos_raw < padding || out_pos_raw >= out_length + padding {
-                        continue;
+            for (il, &xv) in x.iter().enumerate().rev() {
+                let start = (il * stride) as isize - padding as isize;
+                let k0 = start.min(0).unsigned_abs().min(kernel_size);
+                let k1 = (out_length as isize - start).clamp(k0 as isize, kernel_size as isize);
+                let (k1, o) = (k1 as usize, start.wrapping_add_unsigned(k0) as usize);
+                if k0 < k1 {
+                    for (d, &wk) in dst_row[o..o + k1 - k0].iter_mut().zip(&w[k0..k1]) {
+                        *d += xv * wk;
                     }
-                    dst_row[out_pos_raw - padding] += src_row[il * in_channels + in_c_start] * wk;
                 }
             }
         } else {
+            let src_row = &src_reordered[b * length * in_channels..(b + 1) * length * in_channels];
             // This channel's taps for a given k_offset sit `out_c_per_group * kernel_size`
             // apart in `kernel`, so gather them once per offset rather than reading them
             // strided inside the `il` loop: the dot product below then walks two contiguous
