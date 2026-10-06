@@ -277,6 +277,10 @@ pub fn unary(dst: &mut [f32], src: &[f32], op: UnaryOp) -> bool {
 /// `exp(a)` for a softmax's arguments, which are at most zero or NaN. Below `EXP_ZERO`, which
 /// takes in the `-inf` of a masked position, it is zero, as the scalar `exp` is; the rare lanes
 /// between that and the clamp take the scalar `f32::exp`.
+///
+/// A NaN in the row may drop out of the row's max (wasm's `pmax` ignores it, NEON's `max` does
+/// not), but its own lane is still NaN here, so the sum and with it the whole row come out NaN
+/// on every target, as in the scalar softmax.
 #[inline(always)]
 fn exp_nonpositive(a: Lanes) -> Lanes {
     let y = exp(a);
@@ -708,6 +712,11 @@ mod tests {
             let mut dst = vec![0f32; len];
             assert!(softmax_row(&mut dst, &vec![ninf; len]));
             assert!(dst.iter().all(|v| v.is_nan()), "len {len}: all masked gave {dst:?}");
+            // A `+inf` makes the max infinite and `inf - inf` NaN, as in the scalar softmax.
+            let mut inf = vec![0.5f32; len];
+            inf[len - 1] = f32::INFINITY;
+            assert!(softmax_row(&mut dst, &inf));
+            assert!(dst.iter().all(|v| v.is_nan()), "len {len}: +inf gave {dst:?}");
         }
         assert!(softmax_row(&mut [], &[]));
     }

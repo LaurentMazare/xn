@@ -1663,14 +1663,19 @@ where
     }
 }
 
+/// Whether [`arch::unary_inplace`] has a kernel for `op` on `T`: on an empty slice a kernel is
+/// a no-op, so running it only answers the question.
+fn has_arch_unary<T: 'static>(op: UnaryOp) -> bool {
+    arch::unary_inplace::<T>(&mut [], op)
+}
+
 /// [`arch::unary_inplace`], split across the pool like [`apply_inplace_unary`] when the work is
 /// large enough. Says whether there is a kernel for `op`.
 fn arch_unary_inplace<T: Send + Sync + 'static>(dst: &mut [T], op: UnaryOp) -> bool {
     if !use_parallelism(dst.len()) {
         return arch::unary_inplace(dst, op);
     }
-    // On an empty slice a kernel is a no-op, so this asks whether there is one.
-    arch::unary_inplace::<T>(&mut [], op) && {
+    has_arch_unary::<T>(op) && {
         crate::threadpool::par_chunks_mut(dst, ELEMWISE_CHUNK, |_, d| {
             arch::unary_inplace(d, op);
         });
@@ -1684,7 +1689,7 @@ fn arch_unary<T: Send + Sync + 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -
     if !use_parallelism(dst.len()) {
         return arch::unary(dst, src, op);
     }
-    arch::unary_inplace::<T>(&mut [], op) && {
+    has_arch_unary::<T>(op) && {
         crate::threadpool::par_chunks_zip(dst, ELEMWISE_CHUNK, src, ELEMWISE_CHUNK, |_, d, s| {
             arch::unary(d, s, op);
         });
