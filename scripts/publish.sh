@@ -36,6 +36,23 @@ if ! cargo package -p xn --list | grep -qx 'third_party/kleidiai/kai/kai_common.
 fi
 # Verifies with `kai` on, so the kernels must build from the package's own files.
 cargo publish -p xn --features kai --dry-run
-if $publish; then
-  cargo publish -p xn --features kai
+if ! $publish; then
+  echo
+  echo "Dry run only: nothing was published. To publish xn $version, run"
+  echo "  scripts/publish.sh --publish"
+  echo "and not cargo publish, which packages your own checkout, with or without KleidiAI."
+  exit 0
 fi
+cargo publish -p xn --features kai
+
+# Read the crate back from crates.io: what was uploaded is what users get.
+crate="https://static.crates.io/crates/xn/xn-$version.crate"
+for _ in $(seq 30); do
+  curl -sfL "$crate" -o "$dir/published.crate" && break
+  sleep 10
+done
+if ! tar -tzf "$dir/published.crate" | grep -q "/third_party/kleidiai/kai/kai_common.h$"; then
+  echo "xn $version on crates.io has no KleidiAI kernels: yank it (cargo yank --version $version xn)" >&2
+  exit 1
+fi
+echo "Published xn $version with the KleidiAI kernels."
