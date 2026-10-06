@@ -25,6 +25,8 @@ jobs:
         with:
           command: check
       # Builds the KleidiAI kernels on the arm64 macOS runner, and nothing on x86.
+      - name: Fetch KleidiAI
+        run: git submodule update --init --depth 1 xn-core/third_party/kleidiai
       - name: Check the kai feature
         run: cargo check -p xn --features kai
 
@@ -49,8 +51,11 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
-      # The macOS runners are arm64, so this builds the vendored KleidiAI kernels. They have
-      # no SME2, so the kernels themselves do not run here, only the fallback.
+      # The macOS runners are arm64, so this builds the KleidiAI kernels. They have no SME2,
+      # so the kernels themselves do not run here, only the fallback.
+      - name: Fetch KleidiAI
+        if: matrix.os == 'macOS-latest'
+        run: git submodule update --init --depth 1 xn-core/third_party/kleidiai
       - name: Test the kai feature
         if: matrix.os == 'macOS-latest'
         run: cargo test -p xn --features kai
@@ -80,6 +85,7 @@ jobs:
       - run: cargo test -p xn
       # The kai feature with gcc and its Linux SME2 check. The runner has no SME2, so the
       # kernels themselves do not run.
+      - run: git submodule update --init --depth 1 xn-core/third_party/kleidiai
       - run: cargo test -p xn --features kai
       - run: rustup component add clippy
       - run: cargo clippy -p xn --features kai --all-targets -- -D warnings

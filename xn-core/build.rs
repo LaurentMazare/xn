@@ -23,7 +23,7 @@ fn main() {
     build_kai();
 }
 
-/// Compile the vendored KleidiAI kernels in `third_party/kleidiai` and set `xn_kai`, on the
+/// Compile the KleidiAI kernels in `third_party/kleidiai` and set `xn_kai`, on the
 /// targets that can run them: AArch64 on Apple platforms, Linux and Android. Anywhere else, or
 /// with a C toolchain that cannot build them, the feature compiles nothing and
 /// `quantized::kai` does not exist.
@@ -40,8 +40,18 @@ fn build_kai() {
     if var("CARGO_CFG_TARGET_ARCH") != "aarch64" || !supported {
         return;
     }
+    // A git submodule, pinned to a KleidiAI release; see `third_party/README.md`. The files
+    // compiled here are also the only ones `exclude` in `Cargo.toml` lets into the package.
     let root = std::path::Path::new("third_party/kleidiai");
     println!("cargo:rerun-if-changed={}", root.display());
+    if !root.join("kai/kai_common.h").exists() {
+        println!(
+            "cargo:warning=kai: {} is empty, so the feature is off. \
+             Run `git submodule update --init xn-core/third_party/kleidiai`.",
+            root.display()
+        );
+        return;
+    }
     let pack = root.join("kai/ukernels/matmul/pack");
     let q8 = root.join("kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp");
     let build = |flags: &[&str]| {
