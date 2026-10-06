@@ -97,12 +97,12 @@ pub fn with_kleidi_ai() -> bool {
 
 #[cfg(all(test, feature = "kai", target_arch = "aarch64", target_vendor = "apple"))]
 mod kai_build {
-    /// On Apple's arm64 the kernels always build, unless the KleidiAI submodule is missing.
+    /// On Apple's arm64 the vendored kernels always build.
     #[test]
     fn the_kernels_are_built() {
         assert!(
             crate::with_kleidi_ai(),
-            "run `git submodule update --init xn-core/third_party/kleidiai`"
+            "the KleidiAI kernels in third_party/kleidiai did not build"
         );
     }
 }

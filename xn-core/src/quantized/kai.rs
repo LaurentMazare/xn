@@ -2,7 +2,7 @@
 //!
 //! Apple's M4 and M5, and Arm's Cortex-X925 and later, have an SME2 matrix unit that
 //! multiplies a whole tile per instruction. Rust cannot reach it yet, so this binds
-//! [KleidiAI]'s hand-written kernels for it, which `build.rs` compiles from the git submodule
+//! [KleidiAI]'s hand-written kernels for it, which `build.rs` compiles from the files vendored
 //! in `third_party/kleidiai`. On a CPU without SME2, or with `XN_KAI=0`, nothing here is used
 //! and `q8_0` weights keep the layouts in [`super::repack`].
 //!
