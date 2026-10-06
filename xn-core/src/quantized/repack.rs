@@ -511,6 +511,12 @@ pub fn q8_0_storage_owned(src: Vec<BlockQ8_0>, dims: &[usize]) -> super::QStorag
 }
 
 fn interleaved(src: &[BlockQ8_0], dims: &[usize]) -> Option<super::QStorage> {
+    // KleidiAI's layout comes first when it is built in and in use. It takes any shape the
+    // interleave does and more, so the interleave is its fallback.
+    #[cfg(xn_kai)]
+    if let Some(storage) = super::kai::q8_0_storage(src, dims) {
+        return Some(storage);
+    }
     if enabled() && is_eligible(dims) {
         // Interleaving is an optimization; a shape we mis-judged just keeps the plain layout.
         if let Ok(packed) = Q8_0x4::from_q8_0(src, dims[0], dims[1]) {
@@ -535,6 +541,20 @@ mod tests {
     /// interleaved layout from the plain one.
     fn stored_bytes(storage: &dyn QuantizedType) -> &[u8] {
         unsafe { std::slice::from_raw_parts(storage.as_ptr(), storage.storage_size_in_bytes()) }
+    }
+
+    /// Whether `q8_0_storage` hands tensors to `kai` instead. Its layout is lossy and its bytes
+    /// are not the canonical ones, so the byte-level checks here, which are about the
+    /// interleave, step aside; `kai`'s own tests cover its layout.
+    fn kai_active() -> bool {
+        #[cfg(xn_kai)]
+        {
+            crate::quantized::kai::active()
+        }
+        #[cfg(not(xn_kai))]
+        {
+            false
+        }
     }
 
     fn weights(n: usize, k: usize) -> Vec<BlockQ8_0> {
@@ -607,6 +627,9 @@ mod tests {
     /// `enabled()` decided for this build, which is the point -- both branches are wired.
     #[test]
     fn q8_0_storage_is_layout_agnostic() {
+        if kai_active() {
+            return;
+        }
         let (m, n, k) = (3, 8, 128);
         let plain = weights(n, k);
         let storage = q8_0_storage(&plain, &[n, k]);
@@ -643,6 +666,9 @@ mod tests {
     /// whatever the gate says.
     #[test]
     fn q8_0_storage_falls_back_on_ineligible_shapes() {
+        if kai_active() {
+            return;
+        }
         let (n, k) = (6, 64); // n % NCOLS != 0
         let plain = weights(n, k);
         let crate::quantized::QStorage::Cpu(storage) = &q8_0_storage(&plain, &[n, k]);
@@ -660,6 +686,9 @@ mod tests {
     /// model has the same layout (and so the same kernel) whichever way it was loaded.
     #[test]
     fn quantize_f32_matches_the_gguf_layout() {
+        if kai_active() {
+            return;
+        }
         for (n, k) in [(8, 128), (6, 64) /* ineligible: n % NCOLS != 0 */] {
             let raw: Vec<f32> =
                 (0..n * k).map(|i| ((i * 37 % 211) as f32 - 105.0) / 64.0).collect();

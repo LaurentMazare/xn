@@ -87,6 +87,24 @@ pub fn with_f16c() -> bool {
     cfg!(target_feature = "f16c")
 }
 
+/// Whether xn was built with KleidiAI's kernels: the `kai` feature, on a target they support.
+/// They run only on a CPU with SME2, and not when `XN_KAI` is `0`.
+pub fn with_kleidi_ai() -> bool {
+    cfg!(xn_kai)
+}
+
+#[cfg(all(test, feature = "kai", target_arch = "aarch64", target_vendor = "apple"))]
+mod kai_build {
+    /// On Apple's arm64 the kernels always build, unless the KleidiAI submodule is missing.
+    #[test]
+    fn the_kernels_are_built() {
+        assert!(
+            crate::with_kleidi_ai(),
+            "run `git submodule update --init xn-core/third_party/kleidiai`"
+        );
+    }
+}
+
 pub trait Module {
     fn forward<T: WithDType, B: Backend>(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>>;
 }
