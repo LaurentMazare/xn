@@ -94,11 +94,20 @@ enum Rhs {
     NxK(usize),
 }
 
+/// How the lhs is laid out: `m` rows of `k`, or `k` rows of `m`, each with a row stride. The
+/// packing routine takes the first, so the second is transposed into it first.
+#[derive(Clone, Copy)]
+enum Lhs {
+    MxK(usize),
+    KxM(usize),
+}
+
 /// Packed operands, reused across calls. Each buffer keeps the size of the largest matmul its
 /// thread has run, for the life of the thread.
 #[derive(Default)]
 struct Scratch {
     lhs: Vec<f32>,
+    lhs_t: Vec<f32>,
     rhs: Vec<f32>,
     bias: Vec<f32>,
 }
@@ -133,9 +142,16 @@ pub(crate) fn gemm(
     if m < 2 || n == 0 || k == 0 || batch == 0 || !crate::quantized::kai::active() {
         return false;
     }
-    if dst_cs != 1 || lhs_cs != 1 {
+    if dst_cs != 1 {
         return false;
     }
+    let lhs_layout = if lhs_cs == 1 {
+        Lhs::MxK(lhs_rs)
+    } else if lhs_rs == 1 {
+        Lhs::KxM(lhs_cs)
+    } else {
+        return false;
+    };
     let layout = if rhs_cs == 1 {
         Rhs::KxN(rhs_rs)
     } else if rhs_rs == 1 {
@@ -144,7 +160,11 @@ pub(crate) fn gemm(
         return false;
     };
     // Every element the kernels read or write has to be inside the slices.
-    let lhs_end = (batch - 1) * lhs_b_stride + (m - 1) * lhs_rs + k;
+    let lhs_end = (batch - 1) * lhs_b_stride
+        + match lhs_layout {
+            Lhs::MxK(s) => (m - 1) * s + k,
+            Lhs::KxM(s) => (k - 1) * s + m,
+        };
     let rhs_end = (batch - 1) * rhs_b_stride
         + match layout {
             Rhs::KxN(s) => (k - 1) * s + n,
@@ -221,17 +241,32 @@ pub(crate) fn gemm(
                 if b == 0 || rhs_b_stride != 0 {
                     pack_rhs(rhs.as_ptr().add(b * rhs_b_stride));
                 }
-                kai_run_lhs_pack_f32p2vlx1_f32_sme(
-                    m,
-                    k,
-                    mr,
-                    kr,
-                    sr,
-                    0,
-                    lhs.as_ptr().add(b * lhs_b_stride).cast(),
-                    lhs_rs * f,
-                    lhs_packed,
-                );
+                if b == 0 || lhs_b_stride != 0 {
+                    let src = &lhs[b * lhs_b_stride..];
+                    let (ptr, stride) = match lhs_layout {
+                        Lhs::MxK(st) => (src.as_ptr(), st),
+                        Lhs::KxM(st) => {
+                            s.lhs_t.resize(m * k, 0.0);
+                            for (p, col) in src.chunks(st).take(k).enumerate() {
+                                for (i, &x) in col[..m].iter().enumerate() {
+                                    s.lhs_t[i * k + p] = x;
+                                }
+                            }
+                            (s.lhs_t.as_ptr(), k)
+                        }
+                    };
+                    kai_run_lhs_pack_f32p2vlx1_f32_sme(
+                        m,
+                        k,
+                        mr,
+                        kr,
+                        sr,
+                        0,
+                        ptr.cast(),
+                        stride * f,
+                        lhs_packed,
+                    );
+                }
                 kai_run_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa(
                     m,
                     n,
@@ -269,7 +304,7 @@ mod tests {
             .collect()
     }
 
-    /// `lhs` row-major with row stride `lhs_rs`; `rhs[(p, j)]` at `p * rs.1 + j * rs.0`.
+    /// `lhs[(i, p)]` at `i * ls.1 + p * ls.0`, `rhs[(p, j)]` at `p * rs.1 + j * rs.0`.
     #[allow(clippy::too_many_arguments)]
     fn reference(
         lhs: &[f32],
@@ -278,7 +313,7 @@ mod tests {
         batch: usize,
         (lb, rb): (usize, usize),
         dst_rs: usize,
-        lhs_rs: usize,
+        (lhs_cs, lhs_rs): (usize, usize),
         (rhs_cs, rhs_rs): (usize, usize),
     ) -> Vec<f32> {
         let mut dst = vec![0f32; (batch - 1) * m * n + (m - 1) * dst_rs + n];
@@ -288,7 +323,7 @@ mod tests {
                     dst[b * m * n + i * dst_rs + j] = (0..k)
                         .map(|p| {
                             let r = rhs[b * rb + p * rhs_rs + j * rhs_cs] as f64;
-                            lhs[b * lb + i * lhs_rs + p] as f64 * r
+                            lhs[b * lb + i * lhs_rs + p * lhs_cs] as f64 * r
                         })
                         .sum::<f64>() as f32;
                 }
@@ -297,32 +332,47 @@ mod tests {
         dst
     }
 
-    /// Both rhs layouts, partial tiles in `m` and `n`, padded lhs and dst rows, and a batch
-    /// with a shared and with a per-batch rhs.
+    /// Both layouts of each input, partial tiles in `m` and `n`, padded lhs and dst rows, and
+    /// batches with a shared or a per-batch lhs and rhs.
     #[test]
     fn matches_the_reference() {
+        // (m, n, k, batch, which input is per batch, kxm lhs, kxn rhs, lhs pad, dst pad)
+        let (lhs_b, rhs_b, both) = ((true, false), (false, true), (true, true));
         let cases = [
-            // (m, n, k, batch, rhs per batch, kxn, lhs pad, dst pad)
-            (2, 3, 1, 1, false, true, 0, 0),
-            (16, 2048, 512, 1, false, false, 0, 0),
-            (17, 70, 33, 1, false, true, 5, 3),
-            (96, 128, 64, 1, false, false, 0, 0),
-            (480, 64, 384, 1, false, true, 0, 0),
-            (16, 266, 64, 3, true, true, 0, 0),
-            (16, 64, 266, 3, true, false, 0, 0),
-            (5, 40, 24, 4, false, false, 2, 0),
+            (2, 3, 1, 1, both, false, true, 0, 0),
+            (16, 2048, 512, 1, both, false, false, 0, 0),
+            (17, 70, 33, 1, both, false, true, 5, 3),
+            (96, 128, 64, 1, both, false, false, 0, 0),
+            (480, 64, 384, 1, both, false, true, 0, 0),
+            (16, 266, 64, 3, both, false, true, 0, 0),
+            (16, 64, 266, 3, both, false, false, 0, 0),
+            (5, 40, 24, 4, lhs_b, false, false, 2, 0),
+            (16, 3072, 512, 1, both, true, true, 0, 0),
+            (19, 130, 40, 2, both, true, true, 3, 0),
+            (64, 96, 72, 3, rhs_b, false, true, 0, 0),
+            (7, 33, 18, 2, rhs_b, true, false, 1, 0),
         ];
-        for (m, n, k, batch, per_batch, kxn, lhs_pad, dst_pad) in cases {
-            let lhs_rs = k + lhs_pad;
+        for (m, n, k, batch, (lhs_per, rhs_per), kxm, kxn, lhs_pad, dst_pad) in cases {
             let dst_rs = n + dst_pad;
+            let (lhs_cs, lhs_rs) = if kxm { (m + lhs_pad, 1) } else { (1, k + lhs_pad) };
             let (rhs_cs, rhs_rs) = if kxn { (1, n) } else { (k, 1) };
-            let rb = if per_batch { n * k } else { 0 };
-            let lb = m * lhs_rs;
-            let lhs = uniform(0xA076_1D64 + (m * n) as u64, batch * lb);
+            let lhs_len = if kxm { k * (m + lhs_pad) } else { m * (k + lhs_pad) };
+            let lb = if lhs_per { lhs_len } else { 0 };
+            let rb = if rhs_per { n * k } else { 0 };
+            let lhs =
+                uniform(0xA076_1D64 + (m * n) as u64, lhs_len * if lhs_per { batch } else { 1 });
             let rhs =
-                uniform(0xE703_7ED1 + (n * k) as u64, n * k * if per_batch { batch } else { 1 });
-            let want =
-                reference(&lhs, &rhs, (m, n, k), batch, (lb, rb), dst_rs, lhs_rs, (rhs_cs, rhs_rs));
+                uniform(0xE703_7ED1 + (n * k) as u64, n * k * if rhs_per { batch } else { 1 });
+            let want = reference(
+                &lhs,
+                &rhs,
+                (m, n, k),
+                batch,
+                (lb, rb),
+                dst_rs,
+                (lhs_cs, lhs_rs),
+                (rhs_cs, rhs_rs),
+            );
             let mut got = vec![f32::NAN; want.len()];
             let ran = gemm(
                 &mut got,
@@ -332,7 +382,7 @@ mod tests {
                 batch,
                 (lb, rb),
                 (1, dst_rs),
-                (1, lhs_rs),
+                (lhs_cs, lhs_rs),
                 (rhs_cs, rhs_rs),
             );
             if !crate::quantized::kai::active() {
