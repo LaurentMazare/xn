@@ -1,6 +1,15 @@
 use crate::nn::var_builder::Path;
 use crate::{Backend, Result, Tensor, WithDTypeF};
 
+/// A linear layer, `x @ weight^T + bias`.
+///
+/// The weight is treated as a model parameter: on the CPU, the gemm keeps it packed between
+/// calls instead of packing it on every call. Do not write it in place once the layer has run.
+///
+/// Each thread that runs part of the product keeps its own packed copy, and dropping the layer
+/// does not release it: copies are held until their thread exits. `GEMM_PACKED_LHS_CACHE_MB`
+/// caps what is held across the process (256 by default; past it, products pack per call as
+/// before), and `GEMM_PACKED_LHS_CACHE_MB=0` turns the cache off.
 pub struct Linear<T: WithDTypeF, B: Backend> {
     weight: Tensor<T, B>,
     bias: Option<Tensor<T, B>>,
@@ -65,7 +74,11 @@ impl<T: WithDTypeF, B: Backend> Linear<T, B> {
         // weight: (out_features, in_features)
         // x: (..., in_features)
         // output: (..., out_features)
-        let x = crate::ops::matmul_t(x, &self.weight)?;
+        // The weight is a parameter, so the CPU gemm may keep it packed across calls.
+        let len = self.weight.elem_count();
+        let parameter = crate::cpu_backend::parameter::<T, _>(&*self.weight.storage()?, len);
+        let x =
+            gemm::packed_cache::with_constant(parameter, || crate::ops::matmul_t(x, &self.weight))?;
         let x = match &self.bias {
             Some(bias) => x.broadcast_add(bias)?,
             None => x,

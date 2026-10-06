@@ -3463,9 +3463,9 @@ dependencies = [
 
 [[package]]
 name = "xn-gemm"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42f9870e23208b830b4776ad5fa1d75fc53a59cfdad9e9e92a79d31d14613512"
+checksum = "0f5bcb177032cca83eb7aae3de9d6fa9cc5cbb29a0090bb07ef8880cf82e3c7d"
 dependencies = [
  "dyn-stack",
  "num-complex",
@@ -3483,9 +3483,9 @@ dependencies = [
 
 [[package]]
 name = "xn-gemm-c32"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c397f4ceb91ecd9847579d27ea8cec7dedc9a7b0b0f1e69aae636ce1da43feb"
+checksum = "9137ec88a81f5510045a45b1d5fce27b67f9748b8d83400b39163a51ecae6f04"
 dependencies = [
  "dyn-stack",
  "num-complex",
@@ -3498,9 +3498,9 @@ dependencies = [
 
 [[package]]
 name = "xn-gemm-c64"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d4dc98f425aa3c1047099d5d0407d4efb3e5e7aa6e85bd4343b0c7eaa1e57cc"
+checksum = "e9ab9a0de939c339098e4b20da0aa863f66dfbf1a4b0396dff9a13645443d510"
 dependencies = [
  "dyn-stack",
  "num-complex",
@@ -3513,9 +3513,9 @@ dependencies = [
 
 [[package]]
 name = "xn-gemm-common"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c99ef04320b4dc583814dd67b10dff68cc2db60d927770ddee590ac31f4577"
+checksum = "c22f986c37636c5cbc0a6b4e120a5315ef8ba25615504c554a075e3b3286f642"
 dependencies = [
  "bytemuck",
  "dyn-stack",
@@ -3534,9 +3534,9 @@ dependencies = [
 
 [[package]]
 name = "xn-gemm-f16"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33b73379c0fe9c9986dcc1ab7a579a0f9b67f08964b44f08acb5956adfd94002"
+checksum = "c971a82caab9a5960a7c3a6c32bf0c5b6bf5b76492f403997825a4d308b7f233"
 dependencies = [
  "dyn-stack",
  "half",
@@ -3552,9 +3552,9 @@ dependencies = [
 
 [[package]]
 name = "xn-gemm-f32"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b629f3b55e84af9b98faff68bdb2a596c6a39a75356d639e89a803e4b8da9a6e"
+checksum = "56b8b45a6a11b6d9fedcea8be60bb175c1278170484e7956b29bae507e3c3039"
 dependencies = [
  "dyn-stack",
  "num-complex",
@@ -3567,9 +3567,9 @@ dependencies = [
 
 [[package]]
 name = "xn-gemm-f64"
-version = "0.20.1"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e266576fc0829ea63da4fe795bf79b2f959591a8cdea3bbb64cb673452674a3a"
+checksum = "2be9f43b557116575751164c7ce2c9e1a7a5bde9e944843bf87ca3314da7eb41"
 dependencies = [
  "dyn-stack",
  "num-complex",

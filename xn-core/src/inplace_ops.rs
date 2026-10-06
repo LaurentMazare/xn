@@ -735,21 +735,25 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let mut dst = self.storage_mut()?;
         let src_data = src.storage()?;
         let kernel_data = kernel.storage()?;
-        B::conv1d(
-            &mut *dst,
-            &*src_data,
-            &*kernel_data,
-            batch,
-            in_channels,
-            out_channels,
-            length,
-            out_length,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-            groups,
-        )
+        // The kernel is a parameter, so the CPU gemm may keep it packed across calls.
+        let parameter = crate::cpu_backend::parameter::<T, _>(&*kernel_data, kernel.elem_count());
+        gemm::packed_cache::with_constant(parameter, || {
+            B::conv1d(
+                &mut *dst,
+                &*src_data,
+                &*kernel_data,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                groups,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -801,21 +805,25 @@ impl<T: WithDTypeF, B: Backend> Tensor<T, B> {
         let mut dst = self.storage_mut()?;
         let src_data = src.storage()?;
         let kernel_data = kernel.storage()?;
-        B::conv_transpose1d(
-            &mut *dst,
-            &*src_data,
-            &*kernel_data,
-            batch,
-            in_channels,
-            out_channels,
-            length,
-            out_length,
-            kernel_size,
-            stride,
-            padding,
-            output_padding,
-            groups,
-        )
+        // The kernel is a parameter, so the CPU gemm may keep it packed across calls.
+        let parameter = crate::cpu_backend::parameter::<T, _>(&*kernel_data, kernel.elem_count());
+        gemm::packed_cache::with_constant(parameter, || {
+            B::conv_transpose1d(
+                &mut *dst,
+                &*src_data,
+                &*kernel_data,
+                batch,
+                in_channels,
+                out_channels,
+                length,
+                out_length,
+                kernel_size,
+                stride,
+                padding,
+                output_padding,
+                groups,
+            )
+        })
     }
 }
 
