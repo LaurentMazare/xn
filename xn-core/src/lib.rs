@@ -9,6 +9,8 @@ pub mod dtype;
 pub mod error;
 pub mod inplace_ops;
 pub mod models;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub(crate) mod neon_conv;
 pub mod nn;
 pub mod ops;
 pub mod quantized;
