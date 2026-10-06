@@ -2248,3 +2248,109 @@ fn rope_matches_the_reference_on_both_sides_of_the_gate() -> Result<()> {
     }
     Ok(())
 }
+
+// =============================================================================
+// exp-based activations and softmax across the parallelism threshold
+// =============================================================================
+
+type CpuT = Tensor<f32, xn::CpuDevice>;
+type CpuV = TensorView<f32, xn::CpuDevice>;
+
+struct Activation {
+    name: &'static str,
+    tensor: fn(&CpuT) -> Result<CpuT>,
+    view: fn(&CpuV) -> Result<CpuT>,
+    reference: fn(f32) -> f32,
+}
+
+/// The exp and erf activations, out of place and in place (a view goes through the in-place
+/// kernel), below and above the elementwise parallelism threshold: within float noise of the
+/// scalar formulas, and the two paths identical to the bit.
+#[test]
+fn activations_match_the_scalar_formulas_on_both_sides_of_the_gate() -> Result<()> {
+    let dev = &xn::CPU;
+    let ops = [
+        Activation { name: "exp", tensor: |t| t.exp(), view: |v| v.exp(), reference: f32::exp },
+        Activation {
+            name: "silu",
+            tensor: |t| t.silu(),
+            view: |v| v.silu(),
+            reference: |x| x / (1.0 + (-x).exp()),
+        },
+        Activation {
+            name: "sigmoid",
+            tensor: |t| t.sigmoid(),
+            view: |v| v.sigmoid(),
+            reference: |x| 1.0 / (1.0 + (-x).exp()),
+        },
+        Activation {
+            name: "elu",
+            tensor: |t| t.elu(1.0),
+            view: |v| v.elu(1.0),
+            reference: |x| if x > 0.0 { x } else { x.exp() - 1.0 },
+        },
+        Activation {
+            name: "gelu",
+            tensor: |t| t.gelu_erf(),
+            view: |v| v.gelu_erf(),
+            reference: |x| x * 0.5 * (1.0 + libm::erff(x * std::f32::consts::FRAC_1_SQRT_2)),
+        },
+    ];
+    for n in [7, 4099, 300_001] {
+        let src: Vec<f32> = conv_test_values(0xe1 + n as u64, n).iter().map(|v| v * 12.0).collect();
+        let t: CpuT = Tensor::from_vec(src.clone(), n, dev)?;
+        for op in &ops {
+            let got = (op.tensor)(&t)?.to_vec()?;
+            // A view of a whole tensor runs the in-place kernel on that tensor's own storage,
+            // so it gets a copy.
+            let copy: CpuT = Tensor::from_vec(src.clone(), n, dev)?;
+            let in_place = (op.view)(&TensorView::from(&copy))?.to_vec()?;
+            for (i, ((&x, &g), &v)) in src.iter().zip(&got).zip(&in_place).enumerate() {
+                let name = op.name;
+                assert_eq!(g.to_bits(), v.to_bits(), "{name} n={n} [{i}]: {g} vs in place {v}");
+                let w = (op.reference)(x);
+                assert!((g - w).abs() <= 4e-7 * w.abs().max(1.0), "{name}({x}) n={n}: {g} vs {w}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Softmax over masked attention-like rows, below and above the parallelism threshold:
+/// within float noise of an `f64` softmax, exactly zero where masked, and rows summing to one.
+#[test]
+fn softmax_with_masked_rows_on_both_sides_of_the_gate() -> Result<()> {
+    let dev = &xn::CPU;
+    for (rows, len) in [(16, 266), (3, 13), (256, 266)] {
+        let mut src: Vec<f32> = conv_test_values(0x50f7 + (rows * len) as u64, rows * len)
+            .iter()
+            .map(|v| v * 30.0)
+            .collect();
+        for (r, row) in src.chunks_mut(len).enumerate() {
+            // A causal mask's run of `-inf` at the end of the row, longer on earlier rows.
+            for v in row.iter_mut().skip(len - rows + r + 1) {
+                *v = f32::NEG_INFINITY;
+            }
+        }
+        let t: CpuT = Tensor::from_vec(src.clone(), (rows, len), dev)?;
+        let got = t.softmax()?.to_vec()?;
+        for (r, (row, out)) in src.chunks(len).zip(got.chunks(len)).enumerate() {
+            let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+            let e: Vec<f64> = row.iter().map(|&v| ((v - max) as f64).exp()).collect();
+            let sum: f64 = e.iter().sum();
+            for (i, (&g, &e)) in out.iter().zip(&e).enumerate() {
+                let w = e / sum;
+                if row[i] == f32::NEG_INFINITY {
+                    assert_eq!(g.to_bits(), 0, "{rows}x{len} row {r} [{i}]: masked is {g}");
+                }
+                assert!(
+                    (g as f64 - w).abs() <= 1e-6 * w + 1e-37,
+                    "{rows}x{len} row {r} [{i}]: {g} vs {w}"
+                );
+            }
+            let total: f32 = out.iter().sum();
+            assert!((total - 1.0).abs() < 1e-5, "{rows}x{len} row {r}: sums to {total}");
+        }
+    }
+    Ok(())
+}

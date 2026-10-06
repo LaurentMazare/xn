@@ -240,7 +240,7 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        if arch::unary_inplace(&mut dst[..len], op) {
+        if arch_unary_inplace(&mut dst[..len], op) {
             return Ok(());
         }
         match op {
@@ -287,7 +287,7 @@ impl crate::Backend for crate::CpuDevice {
         len: usize,
         op: UnaryOp,
     ) -> Result<()> {
-        if arch::unary(&mut dst[..len], &src[..len], op) {
+        if arch_unary(&mut dst[..len], &src[..len], op) {
             return Ok(());
         }
         match op {
@@ -1008,6 +1008,9 @@ impl crate::Backend for crate::CpuDevice {
         // autoregressive decode a row is a single short attention vector, and the fork/join
         // cost dominates the handful of exps it saves.
         let softmax_row = |src: &[T], dst: &mut [T]| {
+            if arch::softmax_row(dst, src) {
+                return;
+            }
             let mut max = T::neg_infinity();
             for &v in src.iter() {
                 max = T::max(v, max)
@@ -1660,6 +1663,40 @@ where
     }
 }
 
+/// Whether [`arch::unary_inplace`] has a kernel for `op` on `T`: on an empty slice a kernel is
+/// a no-op, so running it only answers the question.
+fn has_arch_unary<T: 'static>(op: UnaryOp) -> bool {
+    arch::unary_inplace::<T>(&mut [], op)
+}
+
+/// [`arch::unary_inplace`], split across the pool like [`apply_inplace_unary`] when the work is
+/// large enough. Says whether there is a kernel for `op`.
+fn arch_unary_inplace<T: Send + Sync + 'static>(dst: &mut [T], op: UnaryOp) -> bool {
+    if !use_parallelism(dst.len()) {
+        return arch::unary_inplace(dst, op);
+    }
+    has_arch_unary::<T>(op) && {
+        crate::threadpool::par_chunks_mut(dst, ELEMWISE_CHUNK, |_, d| {
+            arch::unary_inplace(d, op);
+        });
+        true
+    }
+}
+
+/// [`arch::unary`], split across the pool like [`apply_unary`] when the work is large enough.
+/// Says whether there is a kernel for `op`.
+fn arch_unary<T: Send + Sync + 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -> bool {
+    if !use_parallelism(dst.len()) {
+        return arch::unary(dst, src, op);
+    }
+    has_arch_unary::<T>(op) && {
+        crate::threadpool::par_chunks_zip(dst, ELEMWISE_CHUNK, src, ELEMWISE_CHUNK, |_, d, s| {
+            arch::unary(d, s, op);
+        });
+        true
+    }
+}
+
 /// Apply a unary operation in-place: dst[i] = op(dst[i])
 #[inline(always)]
 fn apply_inplace_unary<T: Copy + Send + Sync, F>(dst: &mut [T], f: F)
@@ -2126,8 +2163,8 @@ mod arch {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     mod imp {
         use super::{Conv1d, Gemm};
+        pub use crate::simd_math::{softmax_row, unary, unary_inplace};
         use crate::simd128_conv as k;
-        pub use crate::simd128_math::{unary, unary_inplace};
 
         /// Stride 1, no padding, one group: read the input in place, no im2col or transpose.
         pub fn conv1d(dst: &mut [f32], src: &[f32], w: &[f32], s: &Conv1d) -> bool {
@@ -2168,7 +2205,24 @@ mod arch {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    mod imp {
+        use super::{Conv1d, Gemm};
+        pub use crate::simd_math::{softmax_row, unary, unary_inplace};
+        #[inline(always)]
+        pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn gemm(_: &mut [f32], _: &[f32], _: &[f32], _: &Gemm) -> bool {
+            false
+        }
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "wasm32", target_feature = "simd128"),
+        all(target_arch = "aarch64", target_feature = "neon")
+    )))]
     mod imp {
         use super::{Conv1d, Gemm};
         use crate::UnaryOp;
@@ -2178,6 +2232,10 @@ mod arch {
         }
         #[inline(always)]
         pub fn unary(_: &mut [f32], _: &[f32], _: UnaryOp) -> bool {
+            false
+        }
+        #[inline(always)]
+        pub fn softmax_row(_: &mut [f32], _: &[f32]) -> bool {
             false
         }
         #[inline(always)]
@@ -2197,6 +2255,14 @@ mod arch {
     pub(super) fn unary<T: 'static>(dst: &mut [T], src: &[T], op: UnaryOp) -> bool {
         match (as_f32_mut(dst), as_f32(src)) {
             (Some(dst), Some(src)) => imp::unary(dst, src, op),
+            _ => false,
+        }
+    }
+
+    /// One row of a softmax over the last dimension.
+    pub(super) fn softmax_row<T: 'static>(dst: &mut [T], src: &[T]) -> bool {
+        match (as_f32_mut(dst), as_f32(src)) {
+            (Some(dst), Some(src)) => imp::softmax_row(dst, src),
             _ => false,
         }
     }

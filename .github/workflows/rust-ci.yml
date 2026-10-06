@@ -104,7 +104,8 @@ jobs:
 
   wasm-test:
     # The simd128 kernels only compile for wasm32; run their tests under wasmtime, which
-    # executes wasm32-wasip1 binaries with SIMD and relaxed SIMD.
+    # executes wasm32-wasip1 binaries with SIMD and relaxed SIMD. `simd` selects the
+    # simd128 modules and the target-neutral `simd_math`.
     name: Wasm SIMD tests
     runs-on: ubuntu-latest
     steps:
@@ -123,4 +124,4 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128,+relaxed-simd
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
-        run: cargo test -p xn --lib --target wasm32-wasip1 -- simd128
+        run: cargo test -p xn --lib --target wasm32-wasip1 -- simd
