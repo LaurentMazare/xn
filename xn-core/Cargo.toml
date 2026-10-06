@@ -28,7 +28,6 @@ rayon = { workspace = true }
 safetensors = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 wgpu = { workspace = true, optional = true }
 yoke = { workspace = true }
 
@@ -45,6 +44,7 @@ clap = { workspace = true }
 hf-hub = { workspace = true }
 tokenizers = { workspace = true }
 tracing-chrome = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }
