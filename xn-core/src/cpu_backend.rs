@@ -1230,6 +1230,12 @@ impl crate::Backend for crate::CpuDevice {
         dilation: usize,
         groups: usize,
     ) -> Result<()> {
+        if in_channels == 0 {
+            // Nothing to sum, so every output is zero. The gemm paths below would be handed an
+            // empty reduction, which BLAS rejects.
+            dst.fill(T::zero());
+            return Ok(());
+        }
         let shape = arch::Conv1d {
             batch,
             in_channels,
@@ -1426,12 +1432,19 @@ impl crate::Backend for crate::CpuDevice {
         output_padding: usize,
         groups: usize,
     ) -> Result<()> {
+        if in_channels == 0 {
+            // Nothing to sum, so every output is zero. The gemm paths below would be handed an
+            // empty reduction, which BLAS rejects.
+            dst.fill(T::zero());
+            return Ok(());
+        }
         if USE_COL2IM_CONV1D_TR && groups == 1 {
             // [B, L_in, C_in] @ [C_in, C_out * K] -> [B, L_in, C_out * K], then col2im
             // overlap-adds the taps into [B, C_out, L_out]. The input is [B, C_in, L_in]; the
             // gemm reads it transposed through its strides rather than through a copy.
             let n = out_channels * kernel_size;
-            // SAFETY: the gemm writes every element.
+            // SAFETY: the gemm writes every element; its reduction is not empty, since
+            // `in_channels > 0` here.
             let mut col = unsafe { Self::alloc_uninit(batch * length * n, &crate::CPU)? };
             Self::gemm(
                 &mut col,
@@ -1950,9 +1963,13 @@ fn col2im1d<T: WithDTypeF>(
         }
     };
     let rows = dst.len() / l_out.max(1);
-    if use_parallelism(dst.len().max(col.len())) {
+    // The work is the larger of the two buffers, for the pool's decision as for this one.
+    let work = dst.len().max(col.len());
+    if use_parallelism(work) {
         let per = rows.div_ceil(crate::threadpool::size());
-        crate::threadpool::par_chunks_mut(dst, per * l_out, |i, dst| accumulate(i * per, dst));
+        crate::threadpool::par_chunks_mut_by(work, dst, per * l_out, |i, dst| {
+            accumulate(i * per, dst)
+        });
     } else if rows > 0 {
         accumulate(0, dst);
     }

@@ -2571,3 +2571,76 @@ fn matmul_tall_and_wide_match_naive_reference() -> Result<()> {
     }
     Ok(())
 }
+
+/// With no input channels there is nothing to sum: both convolutions give zeros, on whichever
+/// path (im2col, col2im) they take. The gemm then has a zero-length reduction and must still
+/// write its whole output.
+#[test]
+fn convolutions_over_zero_input_channels_give_zeros() -> Result<()> {
+    let dev = &xn::CPU;
+    let x: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(vec![], (2, 0, 10), dev)?;
+    let w: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(vec![], (4, 0, 3), dev)?;
+    let y = x.conv1d(&w, None, 1, 0, 1, 1)?;
+    assert_eq!(y.dims(), &[2, 4, 8]);
+    assert!(y.to_vec()?.iter().all(|&v| v == 0.0), "conv1d");
+    let w: Tensor<f32, xn::CpuDevice> = Tensor::from_vec(vec![], (0, 4, 3), dev)?;
+    let y = x.conv_transpose1d(&w, None, 2, 1, 1, 1)?;
+    assert_eq!(y.dims(), &[2, 4, 20]);
+    assert!(y.to_vec()?.iter().all(|&v| v == 0.0), "conv_transpose1d");
+    Ok(())
+}
+
+/// The im2col and col2im paths are generic over the float type: one strided, padded case of
+/// each convolution in f16, against the f32 reference, within f16's precision. (bf16 has no
+/// gemm on this backend.)
+#[test]
+fn convolutions_in_half_precision_match_the_reference() -> Result<()> {
+    fn run<T: xn::WithDTypeF>(tol: f32) -> Result<()> {
+        let dev = &xn::CPU;
+        let half =
+            |v: Vec<f32>, shape: (usize, usize, usize)| -> Result<Tensor<T, xn::CpuDevice>> {
+                Tensor::<f32, xn::CpuDevice>::from_vec(v, shape, dev)?.to()
+            };
+        // Inputs rounded to T first, so the reference sees what the half-precision op sees.
+        let round = |v: Vec<f32>| {
+            v.into_iter().map(|x| xn::WithDTypeF::to_f32(T::from_f32(x))).collect::<Vec<_>>()
+        };
+        let c = conv_case(2, 12, 10, 41, 4, 2, 3, 1, 1);
+        let x = round(conv_test_values(0x91, c.b * c.c_in * c.l));
+        let w = round(conv_test_values(0x92, c.c_out * c.c_in * c.k));
+        let (want, l_out) = naive_conv1d(&x, &w, c);
+        let out = half(x.clone(), (c.b, c.c_in, c.l))?.conv1d(
+            &half(w, (c.c_out, c.c_in, c.k))?,
+            None,
+            c.stride,
+            c.padding,
+            c.extra,
+            1,
+        )?;
+        assert_eq!(out.dims(), &[c.b, c.c_out, l_out]);
+        let got: Vec<f32> = out.to_vec()?.into_iter().map(xn::WithDTypeF::to_f32).collect();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= tol * scale, "conv1d {:?}: {g} vs {w}", T::DTYPE);
+        }
+        let c = conv_case(2, 12, 10, 41, 6, 3, 2, 1, 1);
+        let w = round(conv_test_values(0x93, c.c_in * c.c_out * c.k));
+        let (want, l_out) = naive_conv_transpose1d(&x, &w, c);
+        let out = half(x, (c.b, c.c_in, c.l))?.conv_transpose1d(
+            &half(w, (c.c_in, c.c_out, c.k))?,
+            None,
+            c.stride,
+            c.padding,
+            c.extra,
+            1,
+        )?;
+        assert_eq!(out.dims(), &[c.b, c.c_out, l_out]);
+        let got: Vec<f32> = out.to_vec()?.into_iter().map(xn::WithDTypeF::to_f32).collect();
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= tol * scale, "conv_transpose1d {:?}: {g} vs {w}", T::DTYPE);
+        }
+        Ok(())
+    }
+    run::<half::f16>(1e-2)
+}
