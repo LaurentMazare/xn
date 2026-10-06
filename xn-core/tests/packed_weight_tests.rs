@@ -31,6 +31,16 @@ fn values(len: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+/// Whether f32 products reach the gemm, and with it the cache: not with Accelerate, which runs
+/// them in BLAS, nor where KleidiAI's kernels take them.
+fn products_reach_the_cache() -> bool {
+    #[cfg(xn_kai)]
+    let kai = xn::quantized::kai::active();
+    #[cfg(not(xn_kai))]
+    let kai = false;
+    !cfg!(feature = "accelerate") && !kai
+}
+
 fn tensor(shape: &[usize], seed: u64) -> Result<CpuTensor<f32>> {
     Tensor::from_vec(values(shape.iter().product(), seed), shape.to_vec(), &CPU)
 }
@@ -66,8 +76,7 @@ fn a_parameter_used_again_gives_the_same_result() -> Result<()> {
         assert_eq!(again, first, "conv_transpose1d, call {call}");
     }
 
-    // With Accelerate, f32 products go to BLAS and never reach the cache.
-    if !cfg!(feature = "accelerate") {
+    if products_reach_the_cache() {
         assert!(gemm::packed_cache::stats().0 > before, "the parameters were cached");
     }
     Ok(())
@@ -120,7 +129,7 @@ fn a_buffer_written_in_place_is_never_served_stale() -> Result<()> {
 
     // The count is this thread's. A declared parameter in a product as small as the ones above
     // does move it, so the assertion above cannot pass because the work ran elsewhere.
-    if !cfg!(feature = "accelerate") {
+    if products_reach_the_cache() {
         let kernel = tensor(&[16, 8, 4], 9)?;
         let x = tensor(&[1, 16, 8], 10)?;
         for _ in 0..3 {
