@@ -117,5 +117,16 @@ fn a_buffer_written_in_place_is_never_served_stale() -> Result<()> {
         }
     }
     assert_eq!(gemm::packed_cache::stats().1, panels, "nothing but parameters is cached");
+
+    // The count is this thread's. A declared parameter in a product as small as the ones above
+    // does move it, so the assertion above cannot pass because the work ran elsewhere.
+    if !cfg!(feature = "accelerate") {
+        let kernel = tensor(&[16, 8, 4], 9)?;
+        let x = tensor(&[1, 16, 8], 10)?;
+        for _ in 0..3 {
+            x.conv_transpose1d(&kernel, None, 2, 0, 0, 1)?;
+        }
+        assert!(gemm::packed_cache::stats().1 > panels, "a parameter is counted on this thread");
+    }
     Ok(())
 }

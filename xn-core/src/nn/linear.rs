@@ -5,6 +5,11 @@ use crate::{Backend, Result, Tensor, WithDTypeF};
 ///
 /// The weight is treated as a model parameter: on the CPU, the gemm keeps it packed between
 /// calls instead of packing it on every call. Do not write it in place once the layer has run.
+///
+/// Each thread that runs part of the product keeps its own packed copy, and dropping the layer
+/// does not release it: copies are held until their thread exits. `GEMM_PACKED_LHS_CACHE_MB`
+/// caps what is held across the process (256 by default; past it, products pack per call as
+/// before), and `GEMM_PACKED_LHS_CACHE_MB=0` turns the cache off.
 pub struct Linear<T: WithDTypeF, B: Backend> {
     weight: Tensor<T, B>,
     bias: Option<Tensor<T, B>>,
