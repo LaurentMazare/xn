@@ -2318,6 +2318,20 @@ mod arch {
         /// xn-gemm's packed kernel, which loads fewer operands per multiply-add, catches up and
         /// then wins.
         pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
+            #[cfg(xn_kai)]
+            if crate::kai_f32::gemm(
+                dst,
+                lhs,
+                rhs,
+                (g.m, g.n, g.k),
+                g.batch,
+                (g.lhs_b_stride, g.rhs_b_stride),
+                g.dst,
+                g.lhs,
+                g.rhs,
+            ) {
+                return true;
+            }
             const MAX_ROWS: usize = 64;
             let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
             let dense = dst_rs == g.n || g.m <= 1;
@@ -2501,7 +2515,8 @@ mod tests {
     }
 
     /// Which matmuls the target kernel takes: `f32` only, with `lhs` and the output contiguous
-    /// along their rows and `rhs` along `k`, and on aarch64 only up to 64 rows.
+    /// along their rows and `rhs` along `k`, and on aarch64 only up to 64 rows. KleidiAI's
+    /// kernels, when in use, also take more rows and the other layouts of `lhs` and `rhs`.
     #[test]
     fn arch_gemm_guards() {
         use super::arch::{Gemm, gemm};
@@ -2521,18 +2536,22 @@ mod tests {
         let mut dst = vec![0f32; 65 * n];
         let wasm = cfg!(all(target_arch = "wasm32", target_feature = "simd128"));
         let neon = cfg!(all(target_arch = "aarch64", target_feature = "neon"));
+        #[cfg(xn_kai)]
+        let kai = crate::quantized::kai::active();
+        #[cfg(not(xn_kai))]
+        let kai = false;
         let x_wt = |m| layout(m, (1, n), (1, k), (k, 1));
         assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(4)), wasm || neon);
-        assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(65)), wasm, "65 rows");
+        assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(65)), wasm || kai, "65 rows");
         let (lhs64, rhs64): (Vec<f64>, Vec<f64>) =
             (lhs.iter().map(|&v| v as f64).collect(), rhs.iter().map(|&v| v as f64).collect());
         assert!(!gemm(&mut vec![0f64; 4 * n], &lhs64, &rhs64, &x_wt(4)), "f64");
-        assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (4, 1), (k, 1))), "strided lhs");
-        assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (1, k), (1, n))), "x @ w");
+        assert_eq!(gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (4, 1), (k, 1))), kai, "kxm lhs");
+        assert_eq!(gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (1, k), (1, n))), kai, "x @ w");
         assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (4, 1), (1, k), (k, 1))), "strided dst");
         // Rows of the output further apart than `n` are not the dense layout the hook writes.
         let padded = layout(4, (1, n + 3), (1, k), (k, 1));
-        assert!(!gemm(&mut vec![0f32; 4 * (n + 3)], &lhs, &rhs, &padded), "padded dst rows");
+        assert_eq!(gemm(&mut vec![0f32; 4 * (n + 3)], &lhs, &rhs, &padded), kai, "padded dst rows");
         // One row has no row stride to speak of.
         assert_eq!(
             gemm(&mut dst, &lhs, &rhs, &layout(1, (1, n + 3), (1, k), (k, 1))),

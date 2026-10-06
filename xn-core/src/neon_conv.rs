@@ -176,10 +176,10 @@ pub fn conv1d(
 /// Whether a stride-1, unpadded, single-group convolution should go to [`conv1d`] rather than
 /// to im2col and a gemm.
 ///
-/// Below four output steps every output is a scalar tail, and a gemm wins. With Accelerate the
-/// gemm runs on the matrix unit, which beats NEON once each im2col column feeds more than a few
-/// output channels; with four or fewer, copying the columns costs more than the matrix unit
-/// saves.
+/// Below four output steps every output is a scalar tail, and a gemm wins. With Accelerate, or
+/// with KleidiAI's SME2 kernels in use, the gemm runs on the matrix unit, which beats NEON once
+/// each im2col column feeds more than a few output channels; with four or fewer, copying the
+/// columns costs more than the matrix unit saves.
 pub fn takes(ci: usize, co: usize, l_in: usize, l_out: usize) -> bool {
     #[cfg(test)]
     match tests::FORCE.get() {
@@ -188,7 +188,15 @@ pub fn takes(ci: usize, co: usize, l_in: usize, l_out: usize) -> bool {
         _ => {}
     }
     let fits = ci * l_in <= u32::MAX as usize;
-    fits && l_out >= 4 && (cfg!(not(feature = "accelerate")) || co <= 4)
+    fits && l_out >= 4 && (!matrix_unit() || co <= 4)
+}
+
+fn matrix_unit() -> bool {
+    #[cfg(xn_kai)]
+    if crate::quantized::kai::active() {
+        return true;
+    }
+    cfg!(feature = "accelerate")
 }
 
 #[cfg(test)]
@@ -337,9 +345,9 @@ mod tests {
         assert!(!takes(32, 512, 3, 3));
         assert!(takes(64, 1, 1922, 1920));
         assert!(takes(64, 4, 1922, 1920));
-        assert_eq!(takes(64, 8, 1922, 1920), cfg!(not(feature = "accelerate")));
-        assert_eq!(takes(64, 32, 1922, 1920), cfg!(not(feature = "accelerate")));
-        assert_eq!(takes(512, 512, 22, 16), cfg!(not(feature = "accelerate")));
+        assert_eq!(takes(64, 8, 1922, 1920), !matrix_unit());
+        assert_eq!(takes(64, 32, 1922, 1920), !matrix_unit());
+        assert_eq!(takes(512, 512, 22, 16), !matrix_unit());
     }
 
     /// Times every convolution of a streaming decoder frame, direct against im2col and a gemm,

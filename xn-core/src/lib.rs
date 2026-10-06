@@ -8,6 +8,8 @@ pub mod display;
 pub mod dtype;
 pub mod error;
 pub mod inplace_ops;
+#[cfg(xn_kai)]
+mod kai_f32;
 pub mod models;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub(crate) mod neon_conv;
