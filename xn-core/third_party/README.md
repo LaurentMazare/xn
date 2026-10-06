@@ -9,6 +9,7 @@ pinned to the release tag **v1.24.0**. It is licensed under Apache-2.0
 The `kai` feature of `xn-core` uses a few of its files and nothing else:
 
 - the SME2 int8 matmul kernels, one gemm (`..._sme2_mopa`) and one gemv (`..._sme2_dot`)
+- the SME2 f32 gemm kernel (`..._f32p2vlx1biasf32_sme2_mopa`)
 - the routines that pack their operands (`pack/`)
 - the shared header and the SME helper assembly (`kai_common.h`, `kai_common_sme_asm.S`)
 
@@ -24,5 +25,5 @@ git submodule update --init xn-core/third_party/kleidiai
 
 To update KleidiAI, check out a newer tag in `kleidiai/` and commit the submodule. If a file
 was renamed or a new one is needed, change both `build.rs` and the `exclude` list. The kernel
-interfaces are declared by hand in `src/quantized/kai.rs`, so check them against the new
-headers.
+interfaces are declared by hand in `src/quantized/kai.rs` and `src/kai_f32.rs`, so check them
+against the new headers.

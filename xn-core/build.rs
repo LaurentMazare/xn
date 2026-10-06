@@ -53,7 +53,7 @@ fn build_kai() {
         return;
     }
     let pack = root.join("kai/ukernels/matmul/pack");
-    let q8 = root.join("kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp");
+    let matmul = root.join("kai/ukernels/matmul");
     let build = |flags: &[&str]| {
         let mut b = cc::Build::new();
         b.include(root).opt_level(3).warnings(false);
@@ -68,17 +68,22 @@ fn build_kai() {
         .file(pack.join("kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c"))
         .try_compile("xn_kai_pack");
 
+    // Each is a `.c` file and its `_asm.S`, under `kai/ukernels/matmul`.
     let kernels = [
-        "kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa",
-        "kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme2_dot",
+        "matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa",
+        "matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme2_dot",
+        "matmul_clamp_f32_f32p_f32p/kai_matmul_clamp_f32_f32p2vlx1_f32p2vlx1biasf32_sme2_mopa",
+        "pack/kai_lhs_pack_f32p2vlx1_f32_sme",
+        "pack/kai_rhs_pack_kxn_f32p2vlx1biasf32_f32_f32_sme",
+        "pack/kai_rhs_pack_nxk_f32p2vlx1biasf32_f32_f32_sme",
     ];
     let sme2 =
         build(&["-march=armv8.2-a+sve+sve2", "-fno-tree-vectorize", "-fno-tree-slp-vectorize"])
             .file(root.join("kai/kai_common_sme_asm.S"))
             .files(
-                kernels
-                    .iter()
-                    .flat_map(|k| [q8.join(format!("{k}.c")), q8.join(format!("{k}_asm.S"))]),
+                kernels.iter().flat_map(|k| {
+                    [matmul.join(format!("{k}.c")), matmul.join(format!("{k}_asm.S"))]
+                }),
             )
             .try_compile("xn_kai_sme2");
 

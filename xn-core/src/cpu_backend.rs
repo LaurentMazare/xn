@@ -2357,6 +2357,21 @@ mod arch {
         pub fn conv1d(_: &mut [f32], _: &[f32], _: &[f32], _: &Conv1d) -> bool {
             false
         }
+        #[cfg(xn_kai)]
+        pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
+            crate::kai_f32::gemm(
+                dst,
+                lhs,
+                rhs,
+                (g.m, g.n, g.k),
+                g.batch,
+                (g.lhs_b_stride, g.rhs_b_stride),
+                g.dst,
+                g.lhs,
+                g.rhs,
+            )
+        }
+        #[cfg(not(xn_kai))]
         #[inline(always)]
         pub fn gemm(_: &mut [f32], _: &[f32], _: &[f32], _: &Gemm) -> bool {
             false
