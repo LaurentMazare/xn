@@ -223,6 +223,54 @@ pub fn gemm_dot(
     }
 }
 
+/// The batch of a batched [`gemm_dot`]: `n` entries, entry `b` reading `lhs[b * self.lhs..]`
+/// and `rhs[b * self.rhs..]` and writing the `m * n` floats of output from `b * m * n` on.
+#[derive(Clone, Copy)]
+pub struct Batch {
+    pub n: usize,
+    pub lhs: usize,
+    pub rhs: usize,
+}
+
+/// [`gemm_dot`] over a batch, such as one product per attention head. Entries too small to be
+/// split themselves go to the pool whole, so a batch of small products still uses the threads;
+/// each entry is computed the same way either way, so the bits do not depend on the split.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_dot_batched(
+    out: &mut [f32],
+    out_rs: usize,
+    lhs: &[f32],
+    lhs_rs: usize,
+    rhs: &[f32],
+    rhs_cs: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    batch: Batch,
+) {
+    let entry = m * n * k;
+    let one = |out: &mut [f32], b: usize| {
+        let (lhs, rhs) = (&lhs[b * batch.lhs..], &rhs[b * batch.rhs..]);
+        gemm_dot(out, out_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, k)
+    };
+    if batch.n <= 1 || entry >= PAR_WORK || entry * batch.n < PAR_WORK {
+        for b in 0..batch.n {
+            one(&mut out[b * m * n..(b + 1) * m * n], b);
+        }
+        return;
+    }
+    assert!(out.len() >= batch.n * m * n);
+    let o = out.as_mut_ptr() as usize;
+    crate::threadpool::par_units_by(entry * batch.n, batch.n, 1, |b_lo, b_hi| {
+        for b in b_lo..b_hi {
+            // SAFETY: inside `out`, as asserted above, and entries write disjoint blocks.
+            let out =
+                unsafe { std::slice::from_raw_parts_mut((o as *mut f32).add(b * m * n), m * n) };
+            one(out, b);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +542,28 @@ mod tests {
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&pool), bits(&whole), "{m}x{n}x{k}: pool");
             assert_eq!(bits(&parts), bits(&whole), "{m}x{n}x{k}: parts");
+        }
+    }
+
+    /// A batch of products each too small to split, like one attention head per entry, goes to
+    /// the pool whole and gives the same bits as running the entries one by one; a shared
+    /// weight (stride 0) too.
+    #[test]
+    fn gemm_dot_batched_matches_the_entries_one_by_one() {
+        for (batch, m, n, k, rhs_bs) in
+            [(8, 16, 37, 64, 37 * 64), (12, 25, 9, 64, 0), (3, 2, 5, 7, 35)]
+        {
+            let (lhs, rhs) = (data(batch * m * k, 21), data(batch * n * k + 3, 22));
+            let mut got = vec![0f32; batch * m * n];
+            let b = Batch { n: batch, lhs: m * k, rhs: rhs_bs };
+            gemm_dot_batched(&mut got, n, &lhs, k, &rhs, k, m, n, k, b);
+            let mut want = vec![0f32; batch * m * n];
+            for e in 0..batch {
+                let out = &mut want[e * m * n..(e + 1) * m * n];
+                gemm_dot(out, n, &lhs[e * m * k..], k, &rhs[e * rhs_bs..], k, m, n, k);
+            }
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "{batch} x {m}x{n}x{k}");
         }
     }
 

@@ -2216,7 +2216,7 @@ mod arch {
     /// A batched matmul's layout, as the backend's `gemm_` receives it: `(col, row)` strides.
     #[cfg_attr(
         not(any(
-            target_arch = "aarch64",
+            all(target_arch = "aarch64", target_feature = "neon"),
             all(target_arch = "wasm32", target_feature = "simd128")
         )),
         allow(dead_code)
@@ -2262,10 +2262,12 @@ mod arch {
             true
         }
 
-        /// `x @ W^T` on a row-major weight, both operands contiguous along `k`.
+        /// `x @ W^T` on a row-major weight, both operands contiguous along `k`, into a dense
+        /// output: each batch entry is `m * n` floats, as `gemm_` lays them out.
         pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
             let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
-            if lhs_cs != 1 || dst_cs != 1 || rhs_rs != 1 {
+            let dense = dst_rs == g.n || g.m <= 1;
+            if lhs_cs != 1 || dst_cs != 1 || rhs_rs != 1 || !dense {
                 return false;
             }
             let (m, n, kk) = (g.m, g.n, g.k);
@@ -2311,21 +2313,23 @@ mod arch {
         }
 
         /// `x @ W^T` on a row-major weight, both operands contiguous along `k`, for up to
-        /// `MAX_ROWS` rows. Skipping the packing pays for a handful of rows; past a few dozen,
+        /// `MAX_ROWS` rows, into a dense output: each batch entry is `m * n` floats, as `gemm_`
+        /// lays them out. Skipping the packing pays for a handful of rows; past a few dozen,
         /// xn-gemm's packed kernel, which loads fewer operands per multiply-add, catches up and
         /// then wins.
         pub fn gemm(dst: &mut [f32], lhs: &[f32], rhs: &[f32], g: &Gemm) -> bool {
             const MAX_ROWS: usize = 64;
             let (((dst_cs, dst_rs), (lhs_cs, lhs_rs)), (rhs_cs, rhs_rs)) = ((g.dst, g.lhs), g.rhs);
-            if lhs_cs != 1 || dst_cs != 1 || rhs_rs != 1 || g.m > MAX_ROWS {
+            let dense = dst_rs == g.n || g.m <= 1;
+            if lhs_cs != 1 || dst_cs != 1 || rhs_rs != 1 || !dense || g.m > MAX_ROWS {
                 return false;
             }
+            let batch =
+                crate::neon_gemm::Batch { n: g.batch, lhs: g.lhs_b_stride, rhs: g.rhs_b_stride };
             let (m, n, kk) = (g.m, g.n, g.k);
-            for b in 0..g.batch {
-                let dst = &mut dst[b * m * n..(b + 1) * m * n];
-                let (lhs, rhs) = (&lhs[b * g.lhs_b_stride..], &rhs[b * g.rhs_b_stride..]);
-                crate::neon_gemm::gemm_dot(dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk);
-            }
+            crate::neon_gemm::gemm_dot_batched(
+                dst, dst_rs, lhs, lhs_rs, rhs, rhs_cs, m, n, kk, batch,
+            );
             true
         }
     }
@@ -2516,8 +2520,9 @@ mod tests {
         let (lhs, rhs) = (data(65 * k, 13), data(n * k, 14));
         let mut dst = vec![0f32; 65 * n];
         let wasm = cfg!(all(target_arch = "wasm32", target_feature = "simd128"));
+        let neon = cfg!(all(target_arch = "aarch64", target_feature = "neon"));
         let x_wt = |m| layout(m, (1, n), (1, k), (k, 1));
-        assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(4)), wasm || cfg!(target_arch = "aarch64"));
+        assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(4)), wasm || neon);
         assert_eq!(gemm(&mut dst, &lhs, &rhs, &x_wt(65)), wasm, "65 rows");
         let (lhs64, rhs64): (Vec<f64>, Vec<f64>) =
             (lhs.iter().map(|&v| v as f64).collect(), rhs.iter().map(|&v| v as f64).collect());
@@ -2525,5 +2530,13 @@ mod tests {
         assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (4, 1), (k, 1))), "strided lhs");
         assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (1, n), (1, k), (1, n))), "x @ w");
         assert!(!gemm(&mut dst, &lhs, &rhs, &layout(4, (4, 1), (1, k), (k, 1))), "strided dst");
+        // Rows of the output further apart than `n` are not the dense layout the hook writes.
+        let padded = layout(4, (1, n + 3), (1, k), (k, 1));
+        assert!(!gemm(&mut vec![0f32; 4 * (n + 3)], &lhs, &rhs, &padded), "padded dst rows");
+        // One row has no row stride to speak of.
+        assert_eq!(
+            gemm(&mut dst, &lhs, &rhs, &layout(1, (1, n + 3), (1, k), (k, 1))),
+            wasm || neon
+        );
     }
 }
