@@ -2644,3 +2644,39 @@ fn convolutions_in_half_precision_match_the_reference() -> Result<()> {
     }
     run::<half::f16>(1e-2)
 }
+
+/// Matmuls on views that start past the beginning of their storage, in layouts and dtypes that
+/// a backend may hand from its fast path to a general one: the offset must be applied once.
+#[test]
+fn matmul_on_offset_views_matches_reference() -> Result<()> {
+    fn run<T: xn::WithDTypeF>(tol: f32) -> Result<()> {
+        let dev = &xn::CPU;
+        let (m, k, n) = (4, 5, 8);
+        let lhs_v: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 11) as f32 - 5.0) / 4.0).collect();
+        let base_v: Vec<f32> = (0..n * 12).map(|i| ((i * 5 % 13) as f32 - 6.0) / 4.0).collect();
+        let lhs: Tensor<T, xn::CpuDevice> =
+            Tensor::<f32, _>::from_vec(lhs_v.clone(), (m, k), dev)?.to()?;
+        let base: Tensor<T, xn::CpuDevice> =
+            Tensor::<f32, _>::from_vec(base_v.clone(), (n, 12), dev)?.to()?;
+        // Columns 2..7 of `base`, transposed: [k, n], starting 2 elements in, with a row stride
+        // of 1 and a column stride of 12, which is neither a plain nor a transposed matrix.
+        let rhs = TensorView::from(&base).narrow(1, 2..2 + k)?.transpose(0, 1)?;
+        assert!(rhs.start_offset() > 0);
+        let got: Vec<f32> =
+            lhs.matmul(&rhs)?.to_vec()?.into_iter().map(xn::WithDTypeF::to_f32).collect();
+        for i in 0..m {
+            for j in 0..n {
+                let want: f32 = (0..k).map(|c| lhs_v[i * k + c] * base_v[j * 12 + 2 + c]).sum();
+                let g = got[i * n + j];
+                assert!(
+                    (g - want).abs() <= tol * want.abs().max(1.0),
+                    "{:?} [{i},{j}]: {g} vs {want}",
+                    T::DTYPE
+                );
+            }
+        }
+        Ok(())
+    }
+    run::<f32>(1e-5)?;
+    run::<half::f16>(1e-2)
+}

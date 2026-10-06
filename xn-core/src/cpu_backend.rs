@@ -722,8 +722,6 @@ impl crate::Backend for crate::CpuDevice {
         // Accelerate comes before the target kernels of `gemm_`, even for one row: it runs on
         // the matrix unit, which beats the direct `x @ W^T` kernel at every shape but the
         // tiniest. Only the layouts it cannot take reach them.
-        let lhs = &lhs[lhs_o..];
-        let rhs = &rhs[rhs_o..];
         let (lda, transa) = if (rhs_cs == 1 || n == 1) && (rhs_rs == n || k == 1) {
             (n as i32, b'N')
         } else if rhs_cs == k && rhs_rs == 1 {
@@ -768,6 +766,8 @@ impl crate::Backend for crate::CpuDevice {
 
         match T::DTYPE {
             crate::DType::F32 => {
+                // The fallbacks hand `gemm_` the offsets; only this path applies them here.
+                let (lhs, rhs) = (&lhs[lhs_o..], &rhs[rhs_o..]);
                 for b_idx in 0..lhs_b {
                     let dst_p = &mut dst[b_idx * m * n..(b_idx + 1) * m * n];
                     let lhs_p = &lhs[b_idx * lhs_b_stride..];
