@@ -86,6 +86,8 @@ jobs:
       # The kai feature with gcc and its Linux SME2 check. The runner has no SME2, so the
       # kernels themselves do not run.
       - run: git submodule update --init --depth 1 xn-core/third_party/kleidiai
+      # The crate must carry the kernels it compiles: see `exclude` in xn-core/Cargo.toml.
+      - run: cargo package -p xn --list | grep -qx third_party/kleidiai/kai/kai_common.h
       - run: cargo test -p xn --features kai
       - run: rustup component add clippy
       - run: cargo clippy -p xn --features kai --all-targets -- -D warnings
