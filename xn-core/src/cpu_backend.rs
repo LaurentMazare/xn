@@ -2193,7 +2193,7 @@ mod arch {
     #[cfg_attr(
         not(any(
             all(target_arch = "wasm32", target_feature = "simd128"),
-            target_arch = "aarch64"
+            all(target_arch = "aarch64", target_feature = "neon")
         )),
         allow(dead_code)
     )]

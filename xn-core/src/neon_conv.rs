@@ -160,10 +160,11 @@ pub fn conv1d(
         }
     };
     // Units of four output channels, or of 16-sample windows when there are too few channels
-    // to go round the threads.
+    // to go round the threads and the windows make more units.
     let work = batch * co * l_out * ci * k;
     let windows = l_out.div_ceil(16);
-    if co.div_ceil(4) >= crate::threadpool::threads_for(work) || windows == 1 {
+    let threads = crate::threadpool::threads_for(work);
+    if co.div_ceil(4) >= threads.min(windows) {
         crate::threadpool::par_units_by(work, co, 4, |c_lo, c_hi| run((c_lo, c_hi), (0, l_out)));
     } else {
         crate::threadpool::par_units_by(work, windows, 1, |w_lo, w_hi| {
